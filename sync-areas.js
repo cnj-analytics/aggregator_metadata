@@ -1,4 +1,4 @@
-test123// sync-areas.js
+// sync-areas.js
 //
 // Deliveroo UAE Area Discovery & Sync
 //
