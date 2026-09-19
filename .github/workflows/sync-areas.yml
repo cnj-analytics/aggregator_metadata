@@ -1,0 +1,39 @@
+name: Sync Deliveroo Areas
+on:
+  schedule:
+    - cron: '0 4 * * 1'  # Every Monday 4am UTC (8am UAE)
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Run in test mode (scan one small region only)'
+        type: boolean
+        default: false
+      test_region:
+        description: 'Region to scan in test mode'
+        type: choice
+        options:
+          - Ajman
+          - Ras Al Khaimah
+          - Al Ain
+          - Umm Al Quwain
+          - Fujairah
+        default: 'Ajman'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Sync Deliveroo areas
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEST_MODE: ${{ inputs.test_mode || 'false' }}
+          TEST_REGION: ${{ inputs.test_region || 'Ajman' }}
+        run: node sync-areas.js
