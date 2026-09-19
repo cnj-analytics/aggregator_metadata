@@ -8,7 +8,7 @@
 //
 // The code owns ALL decisions. Supabase receives and stores.
 
-// âââ Config âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// --- Config -----------------------------------------------------------------
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -22,9 +22,9 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   process.exit(1);
 }
 
-// âââ City Map âââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-// city_id â { name, slug } for all known UAE emirates.
-// Includes Fujairah and UAQ as placeholders â IDs unknown until they activate.
+// --- City Map ---------------------------------------------------------------
+// city_id -> { name, slug } for all known UAE emirates.
+// Includes Fujairah and UAQ as placeholders -- IDs unknown until they activate.
 
 const CITY_MAP = {
   40:   { name: 'Dubai',           slug: 'dubai' },
@@ -35,14 +35,14 @@ const CITY_MAP = {
   2541: { name: 'Ras Al Khaimah',  slug: 'ras-al-khaimah' },
 };
 
-// Names and slugs for cities that don't exist yet â used when a new city_id appears
+// Names and slugs for cities that don't exist yet -- used when a new city_id appears
 const POTENTIAL_CITIES = [
   { name: 'Fujairah',       slug: 'fujairah' },
   { name: 'Umm Al Quwain',  slug: 'umm-al-quwain' },
 ];
 
-// âââ Bounding Boxes âââââââââââââââââââââââââââââââââââââââââââââââââââ
-// 0.008Â° spacing â 800-900m. All 9 emirates scanned every run.
+// --- Bounding Boxes ---------------------------------------------------------
+// 0.008 deg spacing -- 800-900m. All 9 emirates scanned every run.
 
 const REGIONS = [
   { name: 'Dubai',           latMin: 24.82, latMax: 25.36, lngMin: 54.89, lngMax: 55.55 },
@@ -59,16 +59,17 @@ const REGIONS = [
 const GRID_STEP = 0.008;
 const MAX_CONCURRENT = 5;
 const PAGE_FETCH_DELAY_MS = 3000;
-const MAX_RETRIES = 5;
+const MAX_RETRIES = 3;                 // [FIX] was 5 -- reduced to avoid long backoff
 const INITIAL_RETRY_DELAY_MS = 5000;
-const BATCH_PAUSE_EVERY = 25;       // pause after enriching this many areas
-const BATCH_PAUSE_MS = 10000;        // 10s pause between batches of page fetches
+const MAX_RETRY_DELAY_MS = 30000;      // [FIX] cap backoff at 30s
+const BATCH_PAUSE_EVERY = 25;          // pause after enriching this many areas
+const BATCH_PAUSE_MS = 10000;          // 10s pause between batches of page fetches
 
 const LOCATION_API = 'https://api.ae.deliveroo.com/orderapp/v1/location';
 const AREA_PAGE_BASE = 'https://deliveroo.ae/en/restaurants';
 const URL_PARAMS = '?collection=restaurants&collection=all-restaurants';
 
-// âââ Utilities ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// --- Utilities --------------------------------------------------------------
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -78,7 +79,7 @@ function buildAreaUrl(citySlug, areaSlug) {
   return `${AREA_PAGE_BASE}/${citySlug}/${areaSlug}${URL_PARAMS}`;
 }
 
-// âââ Location API Scanning ââââââââââââââââââââââââââââââââââââââââââââ
+// --- Location API Scanning --------------------------------------------------
 
 function generateGridPoints(region) {
   const points = [];
@@ -101,7 +102,7 @@ async function queryLocationAPI(lat, lng) {
 }
 
 async function scanAllRegions() {
-  const neighborhoods = new Map(); // neighborhood.id â data
+  const neighborhoods = new Map(); // neighborhood.id -> data
   const regionsToScan = TEST_MODE
     ? REGIONS.filter(r => r.name === TEST_REGION)
     : REGIONS;
@@ -116,7 +117,7 @@ async function scanAllRegions() {
   for (const region of regionsToScan) {
     const points = generateGridPoints(region);
     totalPoints += points.length;
-    console.log(`Scanning ${region.name} â ${points.length} grid points`);
+    console.log(`Scanning ${region.name} -- ${points.length} grid points`);
 
     let regionNewCount = 0;
 
@@ -145,14 +146,14 @@ async function scanAllRegions() {
       }
     }
 
-    console.log(`  â ${regionNewCount} unique neighborhoods found`);
+    console.log(`  -> ${regionNewCount} unique neighborhoods found`);
   }
 
   console.log(`\nGrid scan complete: ${totalPoints} points queried, ${totalHits} hits, ${neighborhoods.size} unique neighborhoods\n`);
   return neighborhoods;
 }
 
-// âââ Area Page Fetching & Enrichment ââââââââââââââââââââââââââââââââââ
+// --- Area Page Fetching & Enrichment ----------------------------------------
 
 async function fetchWithRetry(url) {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -165,8 +166,9 @@ async function fetchWithRetry(url) {
       });
 
       if (resp.status === 429) {
-        const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
-        console.log(`    429 rate limited â retrying in ${delay / 1000}s`);
+        // [FIX] cap backoff delay at MAX_RETRY_DELAY_MS
+        const delay = Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
+        console.log(`    429 rate limited -- retrying in ${delay / 1000}s`);
         await sleep(delay);
         continue;
       }
@@ -174,8 +176,9 @@ async function fetchWithRetry(url) {
       return resp;
     } catch (e) {
       if (attempt < MAX_RETRIES) {
-        const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
-        console.log(`    Fetch error (${e.message}) â retrying in ${delay / 1000}s`);
+        // [FIX] cap backoff delay at MAX_RETRY_DELAY_MS
+        const delay = Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
+        console.log(`    Fetch error (${e.message}) -- retrying in ${delay / 1000}s`);
         await sleep(delay);
       }
     }
@@ -214,8 +217,8 @@ function extractPageData(html) {
 }
 
 /**
- * Fetch an areaâs page to determine:
- * - is_active â based on restaurantCount > 0 from __NEXT_DATA__.
+ * Fetch an area's page to determine:
+ * - is_active -- based on restaurantCount > 0 from __NEXT_DATA__.
  *   Active areas have restaurants registered; inactive areas (concourses,
  *   beaches) always have restaurantCount = 0. The cron runs at 8am UAE
  *   when restaurants are open, making this count reliable.
@@ -234,7 +237,7 @@ async function enrichArea(citySlug, areaSlug) {
       return { isActive: null, geohash: null, latitude: null, longitude: null, fetchFailed: true };
     }
 
-    // 404 or other error status â inactive
+    // 404 or other error status -- inactive
     if (!resp.ok) {
       return { isActive: false, geohash: null, latitude: null, longitude: null, fetchFailed: false };
     }
@@ -242,7 +245,7 @@ async function enrichArea(citySlug, areaSlug) {
     const html = await resp.text();
     const pageData = extractPageData(html);
 
-    // No __NEXT_DATA__ or canât parse â inactive
+    // No __NEXT_DATA__ or can't parse -- inactive
     if (!pageData) {
       return { isActive: false, geohash: null, latitude: null, longitude: null, fetchFailed: false };
     }
@@ -267,7 +270,7 @@ async function enrichArea(citySlug, areaSlug) {
   }
 }
 
-// âââ New City Detection âââââââââââââââââââââââââââââââââââââââââââââââ
+// --- New City Detection -----------------------------------------------------
 
 function resolveNewCity(cityId, neighborhoodNames) {
   // Try matching against known potential cities
@@ -275,21 +278,21 @@ function resolveNewCity(cityId, neighborhoodNames) {
     const lower = pc.name.toLowerCase();
     if (neighborhoodNames.some(n => n.toLowerCase().includes(lower))) {
       CITY_MAP[cityId] = { name: pc.name, slug: pc.slug };
-      console.log(`  Mapped new city_id ${cityId} â ${pc.name} (${pc.slug})`);
+      console.log(`  Mapped new city_id ${cityId} -> ${pc.name} (${pc.slug})`);
       return CITY_MAP[cityId];
     }
   }
 
   // Fallback: derive from first neighborhood name (often prefixed with city name)
   if (neighborhoodNames.length > 0) {
-    // E.g., "Fujairah Downtown" â city name "Fujairah"
+    // E.g., "Fujairah Downtown" -> city name "Fujairah"
     const first = neighborhoodNames[0];
     const parts = first.split(' ');
     if (parts.length >= 2) {
       const name = parts[0];
       const slug = name.toLowerCase().replace(/\s+/g, '-');
       CITY_MAP[cityId] = { name, slug };
-      console.log(`  Derived new city_id ${cityId} â ${name} (${slug}) from "${first}"`);
+      console.log(`  Derived new city_id ${cityId} -> ${name} (${slug}) from "${first}"`);
       return CITY_MAP[cityId];
     }
   }
@@ -298,7 +301,7 @@ function resolveNewCity(cityId, neighborhoodNames) {
   return null;
 }
 
-// âââ Supabase Operations ââââââââââââââââââââââââââââââââââââââââââââââ
+// --- Supabase Operations ----------------------------------------------------
 
 async function supabase(path, method, body = null, extraHeaders = {}) {
   const resp = await fetch(`${SUPABASE_URL}/rest/v1${path}`, {
@@ -315,7 +318,7 @@ async function supabase(path, method, body = null, extraHeaders = {}) {
   const text = await resp.text();
 
   if (!resp.ok) {
-    throw new Error(`Supabase ${method} ${path} â ${resp.status}: ${text}`);
+    throw new Error(`Supabase ${method} ${path} -> ${resp.status}: ${text}`);
   }
 
   return text ? JSON.parse(text) : null;
@@ -353,7 +356,7 @@ async function upsertAreas(records) {
       await supabase('/deliveroo_area?on_conflict=deliveroo_area_id', 'POST', batch, {
         'Prefer': 'resolution=merge-duplicates',
       });
-      console.log(`  Batch ${batchNum}/${totalBatches} â ${batch.length} rows`);
+      console.log(`  Batch ${batchNum}/${totalBatches} -> ${batch.length} rows`);
     } catch (e) {
       console.error(`  Batch ${batchNum} failed: ${e.message}`);
       // Fall back to individual upserts so one bad row doesn't block the rest
@@ -363,7 +366,7 @@ async function upsertAreas(records) {
             'Prefer': 'resolution=merge-duplicates',
           });
         } catch (e2) {
-          console.error(`    Failed: ${row.deliveroo_area_slug} â ${e2.message}`);
+          console.error(`    Failed: ${row.deliveroo_area_slug} -> ${e2.message}`);
         }
       }
     }
@@ -371,9 +374,9 @@ async function upsertAreas(records) {
 }
 
 async function getExistingAreas() {
-  // Fetch all rows â table is <1000 rows, well within PostgREST default limit
+  // [FIX] Include deliveroo_city_id so Step 6 can scope deactivation by city
   const rows = await supabase(
-    '/deliveroo_area?select=deliveroo_area_id,deliveroo_area_is_active&limit=10000',
+    '/deliveroo_area?select=deliveroo_area_id,deliveroo_area_is_active,deliveroo_city_id&limit=10000',
     'GET',
     null,
     { 'Accept': 'application/json' }
@@ -396,16 +399,16 @@ async function markInactive(areaIds) {
   }
 }
 
-// âââ Main âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// --- Main -------------------------------------------------------------------
 
 async function main() {
   const startTime = Date.now();
-  console.log('âââââââââââââââââââââââââââââââââââââââââââ');
-  console.log('  Deliveroo UAE â Area Discovery & Sync');
-  console.log('âââââââââââââââââââââââââââââââââââââââââââ');
+  console.log('===================================================');
+  console.log('  Deliveroo UAE -- Area Discovery & Sync');
+  console.log('===================================================');
   console.log(`Started: ${new Date().toISOString()}\n`);
 
-  // ââ Step 1: Grid scan ââââââââââââââââââââââââââââââââââââââââââââââ
+  // -- Step 1: Grid scan -----------------------------------------------------
   console.log('STEP 1: Location API grid scan\n');
   const neighborhoods = await scanAllRegions();
 
@@ -414,7 +417,7 @@ async function main() {
     process.exit(1);
   }
 
-  // ââ Step 2: Resolve cities âââââââââââââââââââââââââââââââââââââââââ
+  // -- Step 2: Resolve cities ------------------------------------------------
   console.log('STEP 2: City resolution\n');
   const cityIds = new Set();
   for (const n of neighborhoods.values()) {
@@ -438,7 +441,7 @@ async function main() {
   // Upsert cities before areas (FK constraint)
   await upsertCities([...cityIds]);
 
-  // ââ Step 3: Read existing table for comparison âââââââââââââââââââââ
+  // -- Step 3: Read existing table for comparison ----------------------------
   console.log('\nSTEP 3: Read existing table\n');
   const existingAreas = await getExistingAreas();
   const existingMap = new Map();
@@ -447,7 +450,7 @@ async function main() {
   }
   console.log(`Existing table: ${existingAreas.length} rows (${existingAreas.filter(r => r.deliveroo_area_is_active).length} active)\n`);
 
-  // ââ Step 4: Enrich each neighborhood via page fetch ââââââââââââââââ
+  // -- Step 4: Enrich each neighborhood via page fetch -----------------------
   console.log('STEP 4: Enrich neighborhoods via page fetch\n');
   const records = [];
   const failedSlugs = [];
@@ -456,7 +459,7 @@ async function main() {
   for (const n of neighborhoods.values()) {
     const citySlug = CITY_MAP[n.cityId]?.slug;
     if (!citySlug) {
-      console.log(`  SKIP: ${n.name} â city_id ${n.cityId} unresolved`);
+      console.log(`  SKIP: ${n.name} -- city_id ${n.cityId} unresolved`);
       continue;
     }
 
@@ -464,7 +467,7 @@ async function main() {
 
     // Progress log
     if (enrichedCount % BATCH_PAUSE_EVERY === 0) {
-      console.log(`  Progress: ${enrichedCount}/${neighborhoods.size} â pausing ${BATCH_PAUSE_MS / 1000}s`);
+      console.log(`  Progress: ${enrichedCount}/${neighborhoods.size} -- pausing ${BATCH_PAUSE_MS / 1000}s`);
       await sleep(BATCH_PAUSE_MS);
     }
 
@@ -473,12 +476,12 @@ async function main() {
     // Determine is_active
     let isActive;
     if (enriched.fetchFailed) {
-      // Page fetch failed â preserve previous status if it exists, else default true
+      // Page fetch failed -- preserve previous status if it exists, else default true
       // (Location API returned this area, so Deliveroo's backend knows about it)
       const prev = existingMap.get(n.id);
       isActive = prev !== undefined ? prev : true;
       failedSlugs.push(n.slug);
-      console.log(`    FETCH FAILED: ${n.slug} â keeping is_active=${isActive}`);
+      console.log(`    FETCH FAILED: ${n.slug} -- keeping is_active=${isActive}`);
     } else {
       isActive = enriched.isActive;
       if (!isActive) {
@@ -486,14 +489,17 @@ async function main() {
       }
     }
 
+    // [FIX] Use ?? instead of || for null safety -- prevents undefined values
+    // that would cause PGRST102 "All object keys must match" in batch upserts.
+    // || treats 0 and "" as falsy and falls through; ?? only catches null/undefined.
     records.push({
       deliveroo_area_id: n.id,
       deliveroo_area_name: n.name,
       deliveroo_area_slug: n.slug,
       deliveroo_city_id: n.cityId,
-      deliveroo_area_geohash: enriched.geohash,
-      deliveroo_area_latitude: enriched.latitude || n.apiLat,
-      deliveroo_area_longitude: enriched.longitude || n.apiLng,
+      deliveroo_area_geohash: enriched.geohash ?? null,
+      deliveroo_area_latitude: enriched.latitude ?? n.apiLat ?? null,
+      deliveroo_area_longitude: enriched.longitude ?? n.apiLng ?? null,
       deliveroo_area_url: buildAreaUrl(citySlug, n.slug),
       deliveroo_area_is_active: isActive,
     });
@@ -501,15 +507,27 @@ async function main() {
     await sleep(PAGE_FETCH_DELAY_MS);
   }
 
-  // ââ Step 5: Upsert all records âââââââââââââââââââââââââââââââââââââ
+  // -- Step 5: Upsert all records --------------------------------------------
   console.log('\nSTEP 5: Upsert to Supabase\n');
   await upsertAreas(records);
 
-  // ââ Step 6: Mark inactive â areas in table but not in scan âââââââââ
+  // -- Step 6: Mark inactive -- areas in table but not in scan ---------------
   console.log('\nSTEP 6: Mark inactive areas\n');
   const discoveredIds = new Set(neighborhoods.keys());
+
+  // [FIX] In test mode, only deactivate areas within the scanned cities.
+  // Previously, test mode (scanning one emirate) would deactivate ALL areas
+  // in other emirates because they weren't in the scan results.
+  const scannedCityIds = new Set([...neighborhoods.values()].map(n => n.cityId));
+
   const toDeactivate = existingAreas
-    .filter(a => a.deliveroo_area_is_active && !discoveredIds.has(a.deliveroo_area_id))
+    .filter(a => {
+      if (!a.deliveroo_area_is_active) return false;       // already inactive
+      if (discoveredIds.has(a.deliveroo_area_id)) return false; // found in scan
+      // In test mode, skip areas outside the scanned cities
+      if (TEST_MODE && !scannedCityIds.has(a.deliveroo_city_id)) return false;
+      return true;
+    })
     .map(a => a.deliveroo_area_id);
 
   if (toDeactivate.length > 0) {
@@ -519,26 +537,26 @@ async function main() {
     console.log('  No areas to deactivate.');
   }
 
-  // ââ Summary ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+  // -- Summary ---------------------------------------------------------------
   const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
   const activeCount = records.filter(r => r.deliveroo_area_is_active).length;
   const inactiveCount = records.filter(r => !r.deliveroo_area_is_active).length;
   const newCount = records.filter(r => !existingMap.has(r.deliveroo_area_id)).length;
 
-  console.log('\nâââââââââââââââââââââââââââââââââââââââââââ');
+  console.log('\n===================================================');
   console.log('  Summary');
-  console.log('âââââââââââââââââââââââââââââââââââââââââââ');
-  console.log(`  Discovered:    ${neighborhoods.size} neighborhoods`);
-  console.log(`  Active:        ${activeCount}`);
-  console.log(`  Inactive:      ${inactiveCount}`);
-  console.log(`  New areas:     ${newCount}`);
-  console.log(`  Deactivated:   ${toDeactivate.length}`);
+  console.log('===================================================');
+  console.log(`  Discovered:     ${neighborhoods.size} neighborhoods`);
+  console.log(`  Active:         ${activeCount}`);
+  console.log(`  Inactive:       ${inactiveCount}`);
+  console.log(`  New areas:      ${newCount}`);
+  console.log(`  Deactivated:    ${toDeactivate.length}`);
   console.log(`  Failed fetches: ${failedSlugs.length}`);
   if (failedSlugs.length > 0) {
-    console.log(`    â ${failedSlugs.join(', ')}`);
+    console.log(`    -> ${failedSlugs.join(', ')}`);
   }
-  console.log(`  Runtime:       ${elapsed} minutes`);
-  console.log(`  Finished:      ${new Date().toISOString()}`);
+  console.log(`  Runtime:        ${elapsed} minutes`);
+  console.log(`  Finished:       ${new Date().toISOString()}`);
 }
 
 main().catch(e => {
