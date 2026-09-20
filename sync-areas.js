@@ -3,10 +3,16 @@
 // Deliveroo UAE Area Discovery & Sync
 //
 // Scans all UAE bounding boxes via the Deliveroo Location API,
-// fetches each area's page for enrichment data (geohash, lat/lng, active status),
+// derives enrichment data (geohash, lat/lng, active status) from grid scan results,
 // and upserts complete records to Supabase.
 //
 // The code owns ALL decisions. Supabase receives and stores.
+//
+// Architecture: the Location API grid scan is the single source of truth.
+// - An area that appears in the scan is ACTIVE (Deliveroo serves it).
+// - An area that was previously known but no longer appears is INACTIVE.
+// - Geohash and lat/lng are computed from the centroid of grid hits.
+// - No page scraping is needed â avoids PerimeterX bot detection and 429s.
 
 // --- Config -----------------------------------------------------------------
 
@@ -24,7 +30,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 // --- City Map ---------------------------------------------------------------
 // city_id -> { name, slug } for all known UAE emirates.
-// Includes Fujairah and UAQ as placeholders -- IDs unknown until they activate.
+// Includes Fujairah and UAQ as placeholders â IDs unknown until they activate.
 
 const CITY_MAP = {
   40:   { name: 'Dubai',           slug: 'dubai' },
@@ -35,39 +41,33 @@ const CITY_MAP = {
   2541: { name: 'Ras Al Khaimah',  slug: 'ras-al-khaimah' },
 };
 
-// Names and slugs for cities that don't exist yet -- used when a new city_id appears
+// Names and slugs for cities that don't exist yet â used when a new city_id appears
 const POTENTIAL_CITIES = [
   { name: 'Fujairah',       slug: 'fujairah' },
   { name: 'Umm Al Quwain',  slug: 'umm-al-quwain' },
 ];
 
 // --- Bounding Boxes ---------------------------------------------------------
-// 0.008 deg spacing -- 800-900m. All 9 emirates scanned every run.
+// 0.008 deg spacing â 800-900m. All 9 emirates scanned every run.
 
 const REGIONS = [
-  { name: 'Dubai',           latMin: 24.82, latMax: 25.36, lngMin: 54.89, lngMax: 55.55 },
-  { name: 'Abu Dhabi',       latMin: 24.35, latMax: 24.55, lngMin: 54.30, lngMax: 54.80 },
-  { name: 'Abu Dhabi North', latMin: 24.55, latMax: 24.70, lngMin: 54.55, lngMax: 54.75 },
-  { name: 'Sharjah',         latMin: 25.28, latMax: 25.42, lngMin: 55.30, lngMax: 55.55 },
-  { name: 'Al Ain',          latMin: 24.16, latMax: 24.30, lngMin: 55.68, lngMax: 55.82 },
-  { name: 'Ajman',           latMin: 25.38, latMax: 25.44, lngMin: 55.42, lngMax: 55.52 },
-  { name: 'Ras Al Khaimah',  latMin: 25.72, latMax: 25.84, lngMin: 55.92, lngMax: 56.02 },
-  { name: 'Fujairah',        latMin: 25.10, latMax: 25.16, lngMin: 56.32, lngMax: 56.38 },
-  { name: 'Umm Al Quwain',   latMin: 25.54, latMax: 25.58, lngMin: 55.55, lngMax: 55.60 },
+  { name: 'Dubai',            latMin: 24.82, latMax: 25.36, lngMin: 54.89, lngMax: 55.55 },
+  { name: 'Abu Dhabi',        latMin: 24.35, latMax: 24.55, lngMin: 54.30, lngMax: 54.80 },
+  { name: 'Abu Dhabi North',  latMin: 24.55, latMax: 24.70, lngMin: 54.55, lngMax: 54.75 },
+  { name: 'Sharjah',          latMin: 25.28, latMax: 25.42, lngMin: 55.30, lngMax: 55.55 },
+  { name: 'Al Ain',           latMin: 24.16, latMax: 24.30, lngMin: 55.68, lngMax: 55.82 },
+  { name: 'Ajman',            latMin: 25.38, latMax: 25.44, lngMin: 55.42, lngMax: 55.52 },
+  { name: 'Ras Al Khaimah',   latMin: 25.72, latMax: 25.84, lngMin: 55.92, lngMax: 56.02 },
+  { name: 'Fujairah',         latMin: 25.10, latMax: 25.16, lngMin: 56.32, lngMax: 56.38 },
+  { name: 'Umm Al Quwain',    latMin: 25.54, latMax: 25.58, lngMin: 55.55, lngMax: 55.60 },
 ];
 
 const GRID_STEP = 0.008;
-const MAX_CONCURRENT = 1;
-const PAGE_FETCH_DELAY_MS = TEST_MODE ? 2000 : 5000;   // more polite in full runs
-const MAX_RETRIES = TEST_MODE ? 3 : 5;                 // full run: try harder
-const INITIAL_RETRY_DELAY_MS = 5000;
-const MAX_RETRY_DELAY_MS = 60000;                       // cap backoff at 60s
-const BATCH_PAUSE_EVERY = TEST_MODE ? 25 : 15;         // full run: smaller batches
-const BATCH_PAUSE_MS = TEST_MODE ? 10000 : 30000;      // full run: 30s between batches
+const MAX_CONCURRENT = 5;      // Location API has no rate limiting â 5 is polite
+const BATCH_DELAY_MS = 100;    // Small pause between batches for good citizenship
 
 const LOCATION_API = 'https://api.ae.deliveroo.com/orderapp/v1/location';
 const AREA_PAGE_BASE = 'https://deliveroo.ae/en/restaurants';
-const URL_PARAMS = '?collection=restaurants&collection=all-restaurants';
 
 // --- Utilities --------------------------------------------------------------
 
@@ -76,7 +76,53 @@ function sleep(ms) {
 }
 
 function buildAreaUrl(citySlug, areaSlug) {
-  return `${AREA_PAGE_BASE}/${citySlug}/${areaSlug}${URL_PARAMS}`;
+  return `${AREA_PAGE_BASE}/${citySlug}/${areaSlug}`;
+}
+
+// --- Geohash Encoding -------------------------------------------------------
+// Pure implementation â no external dependencies required.
+// Encodes (lat, lng) to a geohash string of the given precision (default 7).
+
+const GEOHASH_BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+
+function encodeGeohash(lat, lng, precision = 7) {
+  let latMin = -90, latMax = 90;
+  let lngMin = -180, lngMax = 180;
+  let hash = '';
+  let bit = 0;
+  let ch = 0;
+  let isLng = true;
+
+  while (hash.length < precision) {
+    if (isLng) {
+      const mid = (lngMin + lngMax) / 2;
+      if (lng >= mid) {
+        ch |= (1 << (4 - bit));
+        lngMin = mid;
+      } else {
+        lngMax = mid;
+      }
+    } else {
+      const mid = (latMin + latMax) / 2;
+      if (lat >= mid) {
+        ch |= (1 << (4 - bit));
+        latMin = mid;
+      } else {
+        latMax = mid;
+      }
+    }
+
+    isLng = !isLng;
+    bit++;
+
+    if (bit === 5) {
+      hash += GEOHASH_BASE32[ch];
+      bit = 0;
+      ch = 0;
+    }
+  }
+
+  return hash;
 }
 
 // --- Location API Scanning --------------------------------------------------
@@ -101,6 +147,11 @@ async function queryLocationAPI(lat, lng) {
   }
 }
 
+/**
+ * Scans all regions and collects every grid hit per neighborhood.
+ * Returns a Map of neighborhood.id -> { id, name, slug, cityId, hits: [{lat, lng}] }
+ * where `hits` contains every grid point that returned this neighborhood.
+ */
 async function scanAllRegions() {
   const neighborhoods = new Map(); // neighborhood.id -> data
   const regionsToScan = TEST_MODE
@@ -117,7 +168,7 @@ async function scanAllRegions() {
   for (const region of regionsToScan) {
     const points = generateGridPoints(region);
     totalPoints += points.length;
-    console.log(`Scanning ${region.name} -- ${points.length} grid points`);
+    console.log(`Scanning ${region.name} â ${points.length} grid points`);
 
     let regionNewCount = 0;
 
@@ -127,142 +178,63 @@ async function scanAllRegions() {
         batch.map(p => queryLocationAPI(p.lat, p.lng))
       );
 
-      for (const r of results) {
+      // Progress logging every 200 points
+      if (i > 0 && i % 200 === 0) {
+        console.log(`  Progress: ${i}/${points.length} (${((i / points.length) * 100).toFixed(0)}%)`);
+      }
+
+      // Polite delay between batches
+      if (BATCH_DELAY_MS > 0) await sleep(BATCH_DELAY_MS);
+
+      for (let j = 0; j < results.length; j++) {
+        const r = results[j];
         if (!r || !r.neighborhood) continue;
         totalHits++;
         const id = r.neighborhood.id;
+
         if (!neighborhoods.has(id)) {
           neighborhoods.set(id, {
             id,
             name: r.neighborhood.name,
             slug: r.neighborhood.uname,
-            zoneId: r.zone.id,
             cityId: r.zone.city_id,
-            apiLat: r.coordinates.lat,
-            apiLng: r.coordinates.lng,
+            hits: [],
           });
           regionNewCount++;
         }
+
+        // Record the grid point that found this neighborhood
+        neighborhoods.get(id).hits.push({
+          lat: batch[j].lat,
+          lng: batch[j].lng,
+        });
       }
     }
 
-    console.log(`  -> ${regionNewCount} unique neighborhoods found`);
+    console.log(`  â ${regionNewCount} unique neighborhoods found`);
   }
 
   console.log(`\nGrid scan complete: ${totalPoints} points queried, ${totalHits} hits, ${neighborhoods.size} unique neighborhoods\n`);
   return neighborhoods;
 }
 
-// --- Area Page Fetching & Enrichment ----------------------------------------
-
-async function fetchWithRetry(url) {
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const resp = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; AreaSync/1.0)',
-          'Accept': 'text/html,application/xhtml+xml',
-        },
-      });
-
-      if (resp.status === 429) {
-        const delay = Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
-        console.log(`    429 rate limited -- retrying in ${delay / 1000}s`);
-        await sleep(delay);
-        continue;
-      }
-
-      return resp;
-    } catch (e) {
-      if (attempt < MAX_RETRIES) {
-        const delay = Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
-        console.log(`    Fetch error (${e.message}) -- retrying in ${delay / 1000}s`);
-        await sleep(delay);
-      }
-    }
-  }
-  return null;
-}
-
-function extractPageData(html) {
-  const match = html.match(
-    /<script id="__NEXT_DATA__" type="application\/json">(.+?)<\/script>/s
-  );
-  if (!match) return null;
-
-  try {
-    const data = JSON.parse(match[1]);
-    const meta = data?.props?.initialState?.home?.feed?.meta;
-    const location = meta?.location;
-    const restaurantCount = meta?.restaurantCount;
-
-    // restaurantCount.results reflects the number of restaurants listed in this
-    // area. Active areas have restaurants registered; inactive areas (concourses,
-    // beaches, placeholder zones) always have 0.
-    const hasRestaurants = (restaurantCount?.results || 0) > 0;
-
-    return {
-      geohash: location?.geohash || null,
-      latitude: location?.lat || null,
-      longitude: location?.lon || null,
-      hasRestaurants,
-      restaurantCount: restaurantCount?.results || 0,
-    };
-  } catch (e) {
-    console.log(`    __NEXT_DATA__ parse error: ${e.message}`);
-    return null;
-  }
-}
+// --- Enrichment from Grid Data ----------------------------------------------
 
 /**
- * Fetch an area's page to determine:
- * - is_active -- based on restaurantCount > 0 from __NEXT_DATA__.
- *   Active areas have restaurants registered; inactive areas (concourses,
- *   beaches, placeholder zones) always have restaurantCount = 0.
- * - geohash, latitude, longitude (from __NEXT_DATA__)
- *
- * Returns { isActive, geohash, latitude, longitude, restaurantCount, fetchFailed }
+ * Compute centroid (average lat/lng) and geohash from grid hits.
+ * For areas with many hits, the centroid is a good approximation of the
+ * area's center. For areas with few hits, it's still the best we have.
  */
-async function enrichArea(citySlug, areaSlug) {
-  const url = buildAreaUrl(citySlug, areaSlug);
+function computeEnrichment(hits) {
+  if (!hits || hits.length === 0) return { latitude: null, longitude: null, geohash: null };
 
-  try {
-    const resp = await fetchWithRetry(url);
+  const sumLat = hits.reduce((s, h) => s + h.lat, 0);
+  const sumLng = hits.reduce((s, h) => s + h.lng, 0);
+  const latitude = parseFloat((sumLat / hits.length).toFixed(6));
+  const longitude = parseFloat((sumLng / hits.length).toFixed(6));
+  const geohash = encodeGeohash(latitude, longitude);
 
-    // Page fetch completely failed after retries
-    if (!resp) {
-      return { isActive: null, geohash: null, latitude: null, longitude: null, fetchFailed: true };
-    }
-
-    // 404 or other error status -- inactive
-    if (!resp.ok) {
-      return { isActive: false, geohash: null, latitude: null, longitude: null, fetchFailed: false };
-    }
-
-    const html = await resp.text();
-    const pageData = extractPageData(html);
-
-    // No __NEXT_DATA__ or can't parse -- inactive
-    if (!pageData) {
-      return { isActive: false, geohash: null, latitude: null, longitude: null, fetchFailed: false };
-    }
-
-    // Active = restaurantCount > 0 (area has restaurants registered to it).
-    // Inactive areas (airport concourses, beaches, etc.) always have 0.
-    const isActive = pageData.hasRestaurants;
-
-    return {
-      isActive,
-      geohash: pageData.geohash,
-      latitude: pageData.latitude,
-      longitude: pageData.longitude,
-      restaurantCount: pageData.restaurantCount,
-      fetchFailed: false,
-    };
-  } catch (e) {
-    console.log(`    Enrichment error for ${areaSlug}: ${e.message}`);
-    return { isActive: null, geohash: null, latitude: null, longitude: null, fetchFailed: true };
-  }
+  return { latitude, longitude, geohash };
 }
 
 // --- New City Detection -----------------------------------------------------
@@ -273,21 +245,20 @@ function resolveNewCity(cityId, neighborhoodNames) {
     const lower = pc.name.toLowerCase();
     if (neighborhoodNames.some(n => n.toLowerCase().includes(lower))) {
       CITY_MAP[cityId] = { name: pc.name, slug: pc.slug };
-      console.log(`  Mapped new city_id ${cityId} -> ${pc.name} (${pc.slug})`);
+      console.log(`  Mapped new city_id ${cityId} â ${pc.name} (${pc.slug})`);
       return CITY_MAP[cityId];
     }
   }
 
   // Fallback: derive from first neighborhood name (often prefixed with city name)
   if (neighborhoodNames.length > 0) {
-    // E.g., "Fujairah Downtown" -> city name "Fujairah"
     const first = neighborhoodNames[0];
     const parts = first.split(' ');
     if (parts.length >= 2) {
       const name = parts[0];
       const slug = name.toLowerCase().replace(/\s+/g, '-');
       CITY_MAP[cityId] = { name, slug };
-      console.log(`  Derived new city_id ${cityId} -> ${name} (${slug}) from "${first}"`);
+      console.log(`  Derived new city_id ${cityId} â ${name} (${slug}) from "${first}"`);
       return CITY_MAP[cityId];
     }
   }
@@ -313,7 +284,7 @@ async function supabase(path, method, body = null, extraHeaders = {}) {
   const text = await resp.text();
 
   if (!resp.ok) {
-    throw new Error(`Supabase ${method} ${path} -> ${resp.status}: ${text}`);
+    throw new Error(`Supabase ${method} ${path} â ${resp.status}: ${text}`);
   }
 
   return text ? JSON.parse(text) : null;
@@ -351,7 +322,7 @@ async function upsertAreas(records) {
       await supabase('/deliveroo_area?on_conflict=deliveroo_area_id', 'POST', batch, {
         'Prefer': 'resolution=merge-duplicates',
       });
-      console.log(`  Batch ${batchNum}/${totalBatches} -> ${batch.length} rows`);
+      console.log(`  Batch ${batchNum}/${totalBatches} â ${batch.length} rows`);
     } catch (e) {
       console.error(`  Batch ${batchNum} failed: ${e.message}`);
       // Fall back to individual upserts so one bad row doesn't block the rest
@@ -361,7 +332,7 @@ async function upsertAreas(records) {
             'Prefer': 'resolution=merge-duplicates',
           });
         } catch (e2) {
-          console.error(`    Failed: ${row.deliveroo_area_slug} -> ${e2.message}`);
+          console.error(`  Failed: ${row.deliveroo_area_slug} â ${e2.message}`);
         }
       }
     }
@@ -369,9 +340,8 @@ async function upsertAreas(records) {
 }
 
 async function getExistingAreas() {
-  // Include city_id so Step 6 can scope deactivation by city in test mode
   const rows = await supabase(
-    '/deliveroo_area?select=deliveroo_area_id,deliveroo_area_is_active,deliveroo_city_id&limit=10000',
+    '/deliveroo_area?select=deliveroo_area_id,deliveroo_area_slug,deliveroo_area_is_active,deliveroo_city_id,deliveroo_area_geohash,deliveroo_area_latitude,deliveroo_area_longitude&limit=10000',
     'GET',
     null,
     { 'Accept': 'application/json' }
@@ -399,7 +369,7 @@ async function markInactive(areaIds) {
 async function main() {
   const startTime = Date.now();
   console.log('===================================================');
-  console.log('  Deliveroo UAE -- Area Discovery & Sync');
+  console.log('  Deliveroo UAE â Area Discovery & Sync');
   console.log('===================================================');
   console.log(`Started: ${new Date().toISOString()}\n`);
 
@@ -412,14 +382,23 @@ async function main() {
     process.exit(1);
   }
 
-  // -- Step 2: Resolve cities ------------------------------------------------
-  console.log('STEP 2: City resolution\n');
+  // -- Step 2: Compute enrichment from grid data -----------------------------
+  console.log('STEP 2: Compute enrichment (centroid + geohash)\n');
+  for (const n of neighborhoods.values()) {
+    const enrichment = computeEnrichment(n.hits);
+    n.latitude = enrichment.latitude;
+    n.longitude = enrichment.longitude;
+    n.geohash = enrichment.geohash;
+    console.log(`  ${n.name}: ${n.hits.length} hits â lat=${n.latitude}, lng=${n.longitude}, geohash=${n.geohash}`);
+  }
+
+  // -- Step 3: Resolve cities ------------------------------------------------
+  console.log('\nSTEP 3: City resolution\n');
   const cityIds = new Set();
   for (const n of neighborhoods.values()) {
     cityIds.add(n.cityId);
   }
 
-  // Detect unknown city IDs
   const unknownIds = [...cityIds].filter(id => !CITY_MAP[id]);
   if (unknownIds.length > 0) {
     console.log(`New city IDs detected: ${unknownIds.join(', ')}`);
@@ -433,94 +412,61 @@ async function main() {
     console.log('All city IDs known.');
   }
 
-  // Upsert cities before areas (FK constraint)
   await upsertCities([...cityIds]);
 
-  // -- Step 3: Read existing table for comparison ----------------------------
-  console.log('\nSTEP 3: Read existing table\n');
+  // -- Step 4: Read existing table for comparison ----------------------------
+  console.log('\nSTEP 4: Read existing table\n');
   const existingAreas = await getExistingAreas();
   const existingMap = new Map();
   for (const row of existingAreas) {
-    existingMap.set(row.deliveroo_area_id, row.deliveroo_area_is_active);
+    existingMap.set(row.deliveroo_area_id, row);
   }
   console.log(`Existing table: ${existingAreas.length} rows (${existingAreas.filter(r => r.deliveroo_area_is_active).length} active)\n`);
 
-  // -- Step 4: Enrich each neighborhood via page fetch -----------------------
-  console.log('STEP 4: Enrich neighborhoods via page fetch\n');
+  // -- Step 5: Build records -------------------------------------------------
+  // Every area found in the grid scan is active â the Location API returned it.
+  // For existing areas that already have enrichment data (geohash, lat/lng),
+  // preserve the existing values unless the computed ones are better.
+  console.log('STEP 5: Build area records\n');
   const records = [];
-  const failedSlugs = [];
-  let enrichedCount = 0;
-  let consecutiveFails = 0;        // adaptive pacing: track consecutive fetch failures
-  let currentDelay = PAGE_FETCH_DELAY_MS;
 
   for (const n of neighborhoods.values()) {
     const citySlug = CITY_MAP[n.cityId]?.slug;
     if (!citySlug) {
-      console.log(`  SKIP: ${n.name} -- city_id ${n.cityId} unresolved`);
+      console.log(`  SKIP: ${n.name} â city_id ${n.cityId} unresolved`);
       continue;
     }
 
-    enrichedCount++;
+    const existing = existingMap.get(n.id);
 
-    // Progress log and batch pause
-    if (enrichedCount % BATCH_PAUSE_EVERY === 0) {
-      console.log(`  Progress: ${enrichedCount}/${neighborhoods.size} -- pausing ${BATCH_PAUSE_MS / 1000}s`);
-      await sleep(BATCH_PAUSE_MS);
-    }
+    // For geohash/lat/lng: prefer existing values if present (they may have
+    // come from a more precise source), otherwise use the computed centroid.
+    const geohash = existing?.deliveroo_area_geohash || n.geohash;
+    const latitude = existing?.deliveroo_area_latitude || n.latitude;
+    const longitude = existing?.deliveroo_area_longitude || n.longitude;
 
-    const enriched = await enrichArea(citySlug, n.slug);
-
-    // Determine is_active
-    let isActive;
-    if (enriched.fetchFailed) {
-      // Page fetch failed -- preserve previous status if it exists, else default true
-      // (Location API returned this area, so Deliveroo's backend knows about it)
-      const prev = existingMap.get(n.id);
-      isActive = prev !== undefined ? prev : true;
-      failedSlugs.push(n.slug);
-      console.log(`    FETCH FAILED: ${n.slug} -- keeping is_active=${isActive}`);
-
-      // Adaptive pacing: back off when getting consecutive failures (likely 429s)
-      consecutiveFails++;
-      if (consecutiveFails >= 3) {
-        currentDelay = Math.min(currentDelay * 2, 60000); // double delay, cap at 60s
-        console.log(`    Adaptive pacing: ${consecutiveFails} consecutive failures, delay now ${currentDelay / 1000}s`);
-      }
-    } else {
-      isActive = enriched.isActive;
-      if (!isActive) {
-        console.log(`    INACTIVE: ${n.slug} (restaurantCount=${enriched.restaurantCount})`);
-      }
-      // Reset adaptive pacing on success
-      if (consecutiveFails > 0) {
-        consecutiveFails = 0;
-        currentDelay = PAGE_FETCH_DELAY_MS;
-      }
-    }
-
-    // Use ?? (nullish coalescing) for null safety -- ensures every record has
-    // identical keys, which PostgREST requires for batch upserts (PGRST102).
     records.push({
       deliveroo_area_id: n.id,
       deliveroo_area_name: n.name,
       deliveroo_area_slug: n.slug,
       deliveroo_city_id: n.cityId,
-      deliveroo_area_geohash: enriched.geohash ?? null,
-      deliveroo_area_latitude: enriched.latitude ?? n.apiLat ?? null,
-      deliveroo_area_longitude: enriched.longitude ?? n.apiLng ?? null,
+      deliveroo_area_geohash: geohash ?? null,
+      deliveroo_area_latitude: latitude ?? null,
+      deliveroo_area_longitude: longitude ?? null,
       deliveroo_area_url: buildAreaUrl(citySlug, n.slug),
-      deliveroo_area_is_active: isActive,
+      deliveroo_area_is_active: true,  // present in grid scan = active
     });
-
-    await sleep(currentDelay);
   }
 
-  // -- Step 5: Upsert all records --------------------------------------------
-  console.log('\nSTEP 5: Upsert to Supabase\n');
+  const newCount = records.filter(r => !existingMap.has(r.deliveroo_area_id)).length;
+  console.log(`Built ${records.length} records (${newCount} new)`);
+
+  // -- Step 6: Upsert all records --------------------------------------------
+  console.log('\nSTEP 6: Upsert to Supabase\n');
   await upsertAreas(records);
 
-  // -- Step 6: Mark inactive -- areas in table but not in scan ---------------
-  console.log('\nSTEP 6: Mark inactive areas\n');
+  // -- Step 7: Mark inactive â areas in table but not in scan ----------------
+  console.log('\nSTEP 7: Mark inactive areas\n');
   const discoveredIds = new Set(neighborhoods.keys());
 
   // In test mode, only deactivate areas within the scanned cities so that
@@ -529,9 +475,8 @@ async function main() {
 
   const toDeactivate = existingAreas
     .filter(a => {
-      if (!a.deliveroo_area_is_active) return false;       // already inactive
+      if (!a.deliveroo_area_is_active) return false; // already inactive
       if (discoveredIds.has(a.deliveroo_area_id)) return false; // found in scan
-      // In test mode, skip areas outside the scanned cities
       if (TEST_MODE && !scannedCityIds.has(a.deliveroo_city_id)) return false;
       return true;
     })
@@ -539,31 +484,27 @@ async function main() {
 
   if (toDeactivate.length > 0) {
     await markInactive(toDeactivate);
-    console.log(`  Deactivated ${toDeactivate.length} area(s): ${toDeactivate.join(', ')}`);
+    const slugs = toDeactivate.map(id => {
+      const existing = existingMap.get(id);
+      return existing?.deliveroo_area_slug || id;
+    });
+    console.log(`  Deactivated ${toDeactivate.length} area(s): ${slugs.join(', ')}`);
   } else {
     console.log('  No areas to deactivate.');
   }
 
   // -- Summary ---------------------------------------------------------------
   const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
-  const activeCount = records.filter(r => r.deliveroo_area_is_active).length;
-  const inactiveCount = records.filter(r => !r.deliveroo_area_is_active).length;
-  const newCount = records.filter(r => !existingMap.has(r.deliveroo_area_id)).length;
 
   console.log('\n===================================================');
   console.log('  Summary');
   console.log('===================================================');
-  console.log(`  Discovered:     ${neighborhoods.size} neighborhoods`);
-  console.log(`  Active:         ${activeCount}`);
-  console.log(`  Inactive:       ${inactiveCount}`);
-  console.log(`  New areas:      ${newCount}`);
-  console.log(`  Deactivated:    ${toDeactivate.length}`);
-  console.log(`  Failed fetches: ${failedSlugs.length}`);
-  if (failedSlugs.length > 0) {
-    console.log(`    -> ${failedSlugs.join(', ')}`);
-  }
-  console.log(`  Runtime:        ${elapsed} minutes`);
-  console.log(`  Finished:       ${new Date().toISOString()}`);
+  console.log(`  Discovered: ${neighborhoods.size} neighborhoods`);
+  console.log(`  Active:     ${records.length}`);
+  console.log(`  New areas:  ${newCount}`);
+  console.log(`  Deactivated: ${toDeactivate.length}`);
+  console.log(`  Runtime:    ${elapsed} minutes`);
+  console.log(`  Finished:   ${new Date().toISOString()}`);
 }
 
 main().catch(e => {
