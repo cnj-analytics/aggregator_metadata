@@ -2,17 +2,22 @@
 //
 // Deliveroo UAE Area Discovery & Sync
 //
-// Scans all UAE bounding boxes via the Deliveroo Location API,
+// Scans UAE bounding boxes via the Deliveroo Location API,
 // derives enrichment data (geohash, lat/lng, active status) from grid scan results,
 // and upserts complete records to Supabase.
 //
-// The code owns ALL decisions. Supabase receives and stores.
+// Data ownership:
+//   deliveroo_country  — maintained by us (the only table we define).
+//   deliveroo_city     — discovered from Deliveroo. City IDs, names, and assignment
+//                        come from the Location API's zone data, not from this code.
+//   deliveroo_area     — discovered from Deliveroo. Neighborhood IDs, names, slugs,
+//                        and city assignment come from the API response.
 //
 // Architecture: the Location API grid scan is the single source of truth.
 // - An area that appears in the scan is ACTIVE (Deliveroo serves it).
 // - An area that was previously known but no longer appears is INACTIVE.
 // - Geohash and lat/lng are computed from the centroid of grid hits.
-// - No page scraping is needed â avoids PerimeterX bot detection and 429s.
+// - No page scraping is needed — avoids PerimeterX bot detection and 429s.
 
 // --- Config -----------------------------------------------------------------
 
@@ -28,27 +33,10 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   process.exit(1);
 }
 
-// --- City Map ---------------------------------------------------------------
-// city_id -> { name, slug } for all known UAE emirates.
-// Includes Fujairah and UAQ as placeholders â IDs unknown until they activate.
-
-const CITY_MAP = {
-  40:   { name: 'Dubai',           slug: 'dubai' },
-  148:  { name: 'Abu Dhabi',       slug: 'abu-dhabi' },
-  586:  { name: 'Sharjah',         slug: 'sharjah' },
-  1123: { name: 'Al Ain',          slug: 'al-ain' },
-  2407: { name: 'Ajman',           slug: 'ajman' },
-  2541: { name: 'Ras Al Khaimah',  slug: 'ras-al-khaimah' },
-};
-
-// Names and slugs for cities that don't exist yet â used when a new city_id appears
-const POTENTIAL_CITIES = [
-  { name: 'Fujairah',       slug: 'fujairah' },
-  { name: 'Umm Al Quwain',  slug: 'umm-al-quwain' },
-];
-
 // --- Bounding Boxes ---------------------------------------------------------
-// 0.008 deg spacing â 800-900m. All 9 emirates scanned every run.
+// Geographic scan zones — 0.008 deg spacing (~800-900m).
+// These define WHERE to scan, not which city a point belongs to.
+// City assignment comes from the Deliveroo API response (zone.city_id).
 
 const REGIONS = [
   { name: 'Dubai',            latMin: 24.82, latMax: 25.36, lngMin: 54.89, lngMax: 55.55 },
@@ -63,7 +51,7 @@ const REGIONS = [
 ];
 
 const GRID_STEP = 0.008;
-const MAX_CONCURRENT = 5;      // Location API has no rate limiting â 5 is polite
+const MAX_CONCURRENT = 5;      // Location API has no rate limiting — 5 is polite
 const BATCH_DELAY_MS = 100;    // Small pause between batches for good citizenship
 
 const LOCATION_API = 'https://api.ae.deliveroo.com/orderapp/v1/location';
@@ -75,12 +63,16 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function slugify(name) {
+  return name.toLowerCase().replace(/\s+/g, '-');
+}
+
 function buildAreaUrl(citySlug, areaSlug) {
   return `${AREA_PAGE_BASE}/${citySlug}/${areaSlug}`;
 }
 
 // --- Geohash Encoding -------------------------------------------------------
-// Pure implementation â no external dependencies required.
+// Pure implementation — no external dependencies required.
 // Encodes (lat, lng) to a geohash string of the given precision (default 7).
 
 const GEOHASH_BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz';
@@ -168,7 +160,7 @@ async function scanAllRegions() {
   for (const region of regionsToScan) {
     const points = generateGridPoints(region);
     totalPoints += points.length;
-    console.log(`Scanning ${region.name} â ${points.length} grid points`);
+    console.log(`Scanning ${region.name} — ${points.length} grid points`);
 
     let regionNewCount = 0;
 
@@ -198,6 +190,7 @@ async function scanAllRegions() {
             name: r.neighborhood.name,
             slug: r.neighborhood.uname,
             cityId: r.zone.city_id,
+            zone: r.zone,  // preserve full zone data — city info comes from Deliveroo
             hits: [],
           });
           regionNewCount++;
@@ -211,7 +204,7 @@ async function scanAllRegions() {
       }
     }
 
-    console.log(`  â ${regionNewCount} unique neighborhoods found`);
+    console.log(`  → ${regionNewCount} unique neighborhoods found`);
   }
 
   console.log(`\nGrid scan complete: ${totalPoints} points queried, ${totalHits} hits, ${neighborhoods.size} unique neighborhoods\n`);
@@ -237,36 +230,6 @@ function computeEnrichment(hits) {
   return { latitude, longitude, geohash };
 }
 
-// --- New City Detection -----------------------------------------------------
-
-function resolveNewCity(cityId, neighborhoodNames) {
-  // Try matching against known potential cities
-  for (const pc of POTENTIAL_CITIES) {
-    const lower = pc.name.toLowerCase();
-    if (neighborhoodNames.some(n => n.toLowerCase().includes(lower))) {
-      CITY_MAP[cityId] = { name: pc.name, slug: pc.slug };
-      console.log(`  Mapped new city_id ${cityId} â ${pc.name} (${pc.slug})`);
-      return CITY_MAP[cityId];
-    }
-  }
-
-  // Fallback: derive from first neighborhood name (often prefixed with city name)
-  if (neighborhoodNames.length > 0) {
-    const first = neighborhoodNames[0];
-    const parts = first.split(' ');
-    if (parts.length >= 2) {
-      const name = parts[0];
-      const slug = name.toLowerCase().replace(/\s+/g, '-');
-      CITY_MAP[cityId] = { name, slug };
-      console.log(`  Derived new city_id ${cityId} â ${name} (${slug}) from "${first}"`);
-      return CITY_MAP[cityId];
-    }
-  }
-
-  console.error(`  WARNING: Cannot resolve city for city_id=${cityId}. Areas in this city will be skipped.`);
-  return null;
-}
-
 // --- Supabase Operations ----------------------------------------------------
 
 async function supabase(path, method, body = null, extraHeaders = {}) {
@@ -284,27 +247,27 @@ async function supabase(path, method, body = null, extraHeaders = {}) {
   const text = await resp.text();
 
   if (!resp.ok) {
-    throw new Error(`Supabase ${method} ${path} â ${resp.status}: ${text}`);
+    throw new Error(`Supabase ${method} ${path} → ${resp.status}: ${text}`);
   }
 
   return text ? JSON.parse(text) : null;
 }
 
-async function upsertCities(cityIds) {
-  const rows = [];
-  for (const id of cityIds) {
-    const city = CITY_MAP[id];
-    if (!city) continue;
-    rows.push({
-      deliveroo_city_id: id,
-      deliveroo_city_name: city.name,
-      deliveroo_country_id: UAE_COUNTRY_ID,
-    });
-  }
-  if (rows.length === 0) return;
+async function getExistingCities() {
+  const rows = await supabase(
+    `/deliveroo_city?select=deliveroo_city_id,deliveroo_city_name&deliveroo_country_id=eq.${UAE_COUNTRY_ID}&limit=1000`,
+    'GET',
+    null,
+    { 'Accept': 'application/json' }
+  );
+  return rows || [];
+}
 
-  console.log(`Upserting ${rows.length} cities to Supabase...`);
-  await supabase('/deliveroo_city?on_conflict=deliveroo_city_id', 'POST', rows, {
+async function upsertCities(cityRows) {
+  if (cityRows.length === 0) return;
+
+  console.log(`Upserting ${cityRows.length} cities to Supabase...`);
+  await supabase('/deliveroo_city?on_conflict=deliveroo_city_id', 'POST', cityRows, {
     'Prefer': 'resolution=merge-duplicates',
   });
 }
@@ -322,7 +285,7 @@ async function upsertAreas(records) {
       await supabase('/deliveroo_area?on_conflict=deliveroo_area_id', 'POST', batch, {
         'Prefer': 'resolution=merge-duplicates',
       });
-      console.log(`  Batch ${batchNum}/${totalBatches} â ${batch.length} rows`);
+      console.log(`  Batch ${batchNum}/${totalBatches} → ${batch.length} rows`);
     } catch (e) {
       console.error(`  Batch ${batchNum} failed: ${e.message}`);
       // Fall back to individual upserts so one bad row doesn't block the rest
@@ -332,7 +295,7 @@ async function upsertAreas(records) {
             'Prefer': 'resolution=merge-duplicates',
           });
         } catch (e2) {
-          console.error(`  Failed: ${row.deliveroo_area_slug} â ${e2.message}`);
+          console.error(`  Failed: ${row.deliveroo_area_slug} → ${e2.message}`);
         }
       }
     }
@@ -369,7 +332,7 @@ async function markInactive(areaIds) {
 async function main() {
   const startTime = Date.now();
   console.log('===================================================');
-  console.log('  Deliveroo UAE â Area Discovery & Sync');
+  console.log('  Deliveroo UAE — Area Discovery & Sync');
   console.log('===================================================');
   console.log(`Started: ${new Date().toISOString()}\n`);
 
@@ -389,30 +352,77 @@ async function main() {
     n.latitude = enrichment.latitude;
     n.longitude = enrichment.longitude;
     n.geohash = enrichment.geohash;
-    console.log(`  ${n.name}: ${n.hits.length} hits â lat=${n.latitude}, lng=${n.longitude}, geohash=${n.geohash}`);
+    console.log(`  ${n.name}: ${n.hits.length} hits → lat=${n.latitude}, lng=${n.longitude}, geohash=${n.geohash}`);
   }
 
-  // -- Step 3: Resolve cities ------------------------------------------------
+  // -- Step 3: City resolution ------------------------------------------------
+  // City data comes from Deliveroo, not from this code.
+  // Read what we already know from Supabase, then check for new cities from the API.
   console.log('\nSTEP 3: City resolution\n');
-  const cityIds = new Set();
+
+  const existingCities = await getExistingCities();
+  const cityMap = new Map(); // city_id -> { name, slug }
+  for (const row of existingCities) {
+    cityMap.set(row.deliveroo_city_id, {
+      name: row.deliveroo_city_name,
+      slug: slugify(row.deliveroo_city_name),
+    });
+  }
+  console.log(`Loaded ${cityMap.size} existing cities from Supabase`);
+
+  // Collect all city_ids the scan discovered
+  const discoveredCityIds = new Set();
   for (const n of neighborhoods.values()) {
-    cityIds.add(n.cityId);
+    discoveredCityIds.add(n.cityId);
   }
 
-  const unknownIds = [...cityIds].filter(id => !CITY_MAP[id]);
-  if (unknownIds.length > 0) {
-    console.log(`New city IDs detected: ${unknownIds.join(', ')}`);
-    for (const uid of unknownIds) {
-      const names = [...neighborhoods.values()]
-        .filter(n => n.cityId === uid)
-        .map(n => n.name);
-      resolveNewCity(uid, names);
+  // Check for new city_ids that aren't in Supabase yet
+  const newCityIds = [...discoveredCityIds].filter(id => !cityMap.has(id));
+  const cityUpsertRows = [];
+
+  if (newCityIds.length > 0) {
+    console.log(`New city IDs from Deliveroo: ${newCityIds.join(', ')}`);
+    for (const newId of newCityIds) {
+      // Get city name from the zone data that Deliveroo returned
+      const sample = [...neighborhoods.values()].find(n => n.cityId === newId);
+      const zone = sample?.zone;
+
+      // The zone object from the API should contain city/zone name info
+      const cityName = zone?.name || zone?.city_name || zone?.label || null;
+
+      if (cityName) {
+        const slug = slugify(cityName);
+        cityMap.set(newId, { name: cityName, slug });
+        cityUpsertRows.push({
+          deliveroo_city_id: newId,
+          deliveroo_city_name: cityName,
+          deliveroo_country_id: UAE_COUNTRY_ID,
+        });
+        console.log(`  New city from Deliveroo: city_id=${newId} → ${cityName} (${slug})`);
+      } else {
+        // Log the full zone object so we can see what Deliveroo provides
+        console.log(`  WARNING: city_id=${newId} — zone data: ${JSON.stringify(zone)}`);
+        console.log(`  Areas in this city will be skipped until the city is added to Supabase.`);
+      }
     }
   } else {
-    console.log('All city IDs known.');
+    console.log('All discovered city IDs already in Supabase.');
   }
 
-  await upsertCities([...cityIds]);
+  // Upsert all cities (existing ones refresh names, new ones get inserted)
+  for (const id of discoveredCityIds) {
+    if (!cityMap.has(id)) continue; // skip unresolved
+    const city = cityMap.get(id);
+    if (!cityUpsertRows.some(r => r.deliveroo_city_id === id)) {
+      cityUpsertRows.push({
+        deliveroo_city_id: id,
+        deliveroo_city_name: city.name,
+        deliveroo_country_id: UAE_COUNTRY_ID,
+      });
+    }
+  }
+
+  await upsertCities(cityUpsertRows);
 
   // -- Step 4: Read existing table for comparison ----------------------------
   console.log('\nSTEP 4: Read existing table\n');
@@ -424,18 +434,19 @@ async function main() {
   console.log(`Existing table: ${existingAreas.length} rows (${existingAreas.filter(r => r.deliveroo_area_is_active).length} active)\n`);
 
   // -- Step 5: Build records -------------------------------------------------
-  // Every area found in the grid scan is active â the Location API returned it.
+  // Every area found in the grid scan is active — the Location API returned it.
   // For existing areas that already have enrichment data (geohash, lat/lng),
   // preserve the existing values unless the computed ones are better.
   console.log('STEP 5: Build area records\n');
   const records = [];
 
   for (const n of neighborhoods.values()) {
-    const citySlug = CITY_MAP[n.cityId]?.slug;
-    if (!citySlug) {
-      console.log(`  SKIP: ${n.name} â city_id ${n.cityId} unresolved`);
+    const city = cityMap.get(n.cityId);
+    if (!city) {
+      console.log(`  SKIP: ${n.name} — city_id ${n.cityId} not in Supabase`);
       continue;
     }
+    const citySlug = city.slug;
 
     const existing = existingMap.get(n.id);
 
@@ -465,32 +476,43 @@ async function main() {
   console.log('\nSTEP 6: Upsert to Supabase\n');
   await upsertAreas(records);
 
-  // -- Step 7: Mark inactive â areas in table but not in scan ----------------
+  // -- Step 7: Mark inactive — areas in table but not in scan ----------------
   console.log('\nSTEP 7: Mark inactive areas\n');
   const discoveredIds = new Set(neighborhoods.keys());
+  let deactivatedCount = 0;
 
-  // In test mode, only deactivate areas within the scanned cities so that
-  // scanning one emirate doesn't wipe out the rest of the country.
-  const scannedCityIds = new Set([...neighborhoods.values()].map(n => n.cityId));
-
-  const toDeactivate = existingAreas
-    .filter(a => {
-      if (!a.deliveroo_area_is_active) return false; // already inactive
-      if (discoveredIds.has(a.deliveroo_area_id)) return false; // found in scan
-      if (TEST_MODE && !scannedCityIds.has(a.deliveroo_city_id)) return false;
-      return true;
-    })
-    .map(a => a.deliveroo_area_id);
-
-  if (toDeactivate.length > 0) {
-    await markInactive(toDeactivate);
-    const slugs = toDeactivate.map(id => {
-      const existing = existingMap.get(id);
-      return existing?.deliveroo_area_slug || id;
-    });
-    console.log(`  Deactivated ${toDeactivate.length} area(s): ${slugs.join(', ')}`);
+  if (TEST_MODE) {
+    // In test mode we only scan one region, so we cannot reliably determine
+    // which areas across the whole country are inactive.  Skip deactivation
+    // to avoid false-positive mark-downs caused by overlapping bounding boxes
+    // (e.g. Ajman scan discovering a few Sharjah neighborhoods, then the code
+    // treating ALL of Sharjah as scanned and deactivating the rest).
+    const wouldDeactivate = existingAreas.filter(a =>
+      a.deliveroo_area_is_active && !discoveredIds.has(a.deliveroo_area_id)
+    ).length;
+    console.log(`  TEST MODE: skipping deactivation (${wouldDeactivate} areas not seen in partial scan).`);
   } else {
-    console.log('  No areas to deactivate.');
+    // Full scan: every region was scanned, so any existing active area that
+    // was NOT discovered is genuinely inactive.
+    const toDeactivate = existingAreas
+      .filter(a => {
+        if (!a.deliveroo_area_is_active) return false; // already inactive
+        if (discoveredIds.has(a.deliveroo_area_id)) return false; // found in scan
+        return true;
+      })
+      .map(a => a.deliveroo_area_id);
+
+    if (toDeactivate.length > 0) {
+      await markInactive(toDeactivate);
+      deactivatedCount = toDeactivate.length;
+      const slugs = toDeactivate.map(id => {
+        const existing = existingMap.get(id);
+        return existing?.deliveroo_area_slug || id;
+      });
+      console.log(`  Deactivated ${toDeactivate.length} area(s): ${slugs.join(', ')}`);
+    } else {
+      console.log('  No areas to deactivate.');
+    }
   }
 
   // -- Summary ---------------------------------------------------------------
@@ -502,7 +524,7 @@ async function main() {
   console.log(`  Discovered: ${neighborhoods.size} neighborhoods`);
   console.log(`  Active:     ${records.length}`);
   console.log(`  New areas:  ${newCount}`);
-  console.log(`  Deactivated: ${toDeactivate.length}`);
+  console.log(`  Deactivated: ${deactivatedCount}`);
   console.log(`  Runtime:    ${elapsed} minutes`);
   console.log(`  Finished:   ${new Date().toISOString()}`);
 }
