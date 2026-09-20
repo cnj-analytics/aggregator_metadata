@@ -1,7 +1,7 @@
 name: Sync Deliveroo Areas
 on:
   schedule:
-    - cron: '0 4 * * 1'  # Every Monday 4am UTC (8am UAE)
+    - cron: '0 23 * * 0'  # Every Monday 3am Dubai (Sunday 23:00 UTC)
   workflow_dispatch:
     inputs:
       test_mode:
