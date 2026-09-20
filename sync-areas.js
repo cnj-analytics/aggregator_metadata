@@ -58,12 +58,12 @@ const REGIONS = [
 
 const GRID_STEP = 0.008;
 const MAX_CONCURRENT = 5;
-const PAGE_FETCH_DELAY_MS = 3000;
-const MAX_RETRIES = 3;                 // [FIX] was 5 -- reduced to avoid long backoff
+const PAGE_FETCH_DELAY_MS = TEST_MODE ? 2000 : 5000;   // more polite in full runs
+const MAX_RETRIES = TEST_MODE ? 3 : 5;                 // full run: try harder
 const INITIAL_RETRY_DELAY_MS = 5000;
-const MAX_RETRY_DELAY_MS = 30000;      // [FIX] cap backoff at 30s
-const BATCH_PAUSE_EVERY = 25;          // pause after enriching this many areas
-const BATCH_PAUSE_MS = 10000;          // 10s pause between batches of page fetches
+const MAX_RETRY_DELAY_MS = 60000;                       // cap backoff at 60s
+const BATCH_PAUSE_EVERY = TEST_MODE ? 25 : 15;         // full run: smaller batches
+const BATCH_PAUSE_MS = TEST_MODE ? 10000 : 30000;      // full run: 30s between batches
 
 const LOCATION_API = 'https://api.ae.deliveroo.com/orderapp/v1/location';
 const AREA_PAGE_BASE = 'https://deliveroo.ae/en/restaurants';
@@ -166,7 +166,6 @@ async function fetchWithRetry(url) {
       });
 
       if (resp.status === 429) {
-        // [FIX] cap backoff delay at MAX_RETRY_DELAY_MS
         const delay = Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
         console.log(`    429 rate limited -- retrying in ${delay / 1000}s`);
         await sleep(delay);
@@ -176,7 +175,6 @@ async function fetchWithRetry(url) {
       return resp;
     } catch (e) {
       if (attempt < MAX_RETRIES) {
-        // [FIX] cap backoff delay at MAX_RETRY_DELAY_MS
         const delay = Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt), MAX_RETRY_DELAY_MS);
         console.log(`    Fetch error (${e.message}) -- retrying in ${delay / 1000}s`);
         await sleep(delay);
@@ -198,9 +196,9 @@ function extractPageData(html) {
     const location = meta?.location;
     const restaurantCount = meta?.restaurantCount;
 
-    // restaurantCount.results reflects the number of restaurants currently available
-    // in this area. At the cron time (8am UAE), active areas will have restaurants
-    // open and this count will be > 0. Inactive areas (concourses, beaches) always = 0.
+    // restaurantCount.results reflects the number of restaurants listed in this
+    // area. Active areas have restaurants registered; inactive areas (concourses,
+    // beaches, placeholder zones) always have 0.
     const hasRestaurants = (restaurantCount?.results || 0) > 0;
 
     return {
@@ -220,8 +218,7 @@ function extractPageData(html) {
  * Fetch an area's page to determine:
  * - is_active -- based on restaurantCount > 0 from __NEXT_DATA__.
  *   Active areas have restaurants registered; inactive areas (concourses,
- *   beaches) always have restaurantCount = 0. The cron runs at 8am UAE
- *   when restaurants are open, making this count reliable.
+ *   beaches, placeholder zones) always have restaurantCount = 0.
  * - geohash, latitude, longitude (from __NEXT_DATA__)
  *
  * Returns { isActive, geohash, latitude, longitude, restaurantCount, fetchFailed }
@@ -251,9 +248,7 @@ async function enrichArea(citySlug, areaSlug) {
     }
 
     // Active = restaurantCount > 0 (area has restaurants registered to it).
-    // This count reflects currently available restaurants. The cron runs at
-    // 8am UAE when active areas will have restaurants open. Inactive areas
-    // (airport concourses, beaches, etc.) always have restaurantCount = 0.
+    // Inactive areas (airport concourses, beaches, etc.) always have 0.
     const isActive = pageData.hasRestaurants;
 
     return {
@@ -374,7 +369,7 @@ async function upsertAreas(records) {
 }
 
 async function getExistingAreas() {
-  // [FIX] Include deliveroo_city_id so Step 6 can scope deactivation by city
+  // Include city_id so Step 6 can scope deactivation by city in test mode
   const rows = await supabase(
     '/deliveroo_area?select=deliveroo_area_id,deliveroo_area_is_active,deliveroo_city_id&limit=10000',
     'GET',
@@ -455,6 +450,8 @@ async function main() {
   const records = [];
   const failedSlugs = [];
   let enrichedCount = 0;
+  let consecutiveFails = 0;        // adaptive pacing: track consecutive fetch failures
+  let currentDelay = PAGE_FETCH_DELAY_MS;
 
   for (const n of neighborhoods.values()) {
     const citySlug = CITY_MAP[n.cityId]?.slug;
@@ -465,7 +462,7 @@ async function main() {
 
     enrichedCount++;
 
-    // Progress log
+    // Progress log and batch pause
     if (enrichedCount % BATCH_PAUSE_EVERY === 0) {
       console.log(`  Progress: ${enrichedCount}/${neighborhoods.size} -- pausing ${BATCH_PAUSE_MS / 1000}s`);
       await sleep(BATCH_PAUSE_MS);
@@ -482,16 +479,27 @@ async function main() {
       isActive = prev !== undefined ? prev : true;
       failedSlugs.push(n.slug);
       console.log(`    FETCH FAILED: ${n.slug} -- keeping is_active=${isActive}`);
+
+      // Adaptive pacing: back off when getting consecutive failures (likely 429s)
+      consecutiveFails++;
+      if (consecutiveFails >= 3) {
+        currentDelay = Math.min(currentDelay * 2, 60000); // double delay, cap at 60s
+        console.log(`    Adaptive pacing: ${consecutiveFails} consecutive failures, delay now ${currentDelay / 1000}s`);
+      }
     } else {
       isActive = enriched.isActive;
       if (!isActive) {
         console.log(`    INACTIVE: ${n.slug} (restaurantCount=${enriched.restaurantCount})`);
       }
+      // Reset adaptive pacing on success
+      if (consecutiveFails > 0) {
+        consecutiveFails = 0;
+        currentDelay = PAGE_FETCH_DELAY_MS;
+      }
     }
 
-    // [FIX] Use ?? instead of || for null safety -- prevents undefined values
-    // that would cause PGRST102 "All object keys must match" in batch upserts.
-    // || treats 0 and "" as falsy and falls through; ?? only catches null/undefined.
+    // Use ?? (nullish coalescing) for null safety -- ensures every record has
+    // identical keys, which PostgREST requires for batch upserts (PGRST102).
     records.push({
       deliveroo_area_id: n.id,
       deliveroo_area_name: n.name,
@@ -504,7 +512,7 @@ async function main() {
       deliveroo_area_is_active: isActive,
     });
 
-    await sleep(PAGE_FETCH_DELAY_MS);
+    await sleep(currentDelay);
   }
 
   // -- Step 5: Upsert all records --------------------------------------------
@@ -515,9 +523,8 @@ async function main() {
   console.log('\nSTEP 6: Mark inactive areas\n');
   const discoveredIds = new Set(neighborhoods.keys());
 
-  // [FIX] In test mode, only deactivate areas within the scanned cities.
-  // Previously, test mode (scanning one emirate) would deactivate ALL areas
-  // in other emirates because they weren't in the scan results.
+  // In test mode, only deactivate areas within the scanned cities so that
+  // scanning one emirate doesn't wipe out the rest of the country.
   const scannedCityIds = new Set([...neighborhoods.values()].map(n => n.cityId));
 
   const toDeactivate = existingAreas
