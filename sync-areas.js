@@ -57,7 +57,7 @@ const REGIONS = [
 ];
 
 const GRID_STEP = 0.008;
-const MAX_CONCURRENT = 5;
+const MAX_CONCURRENT = 1;
 const PAGE_FETCH_DELAY_MS = TEST_MODE ? 2000 : 5000;   // more polite in full runs
 const MAX_RETRIES = TEST_MODE ? 3 : 5;                 // full run: try harder
 const INITIAL_RETRY_DELAY_MS = 5000;
