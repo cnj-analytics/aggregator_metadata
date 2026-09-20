@@ -1,0 +1,28 @@
+name: Deliveroo UAE – Enrich Area (Failsafe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      area_id:
+        description: 'Deliveroo area ID to enrich'
+        required: true
+        type: string
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Enrich area
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          AREA_ID: ${{ inputs.area_id }}
+        run: node deliveroo/uae/enrich-area.js
