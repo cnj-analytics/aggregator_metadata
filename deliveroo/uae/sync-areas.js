@@ -85,6 +85,15 @@ function buildAreaUrl(citySlug, areaSlug) {
   return `${AREA_PAGE_BASE}/${citySlug}/${areaSlug}`;
 }
 
+// Full restaurant listing for the area (every restaurant card, in ranked order).
+// This is the URL stored in deliveroo_area.deliveroo_area_url and used by the
+// ranking scraper. buildAreaUrl (no query) is still used for city resolution.
+const AREA_LISTING_QUERY = '?collection=restaurants&collection=all-restaurants';
+
+function buildAreaListingUrl(citySlug, areaSlug) {
+  return `${buildAreaUrl(citySlug, areaSlug)}${AREA_LISTING_QUERY}`;
+}
+
 // --- Geohash Encoding -------------------------------------------------------
 // Pure implementation — no external dependencies required.
 // Encodes (lat, lng) to a geohash string of the given precision (default 7).
@@ -609,7 +618,7 @@ async function main() {
       deliveroo_area_geohash: geohash ?? null,
       deliveroo_area_latitude: latitude ?? null,
       deliveroo_area_longitude: longitude ?? null,
-      deliveroo_area_url: buildAreaUrl(city.slug, n.slug),
+      deliveroo_area_url: buildAreaListingUrl(city.slug, n.slug),
       deliveroo_area_is_active: true,
     });
   }
