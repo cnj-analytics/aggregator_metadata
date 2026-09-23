@@ -112,6 +112,27 @@ async function writeChunks(path, rows, prefer) {
   }
 }
 
+// --- Compact rows ---------------------------------------------------------------
+// Order must match deliveroo_ranking_save_area_hour:
+// [partner_id, rank, rating_status, rating, rating_count, operating_status, fast_tag,
+//  has_promo, has_free_delivery_promo, has_non_delivery_promo, promo_text, promo_scope]
+function toCompact(r) {
+  return [
+    r.deliveroo_branch_partner_id,
+    r.deliveroo_listing_rank,
+    r.deliveroo_partner_rating_status,
+    r.deliveroo_partner_rating ?? null,
+    r.deliveroo_partner_rating_count ?? null,
+    r.deliveroo_partner_operating_status,
+    !!r.deliveroo_partner_fast_tag_visible,
+    !!r.deliveroo_partner_has_promo_badge,
+    !!r.deliveroo_partner_has_free_delivery_promo_badge,
+    !!r.deliveroo_partner_has_non_delivery_promo_badge,
+    r.deliveroo_partner_promo_badge_text ?? null,
+    r.deliveroo_partner_promo_scope ?? null,
+  ];
+}
+
 // --- Area URL ---------------------------------------------------------------------
 // The full listing needs ?collection=restaurants&collection=all-restaurants. Whatever
 // is stored in deliveroo_area_url, rebuild it to that form: keep the path and any other
@@ -308,12 +329,14 @@ async function main() {
       if (!DRY_RUN) {
         // One transaction per area+hour: clear that hour's rows, then insert the fresh listing.
         // A re-run of the same hour therefore replaces rather than mixes.
-        const res = await supabase('/rpc/deliveroo_ranking_replace_area_hour', 'POST', {
+        // Rows go as compact arrays (see toCompact) – about 4x smaller than objects with
+        // column names, and far quicker for the database to read.
+        const res = await supabase('/rpc/deliveroo_ranking_save_area_hour', 'POST', {
           p_area_id: area.deliveroo_area_id,
           p_date: SCRAPE_DATE,
           p_hour: SCRAPE_HOUR,
-          p_rows: rankingRows,
-          p_pending: pendingRows,
+          p_rows: rankingRows.map(toCompact),
+          p_pending: pendingRows.map(toCompact),
         });
         s.replaced_rows = res?.deleted ?? 0;
         // Supabase adds any new (partner, area) links itself inside that call and skips duplicates.
