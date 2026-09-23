@@ -8,7 +8,8 @@
 //      fast tag and promo badge.
 //   3. Known partners  -> deliveroo_ranking_analysis (upsert on the unique index).
 //      Unknown partners -> deliveroo_ranking_pending + deliveroo_partner_registration_queue.
-//   4. Add any missing (partner, area) pairs to deliveroo_branch_delivery_area.
+//   4. (Supabase) the save call also adds new (partner, area) links to
+//      deliveroo_branch_delivery_area, skipping ones that already exist.
 //   5. Update deliveroo_branch.deliveroo_branch_image_url when the card image changed.
 //   6. Write a per-area summary (JSON) for the report job.
 //
@@ -37,14 +38,21 @@ const SUMMARY_FILE = process.env.SUMMARY_FILE || 'summary.json';
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 5000;
-const MAX_RATE_LIMIT_RETRIES = 5;
+const MAX_RATE_LIMIT_RETRIES = 2; // wait 60s, then 120s, then skip the area
 const RATE_LIMIT_INITIAL_BACKOFF_MS = 60000;
 const DELAY_BETWEEN_AREAS_MS = 2000;
 const MAX_CONSECUTIVE_BLOCKS = 3;
 const MAX_403_RETRIES = 2;
 const BLOCK_RETRY_DELAY_MS = 20000;
 const WRITE_CHUNK = 1000;
-const START_STAGGER_MS = 3000; // job N starts N×3s after job 0, so writes don't all land at once
+const START_STAGGER_MS = 3000; // used only when pacing is off (small manual runs)
+// Pacing: each job spreads its areas evenly over SPREAD_MINUTES, and the jobs are offset
+// from each other, so requests to Deliveroo (and writes to Supabase) arrive at a steady
+// rate across the hour instead of in bursts. Default 45 for full runs, 0 (off) when
+// AREA_IDS is given.
+const SPREAD_MINUTES = process.env.SPREAD_MINUTES !== undefined && process.env.SPREAD_MINUTES !== ''
+  ? Number(process.env.SPREAD_MINUTES)
+  : (AREA_IDS.length ? 0 : 45);
 
 const HEADERS = {
   'User-Agent':
@@ -185,10 +193,10 @@ async function main() {
     return;
   }
 
-  if (JOB_INDEX > 0) {
-    log(`Staggered start: waiting ${(JOB_INDEX * START_STAGGER_MS) / 1000}s`);
-    await sleep(JOB_INDEX * START_STAGGER_MS);
-  }
+  const slotMs = SPREAD_MINUTES > 0 ? (SPREAD_MINUTES * 60000) / mine.length : 0;
+  const t0Run = Date.now();
+  const offsetMs = slotMs ? Math.round((JOB_INDEX * slotMs) / JOB_COUNT) : JOB_INDEX * START_STAGGER_MS;
+  if (slotMs) log(`Pacing: one area every ${(slotMs / 1000).toFixed(0)}s over ${SPREAD_MINUTES} min, offset ${(offsetMs / 1000).toFixed(0)}s`);
 
   // Known partners + current images (one read per job).
   const branches = await fetchAll(
@@ -201,7 +209,10 @@ async function main() {
 
   let consecutiveBlocks = 0;
 
-  for (const area of mine) {
+  for (const [ai, area] of mine.entries()) {
+    // Wait for this area's slot (area 0 at the job offset, then every slotMs).
+    const due = t0Run + offsetMs + ai * slotMs;
+    if (Date.now() < due) await sleep(due - Date.now());
     const t0 = Date.now();
     const s = {
       job: JOB_INDEX, area_id: area.deliveroo_area_id, area_name: area.deliveroo_area_name,
@@ -253,7 +264,6 @@ async function main() {
       const rankingRows = [];
       const pendingRows = [];
       const queueRows = [];
-      const pairRows = [];
       const imageUpdates = [];
 
       for (const c of cards) {
@@ -268,13 +278,6 @@ async function main() {
         const row = { deliveroo_branch_partner_id: c.partnerId, ...base, ...r };
         if (known.has(c.partnerId)) {
           rankingRows.push(row);
-          if (c.branchId) {
-            pairRows.push({
-              deliveroo_branch_partner_id: c.partnerId,
-              deliveroo_branch_id: c.branchId,
-              deliveroo_area_id: area.deliveroo_area_id,
-            });
-          }
           const stored = known.get(c.partnerId);
           if (UPDATE_IMAGES && c.imageUrl && imageBase(c.imageUrl) !== imageBase(stored)) {
             // Keep the stored URL's query template if there is one; swap only the image path.
@@ -297,20 +300,9 @@ async function main() {
         }
       }
 
-      // Missing delivery-area pairs (compare with what's stored for this area)
-      const existingPairs = await fetchAll(
-        'deliveroo_branch_delivery_area',
-        'deliveroo_branch_partner_id',
-        'deliveroo_branch_partner_id',
-        `&deliveroo_area_id=eq.${area.deliveroo_area_id}`
-      );
-      const have = new Set(existingPairs.map(p => p.deliveroo_branch_partner_id));
-      const newPairs = pairRows.filter(p => !have.has(p.deliveroo_branch_partner_id));
-
       s.ranking_rows = rankingRows.length;
       s.pending_rows = pendingRows.length;
       s.queued_partners = queueRows.length;
-      s.delivery_pairs_added = newPairs.length;
       s.images_updated = imageUpdates.length;
 
       if (!DRY_RUN) {
@@ -324,16 +316,14 @@ async function main() {
           p_pending: pendingRows,
         });
         s.replaced_rows = res?.deleted ?? 0;
+        // Supabase adds any new (partner, area) links itself inside that call and skips duplicates.
+        s.delivery_pairs_added = res?.pairs_added ?? 0;
         if (res && (res.inserted !== rankingRows.length || res.inserted_pending !== pendingRows.length)) {
           throw new Error(`insert count mismatch: ${JSON.stringify(res)}`);
         }
         if (queueRows.length) {
           await writeChunks('/deliveroo_partner_registration_queue?on_conflict=deliveroo_branch_partner_id',
             queueRows, 'resolution=ignore-duplicates,return=minimal');
-        }
-        if (newPairs.length) {
-          await writeChunks('/deliveroo_branch_delivery_area?on_conflict=deliveroo_branch_partner_id,deliveroo_area_id',
-            newPairs, 'resolution=ignore-duplicates,return=minimal');
         }
         for (const u of imageUpdates) {
           await supabase(
@@ -362,7 +352,9 @@ async function main() {
       process.exitCode = 2;
       break;
     }
-    await sleep(DELAY_BETWEEN_AREAS_MS);
+    // Keep the summary on disk after every area so a cancelled job still reports.
+    fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries, null, 1));
+    if (!slotMs) await sleep(DELAY_BETWEEN_AREAS_MS);
   }
 
   fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries, null, 1));
