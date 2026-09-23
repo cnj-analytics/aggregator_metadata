@@ -24,7 +24,7 @@ on:
         type: string
         default: ''
       spread_minutes:
-        description: 'Spread each job''s areas over this many minutes. Empty = 45 for full runs, 0 when area_ids is set'
+        description: 'Spread each job''s areas over this many minutes. Empty = 20 for full runs, 0 when area_ids is set'
         type: string
         default: ''
 
