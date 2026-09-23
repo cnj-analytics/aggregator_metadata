@@ -5,26 +5,28 @@
 // Started by Supabase (trigger on deliveroo_partner_registration_queue /
 // deliveroo_ranking_pending) whenever the ranking scrape finds partner IDs that
 // are not in deliveroo_branch. Each job:
-//   1. claims a few queued partners (deliveroo_registration_claim – no two jobs get the same one);
+//   1. claims the oldest waiting partner (deliveroo_registration_claim – no two jobs get the same one);
 //   2. opens each restaurant's menu page (with the geohash of the area it was seen in);
 //   3. builds the brand / branch / information record in the same format as existing rows
 //      (brand name from the listing card; branch details from the menu page);
 //   4. calls deliveroo_register_branch, which in one transaction creates the brand (if new),
 //      branch, information and delivery areas, moves the parked ranking rows into
-//      deliveroo_ranking_analysis and marks the queue entry 'registered';
+//      deliveroo_ranking_analysis and removes the partner from the queue;
 //   5. on any problem calls deliveroo_registration_fail (retried up to 3 attempts);
 //   6. repeats until the queue is empty or the time budget is used.
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JOB_INDEX, JOB_COUNT,
-//      CLAIM_SIZE (default 5), TIME_BUDGET_MIN (default 40), SUMMARY_FILE
+//      CLAIM_SIZE (default 1), TIME_BUDGET_MIN (default 40), SUMMARY_FILE
+// A successful registration removes the partner from the queue (done in deliveroo_register_branch).
 
 const fs = require('fs');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const JOB_INDEX = parseInt(process.env.JOB_INDEX || '0', 10);
-const JOB_COUNT = parseInt(process.env.JOB_COUNT || '10', 10);
-const CLAIM_SIZE = parseInt(process.env.CLAIM_SIZE || '5', 10);
+const JOB_COUNT = parseInt(process.env.JOB_COUNT || '1', 10);
+// One partner at a time, oldest first (first come, first served).
+const CLAIM_SIZE = parseInt(process.env.CLAIM_SIZE || '1', 10);
 const TIME_BUDGET_MS = parseInt(process.env.TIME_BUDGET_MIN || '40', 10) * 60000;
 const SUMMARY_FILE = process.env.SUMMARY_FILE || 'summary.json';
 

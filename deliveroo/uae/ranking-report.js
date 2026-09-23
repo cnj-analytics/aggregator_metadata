@@ -19,11 +19,13 @@ const merge = k => {
   return o;
 };
 const ok = areas.filter(a => /^ok/.test(a.status || ''));
-const failed = areas.filter(a => !/^ok/.test(a.status || ''));
+const notFound = areas.filter(a => a.status === 'not_found');
+const viaGeohash = areas.filter(a => /_geohash$/.test(a.status || ''));
+const failed = areas.filter(a => !/^ok/.test(a.status || '') && a.status !== 'not_found');
 const mb = b => (b / 1048576).toFixed(1);
 
 let md = `## Deliveroo ranking scrape – ${process.env.SCRAPE_DATE || ''} ${process.env.SCRAPE_HOUR || ''}${process.env.DRY_RUN === 'true' ? ' (DRY RUN – nothing written)' : ''}\n\n`;
-md += `Job files: ${files.length} · Areas: ${areas.length} (ok ${ok.length}, failed ${failed.length})\n\n`;
+md += `Job files: ${files.length} · Areas: ${areas.length} (ok ${ok.length}, of which ${viaGeohash.length} via stored geohash · no public page ${notFound.length} · failed ${failed.length})\n\n`;
 md += `| Total | Value |\n|---|---|\n`;
 md += `| Cards read | ${sum('cards')} |\n| Ranking rows | ${sum('ranking_rows')} |\n| Pending rows (unknown partners) | ${sum('pending_rows')} |\n`;
 md += `| Rows replaced (same hour re-run) | ${sum('replaced_rows')} |\n`;

@@ -198,7 +198,7 @@ async function main() {
   // Areas: active only, stable order, round-robin across jobs.
   let areas = await fetchAll(
     'deliveroo_area',
-    'deliveroo_area_id,deliveroo_area_name,deliveroo_area_url',
+    'deliveroo_area_id,deliveroo_area_name,deliveroo_area_url,deliveroo_area_geohash',
     'deliveroo_area_id',
     '&deliveroo_area_is_active=is.true'
   );
@@ -255,18 +255,39 @@ async function main() {
       const listing = toListingUrl(area.deliveroo_area_url);
       s.url_fixed = listing.fixed;
       if (listing.fixed) log(`  stored URL not in listing format – using ${listing.url}`);
-      const page = await fetchPage(listing.url);
+      let page = await fetchPage(listing.url);
       lastFetchAt = Date.now();
       s.fetch_ms = Date.now() - tf;
       s.rate_limits = page.rateLimits;
       s.http_status = page.status;
       if (!page.html) throw Object.assign(new Error(page.error || 'fetch_failed'), { code: 'fetch_failed' });
       s.bytes = Buffer.byteLength(page.html);
+      // 404 = Deliveroo has no public listing for this area. Not an error: no data this hour.
+      if (page.status === 404) throw Object.assign(new Error('no public listing page (404)'), { code: 'not_found' });
       if (page.status !== 200) throw Object.assign(new Error(`http_${page.status}`), { code: `http_${page.status}` });
 
-      const parsed = parseListing(page.html);
+      let parsed = parseListing(page.html);
       if (parsed.error) throw Object.assign(new Error(parsed.error), { code: parsed.error });
       consecutiveBlocks = 0;
+
+      // Some areas (e.g. JBR) show 0 restaurants at Deliveroo's default point for the area
+      // but a full list at a real address. Retry once at the area's stored geohash.
+      if (parsed.cards.length === 0 && area.deliveroo_area_geohash && !/[?&]geohash=/.test(listing.url)) {
+        const wait = lastFetchAt + AREA_GAP_SECONDS * 1000 - Date.now();
+        if (wait > 0) await sleep(wait);
+        const geoUrl = `${listing.url}&geohash=${encodeURIComponent(area.deliveroo_area_geohash)}`;
+        const retry = await fetchPage(geoUrl);
+        lastFetchAt = Date.now();
+        s.rate_limits += retry.rateLimits || 0;
+        s.geohash_retry = retry.status;
+        if (retry.html && retry.status === 200) {
+          const p2 = parseListing(retry.html);
+          if (!p2.error && p2.cards.length > 0) {
+            page = retry; parsed = p2; s.bytes = Buffer.byteLength(retry.html); s.used_geohash = true;
+            log(`  0 cards at default point – ${p2.cards.length} at stored geohash`);
+          }
+        }
+      }
 
       s.declared_count = parsed.declaredCount;
       s.cards = parsed.cards.length;
@@ -307,13 +328,11 @@ async function main() {
         if (known.has(c.partnerId)) {
           rankingRows.push(row);
           const stored = known.get(c.partnerId);
-          if (UPDATE_IMAGES && c.imageUrl && imageBase(c.imageUrl) !== imageBase(stored)) {
+          // Deliveroo's generic menu-tag pictures are not the branch's own image – ignore them.
+          if (UPDATE_IMAGES && c.imageUrl && !/\/images\/menu_tags\//.test(c.imageUrl) && imageBase(c.imageUrl) !== imageBase(stored)) {
             // Keep the stored URL's query template if there is one; swap only the image path.
             const q = stored && stored.includes('?') ? stored.slice(stored.indexOf('?')) : (c.imageUrl.includes('?') ? c.imageUrl.slice(c.imageUrl.indexOf('?')) : '');
-            imageUpdates.push({ partnerId: c.partnerId, url: imageBase(c.imageUrl) + q });
-            if (s.image_examples.length < 5) {
-              s.image_examples.push({ partner: c.partnerId, name: c.name, stored: imageBase(stored), card: imageBase(c.imageUrl) });
-            }
+            imageUpdates.push({ partnerId: c.partnerId, name: c.name, stored: imageBase(stored), url: imageBase(c.imageUrl) + q });
           }
         } else {
           pendingRows.push(row);
@@ -331,7 +350,7 @@ async function main() {
       s.ranking_rows = rankingRows.length;
       s.pending_rows = pendingRows.length;
       s.queued_partners = queueRows.length;
-      s.images_updated = imageUpdates.length;
+      s.images_updated = 0;
 
       if (!DRY_RUN) {
         // One transaction per area+hour: clear that hour's rows, then insert the fresh listing.
@@ -355,19 +374,27 @@ async function main() {
           await writeChunks('/deliveroo_partner_registration_queue?on_conflict=deliveroo_branch_partner_id',
             queueRows, 'resolution=ignore-duplicates,return=minimal');
         }
+        // Supabase applies the image rule (skip generic pictures, at most one change per
+        // branch per 24h, log every change) and says whether it changed anything.
         for (const u of imageUpdates) {
-          await supabase(
-            `/deliveroo_branch?deliveroo_branch_partner_id=eq.${encodeURIComponent(u.partnerId)}`,
-            'PATCH', { deliveroo_branch_image_url: u.url }, { Prefer: 'return=minimal' }
-          );
+          const changed = await supabase('/rpc/deliveroo_branch_update_image', 'POST',
+            { p_partner_id: u.partnerId, p_new_url: u.url, p_area_id: area.deliveroo_area_id });
+          if (changed === true) {
+            s.images_updated++;
+            if (s.image_examples.length < 5) {
+              s.image_examples.push({ partner: u.partnerId, name: u.name, stored: u.stored, card: imageBase(u.url) });
+            }
+          }
           known.set(u.partnerId, u.url);
         }
       }
       s.status = DRY_RUN ? 'ok_dry_run' : 'ok';
+      if (s.used_geohash) s.status += '_geohash';
     } catch (e) {
       s.status = e.code || 'error';
       s.error = e.message.slice(0, 300);
       if (/^http_(403|429)|fetch_failed/.test(s.status)) consecutiveBlocks++;
+      if (s.status === 'not_found') s.error = null;
     }
 
     s.total_ms = Date.now() - t0;
@@ -387,7 +414,8 @@ async function main() {
   }
 
   fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries, null, 1));
-  if (summaries.some(s => !/^ok/.test(s.status))) process.exitCode = process.exitCode || 1;
+  // Only real problems fail the job; an area with no public page (404) is just "no data".
+  if (summaries.some(s => !/^ok/.test(s.status) && s.status !== 'not_found')) process.exitCode = process.exitCode || 1;
 }
 
 if (require.main === module) {
