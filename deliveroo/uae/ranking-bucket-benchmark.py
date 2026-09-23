@@ -25,7 +25,8 @@ spec = importlib.util.spec_from_file_location("rx", os.path.join(os.path.dirname
 rx = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rx)
 
-NS, TBL = "deliveroo_bench", "ranking_31d"
+SORT = os.environ.get("SORT", "partner")  # partner | area
+NS, TBL = "deliveroo_bench", ("ranking_31d" if SORT == "partner" else "ranking_31d_by_area")
 MODE = os.environ.get("MODE", "build")
 SOURCE_DATE = dt.date.fromisoformat(os.environ.get("SOURCE_DATE", "2026-09-23"))
 SOURCE_HOUR = dt.time(int(os.environ.get("SOURCE_HOUR", "18")))
@@ -51,11 +52,12 @@ def catalog():
 def main():
     cat = catalog()
     if MODE == "drop":
-        try:
-            cat.drop_table((NS, TBL), purge_requested=True)
-            print("Dropped", NS, TBL)
-        except Exception as e:
-            print("drop_table:", e)
+        for t in ("ranking_31d", "ranking_31d_by_area"):
+            try:
+                cat.drop_table((NS, t), purge_requested=True)
+                print("Dropped", NS, t)
+            except Exception as e:
+                print("drop_table", t, e)
         try:
             cat.drop_namespace(NS)
         except Exception as e:
@@ -93,9 +95,11 @@ def main():
             t = t.set_column(hi, base.schema.field(hi), pa.array([h] * base.num_rows, type=pa.time64("us")))
             parts.append(t)
         day_tbl = pa.concat_tables(parts)
-        idx = pc.sort_indices(day_tbl, sort_keys=[("deliveroo_branch_partner_id", "ascending"),
-                                                   ("deliveroo_area_scrape_hour", "ascending"),
-                                                   ("deliveroo_area_id", "ascending")])
+        keys = ([("deliveroo_branch_partner_id", "ascending"), ("deliveroo_area_scrape_hour", "ascending"),
+                 ("deliveroo_area_id", "ascending")] if SORT == "partner" else
+                [("deliveroo_area_id", "ascending"), ("deliveroo_area_scrape_hour", "ascending"),
+                 ("deliveroo_listing_rank", "ascending")])
+        idx = pc.sort_indices(day_tbl, sort_keys=keys)
         day_tbl = day_tbl.take(idx)
         table.append(day_tbl)
         total += day_tbl.num_rows
@@ -108,7 +112,7 @@ def main():
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if path:
         with open(path, "a") as f:
-            f.write(f"## Bucket benchmark table\n\n{DAYS} days × 21 hours from {SOURCE_DATE} {SOURCE_HOUR}: "
+            f.write(f"## Bucket benchmark table ({TBL}, sorted by {SORT})\n\n{DAYS} days × 21 hours from {SOURCE_DATE} {SOURCE_HOUR}: "
                     f"**{total:,} rows**, {len(files)} files, **{size/1e9:.2f} GB**, {size/max(total,1):.1f} bytes/row, "
                     f"{time.time()-t0:.0f} s\n")
 
