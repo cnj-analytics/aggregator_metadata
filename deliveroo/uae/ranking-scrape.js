@@ -48,11 +48,11 @@ const WRITE_CHUNK = 1000;
 const START_STAGGER_MS = 3000; // used only when pacing is off (small manual runs)
 // Pacing: each job spreads its areas evenly over SPREAD_MINUTES, and the jobs are offset
 // from each other, so requests to Deliveroo (and writes to Supabase) arrive at a steady
-// rate across the hour instead of in bursts. Default 45 for full runs, 0 (off) when
+// rate across the hour instead of in bursts. Default 20 for full runs, 0 (off) when
 // AREA_IDS is given.
 const SPREAD_MINUTES = process.env.SPREAD_MINUTES !== undefined && process.env.SPREAD_MINUTES !== ''
   ? Number(process.env.SPREAD_MINUTES)
-  : (AREA_IDS.length ? 0 : 45);
+  : (AREA_IDS.length ? 0 : 20);
 
 const HEADERS = {
   'User-Agent':
