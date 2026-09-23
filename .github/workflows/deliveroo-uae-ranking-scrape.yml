@@ -1,10 +1,9 @@
 name: Deliveroo UAE – Ranking Scrape (hourly)
 
 on:
-  # Hourly 06:00 -> 02:00 Dubai (UTC+4) = 02:05 -> 22:05 UTC.
-  # Live from 2026-09-23 22:05 Dubai (schedule re-registered after enabling the workflow).
+  # Hourly at :15, 06:15 -> 02:15 Dubai (UTC+4) = 02:15 -> 22:15 UTC.
   schedule:
-    - cron: '5 2-22 * * *'
+    - cron: '15 2-22 * * *'
   workflow_dispatch:
     inputs:
       area_ids:
