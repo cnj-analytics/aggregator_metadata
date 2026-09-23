@@ -3,7 +3,10 @@
 // Runs once per hourly scrape, before the 15 jobs start:
 //   - works out the Dubai date + hour window this run belongs to, so all 15 jobs
 //     use the same label even if some start late;
-//   - makes sure that hour's section of deliveroo_ranking_analysis exists.
+//   - makes sure that hour's section of deliveroo_ranking_analysis exists;
+//   - runs 24h retention (deliveroo_ranking_housekeeping): drops hour sections older than
+//     24h that have a verified export in the Analytics Bucket, clears old parked rows and
+//     old registered queue rows. A retention problem is logged but never stops the scrape.
 // Writes scrape_date / scrape_hour / skip to $GITHUB_OUTPUT.
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DRY_RUN,
@@ -60,6 +63,23 @@ async function main() {
     const text = await resp.text();
     if (!resp.ok) throw new Error(`ensure_partition failed: ${resp.status} ${text}`);
     console.log(`Hour section ready: ${text}`);
+
+    try {
+      const hk = await fetch(`${SUPABASE_URL}/rest/v1/rpc/deliveroo_ranking_housekeeping`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      });
+      const hkText = await hk.text();
+      if (!hk.ok) console.log(`::warning::Retention step failed: ${hk.status} ${hkText.slice(0, 300)}`);
+      else console.log(`Retention: ${hkText}`);
+    } catch (e) {
+      console.log(`::warning::Retention step failed: ${e.message}`);
+    }
   }
 
   setOutput('skip', 'false');
