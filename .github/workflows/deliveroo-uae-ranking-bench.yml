@@ -1,0 +1,40 @@
+name: Deliveroo UAE – TEMP Bucket Benchmark
+
+# Temporary (batch 5): builds / drops a 31-day test table in the Analytics Bucket
+# (namespace deliveroo_bench) to time 31-day chart queries. Delete after the test.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'build or drop'
+        type: choice
+        options: [build, drop]
+        default: build
+      days:
+        description: 'Days to build'
+        type: string
+        default: '31'
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --quiet "pyiceberg[pyarrow]==0.12.0" "psycopg[binary]==3.3.6"
+      - name: Run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_S3_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          SUPABASE_S3_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          SUPABASE_S3_REGION: ap-southeast-2
+          ANALYTICS_BUCKET: deliveroo-ranking-archive
+          MODE: ${{ inputs.mode }}
+          DAYS: ${{ inputs.days }}
+        run: python deliveroo/uae/ranking-bucket-benchmark.py
