@@ -27,8 +27,12 @@ on:
         description: 'How many of the 15 jobs to use (1-15). Empty = 15'
         type: string
         default: ''
+      area_gap_seconds:
+        description: 'Minimum seconds between listing requests on each machine. Empty = 75 (Deliveroo limit ~1/min per machine)'
+        type: string
+        default: ''
       spread_minutes:
-        description: 'Spread each job''s areas over this many minutes. Empty = 20 for full runs, 0 when area_ids is set'
+        description: 'Optional: stretch each job over this many minutes (never shorter than the gap). Empty = as fast as the gap allows'
         type: string
         default: ''
 
@@ -84,6 +88,7 @@ jobs:
           AREA_IDS: ${{ inputs.area_ids }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
           UPDATE_IMAGES: ${{ inputs.update_images == false && 'false' || 'true' }}
+          AREA_GAP_SECONDS: ${{ inputs.area_gap_seconds }}
           SPREAD_MINUTES: ${{ inputs.spread_minutes }}
           SUMMARY_FILE: summary-job-${{ matrix.job }}.json
         run: node --max-old-space-size=4096 deliveroo/uae/ranking-scrape.js
