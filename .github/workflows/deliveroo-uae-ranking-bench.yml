@@ -10,6 +10,11 @@ on:
         type: choice
         options: [build, drop]
         default: build
+      sort:
+        description: 'Sort rows by partner or area'
+        type: choice
+        options: [partner, area]
+        default: partner
       days:
         description: 'Days to build'
         type: string
@@ -37,4 +42,5 @@ jobs:
           ANALYTICS_BUCKET: deliveroo-ranking-archive
           MODE: ${{ inputs.mode }}
           DAYS: ${{ inputs.days }}
+          SORT: ${{ inputs.sort }}
         run: python deliveroo/uae/ranking-bucket-benchmark.py
