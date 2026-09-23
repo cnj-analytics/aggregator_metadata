@@ -78,9 +78,7 @@ async function loadPendingRows() {
   for (let offset = 0; ; offset += PAGE_SIZE) {
     const page = await supabase(
       '/deliveroo_branch_information' +
-        '?select=deliveroo_branch_partner_id,deliveroo_branch_id,' +
-        'deliveroo_branch(deliveroo_branch_page_url,' +
-        'deliveroo_branch_delivery_area(deliveroo_area(deliveroo_area_slug,deliveroo_area_geohash)))' +
+        '?select=deliveroo_branch_partner_id,deliveroo_branch_id,deliveroo_branch(deliveroo_branch_page_url)' +
         '&deliveroo_branch_location_latitude=is.null' +
         '&order=deliveroo_branch_partner_id.asc' +
         `&limit=${PAGE_SIZE}&offset=${offset}`,
@@ -90,6 +88,17 @@ async function loadPendingRows() {
     if (page.length < PAGE_SIZE) break;
   }
   return rows;
+}
+
+// The branch's delivery areas (small indexed lookup, done per row).
+// Loading these for all rows up front times out on Supabase.
+async function loadDeliveryAreas(partnerId) {
+  return supabase(
+    '/deliveroo_branch_delivery_area' +
+      `?deliveroo_branch_partner_id=eq.${encodeURIComponent(partnerId)}` +
+      '&select=deliveroo_area(deliveroo_area_slug,deliveroo_area_geohash)',
+    'GET'
+  );
 }
 
 // --- Page fetch & extraction -----------------------------------------
@@ -259,18 +268,24 @@ async function main() {
     const row = mine[i];
     const partnerId = row.deliveroo_branch_partner_id;
     const url = row.deliveroo_branch?.deliveroo_branch_page_url;
-    const geohash = pickGeohash(url, row.deliveroo_branch?.deliveroo_branch_delivery_area);
     const rec = {
       shard: SHARD_INDEX, partner_id: partnerId, branch_id: row.deliveroo_branch_id, url,
       status: null, http_status: null, final_url: null, page_drn_id: null,
       page_restaurant_id: null, lat: null, lon: null, ms: null, retries: 0, rate_limits: 0,
-      geohash, error: null,
+      geohash: null, error: null,
     };
     const t0 = Date.now();
+    let geohash = null;
 
     try {
+      if (url) {
+        geohash = pickGeohash(url, await loadDeliveryAreas(partnerId));
+        rec.geohash = geohash;
+      }
       if (!url) {
         rec.status = 'no_url';
+      } else if (!geohash) {
+        rec.status = 'no_geohash';
       } else {
         const { resp, retries, rateLimits, error } = await fetchWithRetry(withGeohash(url, geohash));
         rec.retries = retries;
