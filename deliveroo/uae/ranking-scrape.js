@@ -42,6 +42,7 @@ const RATE_LIMIT_INITIAL_BACKOFF_MS = 60000;
 const DELAY_BETWEEN_AREAS_MS = 2000;
 const MAX_CONSECUTIVE_BLOCKS = 3;
 const WRITE_CHUNK = 1000;
+const START_STAGGER_MS = 3000; // job N starts N×3s after job 0, so writes don't all land at once
 
 const HEADERS = {
   'User-Agent':
@@ -156,6 +157,11 @@ async function main() {
   if (!mine.length) {
     fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries));
     return;
+  }
+
+  if (JOB_INDEX > 0) {
+    log(`Staggered start: waiting ${(JOB_INDEX * START_STAGGER_MS) / 1000}s`);
+    await sleep(JOB_INDEX * START_STAGGER_MS);
   }
 
   // Known partners + current images (one read per job).

@@ -3,7 +3,7 @@
 // Runs once per hourly scrape, before the 15 jobs start:
 //   - works out the Dubai date + hour window this run belongs to, so all 15 jobs
 //     use the same label even if some start late;
-//   - makes sure that day's section of deliveroo_ranking_analysis exists.
+//   - makes sure that hour's section of deliveroo_ranking_analysis exists.
 // Writes scrape_date / scrape_hour / skip to $GITHUB_OUTPUT.
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DRY_RUN,
@@ -55,11 +55,11 @@ async function main() {
         Authorization: `Bearer ${SUPABASE_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ p_date: date }),
+      body: JSON.stringify({ p_date: date, p_hour: hour }),
     });
     const text = await resp.text();
     if (!resp.ok) throw new Error(`ensure_partition failed: ${resp.status} ${text}`);
-    console.log(`Day section ready: ${text}`);
+    console.log(`Hour section ready: ${text}`);
   }
 
   setOutput('skip', 'false');
