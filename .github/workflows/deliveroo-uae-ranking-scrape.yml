@@ -23,6 +23,10 @@ on:
         description: 'Optional hour label (0-23, Dubai). Empty = current Dubai hour'
         type: string
         default: ''
+      job_count:
+        description: 'How many of the 15 jobs to use (1-15). Empty = 15'
+        type: string
+        default: ''
       spread_minutes:
         description: 'Spread each job''s areas over this many minutes. Empty = 20 for full runs, 0 when area_ids is set'
         type: string
@@ -74,7 +78,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           JOB_INDEX: ${{ matrix.job }}
-          JOB_COUNT: '15'
+          JOB_COUNT: ${{ inputs.job_count || '15' }}
           SCRAPE_DATE: ${{ needs.setup.outputs.scrape_date }}
           SCRAPE_HOUR: ${{ needs.setup.outputs.scrape_hour }}
           AREA_IDS: ${{ inputs.area_ids }}
