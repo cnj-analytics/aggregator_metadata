@@ -6,9 +6,8 @@ name: Deliveroo UAE – Ranking Export (daily)
 # hour sections older than 24h that have a verified export.
 on:
   # 04:00 Dubai = 00:00 UTC, inside the 03:00-05:59 scrape pause.
-  # Switched off until the bucket keys are added as secrets (batch 5).
-  # schedule:
-  #   - cron: '0 0 * * *'
+  schedule:
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       dry_run:

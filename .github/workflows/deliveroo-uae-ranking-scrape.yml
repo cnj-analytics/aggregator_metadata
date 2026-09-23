@@ -2,9 +2,8 @@ name: Deliveroo UAE – Ranking Scrape (hourly)
 
 on:
   # Hourly 06:00 -> 02:00 Dubai (UTC+4) = 02:05 -> 22:05 UTC.
-  # Switched off until the test is signed off (batch 5).
-  # schedule:
-  #   - cron: '5 2-22 * * *'
+  schedule:
+    - cron: '5 2-22 * * *'
   workflow_dispatch:
     inputs:
       area_ids:
