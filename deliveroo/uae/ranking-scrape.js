@@ -39,20 +39,18 @@ const SUMMARY_FILE = process.env.SUMMARY_FILE || 'summary.json';
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 5000;
 const MAX_RATE_LIMIT_RETRIES = 2; // wait 60s, then 120s, then skip the area
-const RATE_LIMIT_INITIAL_BACKOFF_MS = 60000;
-const DELAY_BETWEEN_AREAS_MS = 2000;
+const RATE_LIMIT_INITIAL_BACKOFF_MS = 75000; // one gap, then two
 const MAX_CONSECUTIVE_BLOCKS = 3;
 const MAX_403_RETRIES = 2;
 const BLOCK_RETRY_DELAY_MS = 20000;
 const WRITE_CHUNK = 1000;
-const START_STAGGER_MS = 3000; // used only when pacing is off (small manual runs)
-// Pacing: each job spreads its areas evenly over SPREAD_MINUTES, and the jobs are offset
-// from each other, so requests to Deliveroo (and writes to Supabase) arrive at a steady
-// rate across the hour instead of in bursts. Default 20 for full runs, 0 (off) when
-// AREA_IDS is given.
-const SPREAD_MINUTES = process.env.SPREAD_MINUTES !== undefined && process.env.SPREAD_MINUTES !== ''
-  ? Number(process.env.SPREAD_MINUTES)
-  : (AREA_IDS.length ? 0 : 20);
+// Pacing. Deliveroo limits each machine to roughly one full-listing page per minute
+// (tested 23 Sep 2026: 75s apart = no 429s; ~40s apart = 429s). So every job waits at
+// least AREA_GAP_SECONDS between its own listing requests. Jobs are offset from each
+// other so requests (and database saves) arrive evenly. SPREAD_MINUTES can stretch a
+// run further but never makes the gap shorter than AREA_GAP_SECONDS.
+const AREA_GAP_SECONDS = Number(process.env.AREA_GAP_SECONDS || 75);
+const SPREAD_MINUTES = Number(process.env.SPREAD_MINUTES || 0);
 
 const HEADERS = {
   'User-Agent':
@@ -220,10 +218,11 @@ async function main() {
     return;
   }
 
-  const slotMs = SPREAD_MINUTES > 0 ? (SPREAD_MINUTES * 60000) / mine.length : 0;
+  const slotMs = Math.max(AREA_GAP_SECONDS * 1000, SPREAD_MINUTES > 0 ? (SPREAD_MINUTES * 60000) / mine.length : 0);
   const t0Run = Date.now();
-  const offsetMs = slotMs ? Math.round((JOB_INDEX * slotMs) / JOB_COUNT) : JOB_INDEX * START_STAGGER_MS;
-  if (slotMs) log(`Pacing: one area every ${(slotMs / 1000).toFixed(0)}s over ${SPREAD_MINUTES} min, offset ${(offsetMs / 1000).toFixed(0)}s`);
+  const offsetMs = Math.round((JOB_INDEX * slotMs) / JOB_COUNT);
+  let lastFetchAt = 0;
+  log(`Pacing: one area every ${(slotMs / 1000).toFixed(0)}s (≈${((mine.length * slotMs) / 60000).toFixed(0)} min for ${mine.length} areas), offset ${(offsetMs / 1000).toFixed(0)}s`);
 
   // Known partners + current images (one read per job).
   const branches = await fetchAll(
@@ -238,7 +237,8 @@ async function main() {
 
   for (const [ai, area] of mine.entries()) {
     // Wait for this area's slot (area 0 at the job offset, then every slotMs).
-    const due = t0Run + offsetMs + ai * slotMs;
+    // …and never sooner than one gap after this job's previous request (e.g. after a 429 wait).
+    const due = Math.max(t0Run + offsetMs + ai * slotMs, lastFetchAt + AREA_GAP_SECONDS * 1000);
     if (Date.now() < due) await sleep(due - Date.now());
     const t0 = Date.now();
     const s = {
@@ -256,6 +256,7 @@ async function main() {
       s.url_fixed = listing.fixed;
       if (listing.fixed) log(`  stored URL not in listing format – using ${listing.url}`);
       const page = await fetchPage(listing.url);
+      lastFetchAt = Date.now();
       s.fetch_ms = Date.now() - tf;
       s.rate_limits = page.rateLimits;
       s.http_status = page.status;
@@ -383,7 +384,6 @@ async function main() {
     }
     // Keep the summary on disk after every area so a cancelled job still reports.
     fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries, null, 1));
-    if (!slotMs) await sleep(DELAY_BETWEEN_AREAS_MS);
   }
 
   fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries, null, 1));
