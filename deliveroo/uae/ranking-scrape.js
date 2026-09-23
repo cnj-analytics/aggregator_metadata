@@ -205,6 +205,12 @@ async function main() {
     '&deliveroo_area_is_active=is.true'
   );
   if (AREA_IDS.length) areas = areas.filter(a => AREA_IDS.includes(String(a.deliveroo_area_id)));
+  // JOB_COUNT can be lowered for tests (e.g. 1); matrix jobs above it do nothing.
+  if (JOB_INDEX >= JOB_COUNT) {
+    log(`Job ${JOB_INDEX + 1} not used (job_count=${JOB_COUNT}).`);
+    fs.writeFileSync(SUMMARY_FILE, '[]');
+    return;
+  }
   const mine = areas.filter((_, i) => i % JOB_COUNT === JOB_INDEX);
   log(`Job ${JOB_INDEX + 1}/${JOB_COUNT} · ${SCRAPE_DATE} ${SCRAPE_HOUR} · dry_run=${DRY_RUN} · ${mine.length} of ${areas.length} areas`);
 
