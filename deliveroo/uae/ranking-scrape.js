@@ -104,6 +104,22 @@ async function writeChunks(path, rows, prefer) {
   }
 }
 
+// --- Area URL ---------------------------------------------------------------------
+// The full listing needs ?collection=restaurants&collection=all-restaurants. Whatever
+// is stored in deliveroo_area_url, rebuild it to that form: keep the path and any other
+// query parameters, drop any existing collection values, then add the two required ones.
+// Returns { url, fixed } – fixed=true when the stored URL was not already correct.
+const LISTING_COLLECTIONS = ['restaurants', 'all-restaurants'];
+
+function toListingUrl(stored) {
+  const u = new URL(String(stored).trim());
+  const current = u.searchParams.getAll('collection');
+  u.searchParams.delete('collection');
+  for (const c of LISTING_COLLECTIONS) u.searchParams.append('collection', c);
+  const fixed = current.join(',') !== LISTING_COLLECTIONS.join(',');
+  return { url: u.toString(), fixed };
+}
+
 // --- Page fetch -----------------------------------------------------------------
 
 async function fetchPage(url) {
@@ -198,7 +214,10 @@ async function main() {
 
     try {
       const tf = Date.now();
-      const page = await fetchPage(area.deliveroo_area_url);
+      const listing = toListingUrl(area.deliveroo_area_url);
+      s.url_fixed = listing.fixed;
+      if (listing.fixed) log(`  stored URL not in listing format – using ${listing.url}`);
+      const page = await fetchPage(listing.url);
       s.fetch_ms = Date.now() - tf;
       s.rate_limits = page.rateLimits;
       s.http_status = page.status;
