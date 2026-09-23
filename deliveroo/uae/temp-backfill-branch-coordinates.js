@@ -83,16 +83,32 @@ async function loadPendingRows() {
 
 // --- Page fetch & extraction -----------------------------------------
 
+const BROWSER_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-GB,en;q=0.9',
+  'Cache-Control': 'no-cache',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Upgrade-Insecure-Requests': '1',
+};
+
+// Short description of a blocked/failed response, for the results CSV.
+async function describeBlock(resp) {
+  let body = '';
+  try { body = (await resp.text()).replace(/\s+/g, ' ').slice(0, 160); } catch (_) {}
+  const h = k => resp.headers.get(k);
+  return `server=${h('server') || ''} cf-ray=${h('cf-ray') ? 'yes' : 'no'} ` +
+    `set-cookie=${(h('set-cookie') || '').split('=')[0]} body="${body}"`;
+}
+
 async function fetchWithRetry(url) {
   let lastErr = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const resp = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; AreaSync/1.0)',
-          Accept: 'text/html,application/xhtml+xml',
-        },
-      });
+      const resp = await fetch(url, { headers: BROWSER_HEADERS });
       if (resp.status === 429 || resp.status >= 500) {
         const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
         console.log(`  ${resp.status} -- retrying in ${delay / 1000}s`);
@@ -222,6 +238,8 @@ async function main() {
           if (resp.url && resp.url !== url) rec.final_url = resp.url;
           if (!resp.ok) {
             rec.status = `http_${resp.status}`;
+            rec.error = await describeBlock(resp);
+            if (i < 2) console.log(`  blocked: ${rec.error}`);
           } else {
             const x = extract(await resp.text());
             if (x.error) {
