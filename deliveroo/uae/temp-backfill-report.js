@@ -61,7 +61,7 @@ const avg = ms.length ? ms.reduce((a, b) => a + b, 0) / ms.length : 0;
 const retries = recs.reduce((a, r) => a + Number(get(r, 'retries') || 0), 0);
 
 let md = `## Branch coordinates backfill – report\n\n`;
-md += `Shard files: ${files.length}/20 · Rows processed: ${recs.length}\n\n`;
+md += `Job result files: ${files.length} · Rows processed: ${recs.length}\n\n`;
 md += `| Status | Count |\n|---|---|\n`;
 for (const [k, v] of Object.entries(counts).sort((a, b) => b[1] - a[1])) md += `| ${k} | ${v} |\n`;
 md += `\n**Timing per URL (fetch + parse + write, excl. 0.3s pause):** avg ${(avg / 1000).toFixed(2)}s · p50 ${(pct(0.5) / 1000).toFixed(2)}s · p95 ${(pct(0.95) / 1000).toFixed(2)}s · max ${(pct(1) / 1000).toFixed(2)}s · total retries ${retries}\n\n`;
