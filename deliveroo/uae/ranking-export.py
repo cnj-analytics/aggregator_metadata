@@ -6,14 +6,12 @@ Analytics Bucket (Apache Iceberg), so Postgres only needs to keep the last 24 ho
 Runs at 04:00 Dubai (inside the 03:00-05:59 pause), from GitHub Actions:
   1. Ask Postgres which hour sections are finished (started 2+ hours ago) and not yet
      exported: deliveroo_ranking_export_candidates().
-  2. For each scrape date, read those hours and write them twice (both partitioned by
-     scrape date, same rows):
-       deliveroo.ranking_analysis          sorted by partner, hour, area  – restaurant charts
-       deliveroo.ranking_analysis_by_area  sorted by area, hour, rank     – area charts
-     (tested 23 Sep: one area over 31 days = 8 s with the area copy, >2 min without).
-     Each write replaces those exact hours, so a re-run never duplicates.
-  3. Read the hours back from both copies, count rows per hour and record each hour with
-     deliveroo_ranking_record_export() only if Postgres and both copies agree.
+  2. For each scrape date, read those hours sorted by partner, then hour/area, and write
+     them to deliveroo.ranking_analysis (partitioned by scrape date). Charts are per
+     restaurant, so this sort lets a restaurant lookup skip almost all of each file.
+     The write replaces those exact hours, so a re-run never duplicates.
+  3. Read the hours back from the bucket, count rows per hour and record each hour with
+     deliveroo_ranking_record_export(), which refuses if Postgres and the bucket differ.
      Only recorded hours can ever be dropped from Postgres (hourly retention step).
 
 Env:
@@ -38,8 +36,7 @@ import pyarrow.compute as pc
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 BUCKET = os.environ.get("ANALYTICS_BUCKET", "deliveroo-ranking-archive")
 NAMESPACE = "deliveroo"
-TABLE = "ranking_analysis"              # sorted by restaurant – restaurant charts
-TABLE_BY_AREA = "ranking_analysis_by_area"  # same rows sorted by area – area charts
+TABLE = "ranking_analysis"  # sorted by restaurant (charts are per restaurant)
 RUN_ID = os.environ.get("GITHUB_RUN_ID", "local")
 FETCH_BATCH = 200_000
 
@@ -182,11 +179,10 @@ def main():
         out(f"Hours to export: **{len(cands)}** across {len(by_day)} day(s), "
             f"{sum(c[3] for c in cands):,} rows.")
         out()
-        out("| Day | Hours | Rows (Postgres) | Rows in bucket (by restaurant / by area) | Recorded | Seconds |")
+        out("| Day | Hours | Rows (Postgres) | Rows (bucket) | Recorded | Seconds |")
         out("|---|---|---|---|---|---|")
 
         table = None if DRY_RUN else load_table(TABLE, "deliveroo_branch_partner_id")
-        table_area = None if DRY_RUN else load_table(TABLE_BY_AREA, "deliveroo_area_id")
         failures = 0
         for day, items in sorted(by_day.items()):
             t0 = time.time()
@@ -197,19 +193,11 @@ def main():
                 continue
             data = read_hours(conn, day, hours)
             from pyiceberg.expressions import And, EqualTo, In
-            by_area = data.take(pc.sort_indices(data, sort_keys=[
-                ("deliveroo_area_id", "ascending"), ("deliveroo_area_scrape_hour", "ascending"),
-                ("deliveroo_listing_rank", "ascending")]))
-            # Replace exactly these hours in both copies (safe to re-run; never duplicates).
+            # Replace exactly these hours (safe to re-run; never duplicates).
             flt = And(EqualTo("deliveroo_area_scrape_date", day), In("deliveroo_area_scrape_hour", set(hours)))
             table.overwrite(data, overwrite_filter=flt)
-            table_area.overwrite(by_area, overwrite_filter=flt)
             table.refresh()
-            table_area.refresh()
-            c1 = bucket_counts(table, day, hours)
-            c2 = bucket_counts(table_area, day, hours)
-            # Both copies must agree; a disagreement is recorded as -1 so the database refuses it.
-            counts = {h: (c1.get(h, 0) if c1.get(h, 0) == c2.get(h, 0) else -1) for h in hours}
+            counts = bucket_counts(table, day, hours)
             recorded = 0
             for h, sec, n in items:
                 try:
@@ -218,8 +206,8 @@ def main():
                     recorded += 1
                 except Exception as e:
                     failures += 1
-                    out(f"| {day} {h} | 1 | {n:,} | {c1.get(h, 0):,} / {c2.get(h, 0):,} | **NOT recorded**: {str(e)[:120]} | |")
-            out(f"| {day} | {len(hours)} | {pg_rows:,} | {sum(c1.values()):,} / {sum(c2.values()):,} | {recorded}/{len(hours)} | "
+                    out(f"| {day} {h} | 1 | {n:,} | {counts.get(h, 0):,} | **NOT recorded**: {str(e)[:120]} | |")
+            out(f"| {day} | {len(hours)} | {pg_rows:,} | {sum(counts.values()):,} | {recorded}/{len(hours)} | "
                 f"{time.time() - t0:.0f} |")
 
     out()
