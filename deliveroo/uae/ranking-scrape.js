@@ -174,7 +174,7 @@ async function main() {
     const s = {
       job: JOB_INDEX, area_id: area.deliveroo_area_id, area_name: area.deliveroo_area_name,
       status: null, http_status: null, bytes: 0, fetch_ms: 0, total_ms: 0, rate_limits: 0,
-      declared_count: null, cards: 0, ranking_rows: 0, pending_rows: 0, queued_partners: 0,
+      declared_count: null, cards: 0, ranking_rows: 0, pending_rows: 0, queued_partners: 0, replaced_rows: 0,
       delivery_pairs_added: 0, images_updated: 0, rank_gaps: 0, duplicate_partners: 0,
       rated: 0, not_rated: 0, new: 0, open: 0, closed: 0, fast: 0, with_promo: 0,
       scope: {}, unknown_promos: {}, anomalies: {}, image_examples: [], error: null,
@@ -279,10 +279,20 @@ async function main() {
       s.images_updated = imageUpdates.length;
 
       if (!DRY_RUN) {
-        const onConflict = 'on_conflict=deliveroo_area_id,deliveroo_area_scrape_date,deliveroo_area_scrape_hour,deliveroo_branch_partner_id';
-        await writeChunks(`/deliveroo_ranking_analysis?${onConflict}`, rankingRows, 'resolution=merge-duplicates,return=minimal');
-        if (pendingRows.length) {
-          await writeChunks(`/deliveroo_ranking_pending?${onConflict}`, pendingRows, 'resolution=merge-duplicates,return=minimal');
+        // One transaction per area+hour: clear that hour's rows, then insert the fresh listing.
+        // A re-run of the same hour therefore replaces rather than mixes.
+        const res = await supabase('/rpc/deliveroo_ranking_replace_area_hour', 'POST', {
+          p_area_id: area.deliveroo_area_id,
+          p_date: SCRAPE_DATE,
+          p_hour: SCRAPE_HOUR,
+          p_rows: rankingRows,
+          p_pending: pendingRows,
+        });
+        s.replaced_rows = res?.deleted ?? 0;
+        if (res && (res.inserted !== rankingRows.length || res.inserted_pending !== pendingRows.length)) {
+          throw new Error(`insert count mismatch: ${JSON.stringify(res)}`);
+        }
+        if (queueRows.length) {
           await writeChunks('/deliveroo_partner_registration_queue?on_conflict=deliveroo_branch_partner_id',
             queueRows, 'resolution=ignore-duplicates,return=minimal');
         }
