@@ -23,6 +23,10 @@ on:
         description: 'Optional hour label (0-23, Dubai). Empty = current Dubai hour'
         type: string
         default: ''
+      spread_minutes:
+        description: 'Spread each job''s areas over this many minutes. Empty = 45 for full runs, 0 when area_ids is set'
+        type: string
+        default: ''
 
 concurrency:
   group: deliveroo-uae-ranking-scrape
@@ -54,7 +58,7 @@ jobs:
     needs: setup
     if: needs.setup.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       max-parallel: 15
@@ -76,6 +80,7 @@ jobs:
           AREA_IDS: ${{ inputs.area_ids }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
           UPDATE_IMAGES: ${{ inputs.update_images == false && 'false' || 'true' }}
+          SPREAD_MINUTES: ${{ inputs.spread_minutes }}
           SUMMARY_FILE: summary-job-${{ matrix.job }}.json
         run: node --max-old-space-size=4096 deliveroo/uae/ranking-scrape.js
       - name: Upload job summary
