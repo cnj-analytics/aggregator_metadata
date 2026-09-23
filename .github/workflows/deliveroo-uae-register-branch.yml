@@ -2,35 +2,69 @@ name: Deliveroo UAE – Register Branch
 
 # Started automatically by Supabase (deliveroo_dispatch_registration trigger) when the
 # ranking scrape finds partner IDs that are not in deliveroo_branch. Can also be run by hand.
+#
+# Normal: 1 job, first come first served – takes the oldest waiting partner, registers it,
+# removes it from the queue, takes the next, until the queue is empty.
+# Backlog (more than 100 waiting when the run starts): up to 5 jobs share the same queue.
+# If the time budget runs out with partners still waiting, the run starts itself again.
 on:
   workflow_dispatch:
 
-# One run at a time; an extra request while a run is going waits (it will find an empty or
-# smaller queue). Each run drains the whole queue.
 concurrency:
   group: deliveroo-uae-register-branch
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write   # lets the run re-dispatch itself when a backlog remains
+
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      waiting: ${{ steps.p.outputs.waiting }}
+      jobs: ${{ steps.p.outputs.jobs }}
+    steps:
+      - id: p
+        name: How many partners are waiting?
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          n=$(curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/deliveroo_registration_waiting" \
+                -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+                -H "Content-Type: application/json" -d '{}')
+          n=${n:-0}
+          if   [ "$n" -gt 400 ]; then k=5
+          elif [ "$n" -gt 300 ]; then k=4
+          elif [ "$n" -gt 200 ]; then k=3
+          elif [ "$n" -gt 100 ]; then k=2
+          else k=1; fi
+          echo "waiting=$n" >> "$GITHUB_OUTPUT"
+          echo "jobs=$(python3 -c "import json;print(json.dumps(list(range($k))))")" >> "$GITHUB_OUTPUT"
+          echo "Waiting partners: $n → $k job(s)"
+
   register:
+    needs: plan
+    if: needs.plan.outputs.waiting != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 50
     strategy:
       fail-fast: false
-      max-parallel: 10
       matrix:
-        job: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        job: ${{ fromJSON(needs.plan.outputs.jobs) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Register job ${{ matrix.job }}
+      - name: Register (job ${{ matrix.job }})
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           JOB_INDEX: ${{ matrix.job }}
-          JOB_COUNT: '10'
+          JOB_COUNT: ${{ strategy.job-total }}
           SUMMARY_FILE: register-job-${{ matrix.job }}.json
         run: node deliveroo/uae/register-branch.js
       - name: Upload job summary
@@ -43,8 +77,8 @@ jobs:
           retention-days: 7
 
   report:
-    needs: register
-    if: always()
+    needs: [plan, register]
+    if: always() && needs.plan.outputs.waiting != '0'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,3 +92,17 @@ jobs:
           merge-multiple: true
       - name: Build report
         run: node deliveroo/uae/register-report.js summaries >> "$GITHUB_STEP_SUMMARY"
+      - name: Start again if partners are still waiting
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/deliveroo_registration_waiting" \
+                -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+                -H "Content-Type: application/json" -d '{}')
+          echo "Still waiting: ${n:-0}"
+          if [ "${n:-0}" -gt 0 ]; then
+            gh workflow run deliveroo-uae-register-branch.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo "Dispatched a follow-up run."
+          fi
