@@ -64,8 +64,9 @@ let md = `## Branch coordinates backfill – report\n\n`;
 md += `Job result files: ${files.length} · Rows processed: ${recs.length}\n\n`;
 md += `| Status | Count |\n|---|---|\n`;
 for (const [k, v] of Object.entries(counts).sort((a, b) => b[1] - a[1])) md += `| ${k} | ${v} |\n`;
-md += `\n**Timing per URL (fetch + parse + write, excl. 0.3s pause):** avg ${(avg / 1000).toFixed(2)}s · p50 ${(pct(0.5) / 1000).toFixed(2)}s · p95 ${(pct(0.95) / 1000).toFixed(2)}s · max ${(pct(1) / 1000).toFixed(2)}s · total retries ${retries}\n\n`;
-const perUrl = avg / 1000 + 0.3;
+const rl = recs.reduce((a, r) => a + Number(get(r, 'rate_limits') || 0), 0);
+md += `\n**Timing per URL (fetch + parse + write, excl. 1.5s pause):** avg ${(avg / 1000).toFixed(2)}s · p50 ${(pct(0.5) / 1000).toFixed(2)}s · p95 ${(pct(0.95) / 1000).toFixed(2)}s · max ${(pct(1) / 1000).toFixed(2)}s · total retries ${retries} · 429s ${rl}\n\n`;
+const perUrl = avg / 1000 + 1.5;
 md += `**Estimated full run:** ~${Math.ceil(16189 / 20)} URLs per job × ${perUrl.toFixed(2)}s ≈ ${Math.ceil((16189 / 20) * perUrl / 60)} min per job (20 jobs in parallel)\n\n`;
 
 md += `### drnId mismatches (${mismatches.length}) – not written\n\n`;

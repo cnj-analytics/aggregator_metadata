@@ -4,8 +4,11 @@
 // has coordinates for every row.
 //
 // For each deliveroo_branch_information row with no latitude yet:
-//   1. Fetch the branch page (deliveroo_branch.deliveroo_branch_page_url).
-//      No customer location is sent, so the page's customerLocation stays 0,0.
+//   1. Fetch the branch page (deliveroo_branch.deliveroo_branch_page_url)
+//      with ?geohash= of one of the branch's own delivery areas (Deliveroo
+//      returns 403 without a geohash). The area matching the URL's
+//      neighbourhood slug is preferred. The geohash only sets the customer
+//      location; the restaurant pin is the same for any geohash.
 //   2. Read the restaurant's drnId and the restaurant map pin from the
 //      "Location" section of __NEXT_DATA__.
 //   3. If drnId == deliveroo_branch_partner_id -> write lat/lon.
@@ -28,9 +31,15 @@ const LIMIT_PER_SHARD = parseInt(process.env.LIMIT_PER_SHARD || '0', 10);
 const DRY_RUN = (process.env.DRY_RUN || 'false').toLowerCase() === 'true';
 const RESULTS_FILE = process.env.RESULTS_FILE || 'results.csv';
 
-const MAX_RETRIES = 5;
-const INITIAL_RETRY_DELAY_MS = 5000;
-const DELAY_BETWEEN_PAGES_MS = 300;
+// Pacing mirrors deliveroo-uae-scraper (which ran successfully from GitHub).
+const MAX_RETRIES = 3;                       // network / 5xx errors
+const RETRY_DELAY_MS = 5000;
+const MAX_RATE_LIMIT_RETRIES = 5;            // 429s
+const RATE_LIMIT_INITIAL_BACKOFF_MS = 60000; // 60s, 120s, 180s ...
+const DELAY_BETWEEN_PAGES_MS = 1500;
+const BATCH_PAUSE_EVERY = 200;
+const BATCH_PAUSE_MS = 10000;
+const MAX_CONSECUTIVE_BLOCKS = 10;           // stop this job if Deliveroo keeps refusing
 const PAGE_SIZE = 1000;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -69,7 +78,9 @@ async function loadPendingRows() {
   for (let offset = 0; ; offset += PAGE_SIZE) {
     const page = await supabase(
       '/deliveroo_branch_information' +
-        '?select=deliveroo_branch_partner_id,deliveroo_branch_id,deliveroo_branch(deliveroo_branch_page_url)' +
+        '?select=deliveroo_branch_partner_id,deliveroo_branch_id,' +
+        'deliveroo_branch(deliveroo_branch_page_url,' +
+        'deliveroo_branch_delivery_area(deliveroo_area(deliveroo_area_slug,deliveroo_area_geohash)))' +
         '&deliveroo_branch_location_latitude=is.null' +
         '&order=deliveroo_branch_partner_id.asc' +
         `&limit=${PAGE_SIZE}&offset=${offset}`,
@@ -83,17 +94,31 @@ async function loadPendingRows() {
 
 // --- Page fetch & extraction -----------------------------------------
 
+// Same headers as deliveroo-uae-scraper.
 const BROWSER_HEADERS = {
   'User-Agent':
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
-  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-  'Accept-Language': 'en-GB,en;q=0.9',
-  'Cache-Control': 'no-cache',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Upgrade-Insecure-Requests': '1',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.5',
 };
+
+// Pick a geohash from the branch's own delivery areas, preferring the area
+// whose slug matches the neighbourhood in the page URL (/menu/{city}/{area}/{name}).
+function pickGeohash(url, deliveryAreas) {
+  const areas = (deliveryAreas || [])
+    .map(d => d.deliveroo_area)
+    .filter(a => a && a.deliveroo_area_geohash);
+  if (!areas.length) return null;
+  const m = (url || '').match(/\/menu\/[^/]+\/([^/?#]+)\//);
+  const slug = m ? decodeURIComponent(m[1]).toLowerCase() : null;
+  const match = slug && areas.find(a => (a.deliveroo_area_slug || '').toLowerCase() === slug);
+  return (match || areas[0]).deliveroo_area_geohash;
+}
+
+function withGeohash(url, geohash) {
+  if (!geohash) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}geohash=${encodeURIComponent(geohash)}`;
+}
 
 // Short description of a blocked/failed response, for the results CSV.
 async function describeBlock(resp) {
@@ -106,25 +131,39 @@ async function describeBlock(resp) {
 
 async function fetchWithRetry(url) {
   let lastErr = null;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+  let errors = 0;
+  let rateLimits = 0;
+  let attempts = 0;
+  while (errors <= MAX_RETRIES && rateLimits <= MAX_RATE_LIMIT_RETRIES) {
+    attempts++;
     try {
-      const resp = await fetch(url, { headers: BROWSER_HEADERS });
-      if (resp.status === 429 || resp.status >= 500) {
-        const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
-        console.log(`  ${resp.status} -- retrying in ${delay / 1000}s`);
+      const resp = await fetch(url, { headers: BROWSER_HEADERS, redirect: 'follow' });
+      if (resp.status === 429) {
+        rateLimits++;
+        lastErr = 'http_429';
+        if (rateLimits > MAX_RATE_LIMIT_RETRIES) break;
+        const delay = RATE_LIMIT_INITIAL_BACKOFF_MS * rateLimits;
+        console.log(`  429 rate limited -- backing off ${delay / 1000}s`);
         await sleep(delay);
-        lastErr = `http_${resp.status}`;
         continue;
       }
-      return { resp, retries: attempt };
+      if (resp.status >= 500) {
+        errors++;
+        lastErr = `http_${resp.status}`;
+        if (errors > MAX_RETRIES) break;
+        await sleep(RETRY_DELAY_MS * errors);
+        continue;
+      }
+      return { resp, retries: attempts - 1, rateLimits };
     } catch (e) {
+      errors++;
       lastErr = e.message;
-      const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
-      console.log(`  fetch error (${e.message}) -- retrying in ${delay / 1000}s`);
-      await sleep(delay);
+      if (errors > MAX_RETRIES) break;
+      console.log(`  fetch error (${e.message}) -- retrying in ${(RETRY_DELAY_MS * errors) / 1000}s`);
+      await sleep(RETRY_DELAY_MS * errors);
     }
   }
-  return { resp: null, retries: MAX_RETRIES, error: lastErr };
+  return { resp: null, retries: attempts - 1, rateLimits, error: lastErr };
 }
 
 // Depth-first search for the layout whose header is "Location" and return
@@ -177,7 +216,8 @@ function extract(html) {
 
 const CSV_HEADER = [
   'shard', 'partner_id', 'branch_id', 'url', 'status', 'http_status', 'final_url',
-  'page_drn_id', 'page_restaurant_id', 'lat', 'lon', 'ms', 'retries', 'error',
+  'page_drn_id', 'page_restaurant_id', 'lat', 'lon', 'ms', 'retries', 'rate_limits',
+  'geohash', 'error',
 ];
 const csvCell = v => {
   const s = v === null || v === undefined ? '' : String(v);
@@ -212,15 +252,19 @@ async function main() {
 
   const counts = {};
   const started = Date.now();
+  let consecutiveBlocks = 0;
+  let stoppedEarly = false;
 
   for (let i = 0; i < mine.length; i++) {
     const row = mine[i];
     const partnerId = row.deliveroo_branch_partner_id;
     const url = row.deliveroo_branch?.deliveroo_branch_page_url;
+    const geohash = pickGeohash(url, row.deliveroo_branch?.deliveroo_branch_delivery_area);
     const rec = {
       shard: SHARD_INDEX, partner_id: partnerId, branch_id: row.deliveroo_branch_id, url,
       status: null, http_status: null, final_url: null, page_drn_id: null,
-      page_restaurant_id: null, lat: null, lon: null, ms: null, retries: 0, error: null,
+      page_restaurant_id: null, lat: null, lon: null, ms: null, retries: 0, rate_limits: 0,
+      geohash, error: null,
     };
     const t0 = Date.now();
 
@@ -228,14 +272,15 @@ async function main() {
       if (!url) {
         rec.status = 'no_url';
       } else {
-        const { resp, retries, error } = await fetchWithRetry(url);
+        const { resp, retries, rateLimits, error } = await fetchWithRetry(withGeohash(url, geohash));
         rec.retries = retries;
+        rec.rate_limits = rateLimits;
         if (!resp) {
           rec.status = 'fetch_failed';
           rec.error = error;
         } else {
           rec.http_status = resp.status;
-          if (resp.url && resp.url !== url) rec.final_url = resp.url;
+          if (resp.url && resp.url.split('?')[0] !== url.split('?')[0]) rec.final_url = resp.url;
           if (!resp.ok) {
             rec.status = `http_${resp.status}`;
             rec.error = await describeBlock(resp);
@@ -283,16 +328,29 @@ async function main() {
         (rec.status === 'drn_mismatch' ? `  (page drnId ${rec.page_drn_id})` : '')
     );
 
+    // Stop this job if Deliveroo keeps refusing (403/429 exhausted) rather than
+    // hammering it. Unprocessed rows stay empty and are picked up on a re-run.
+    const blocked = rec.status === 'http_403' || (rec.status === 'fetch_failed' && rec.error === 'http_429');
+    consecutiveBlocks = blocked ? consecutiveBlocks + 1 : 0;
+    if (consecutiveBlocks >= MAX_CONSECUTIVE_BLOCKS) {
+      console.log(`\nSTOPPING: ${MAX_CONSECUTIVE_BLOCKS} consecutive blocked responses.`);
+      stoppedEarly = true;
+      break;
+    }
+
     await sleep(DELAY_BETWEEN_PAGES_MS);
+    if ((i + 1) % BATCH_PAUSE_EVERY === 0) await sleep(BATCH_PAUSE_MS);
   }
 
   await new Promise(r => out.end(r));
   const secs = (Date.now() - started) / 1000;
-  console.log(`\nDone in ${secs.toFixed(1)}s (${mine.length ? (secs / mine.length).toFixed(2) : 0}s per URL incl. delay)`);
+  const done = Object.values(counts).reduce((a, b) => a + b, 0);
+  console.log(`\nDone in ${secs.toFixed(1)}s (${done ? (secs / done).toFixed(2) : 0}s per URL incl. delay)`);
   console.log('Counts:', JSON.stringify(counts));
+  if (stoppedEarly) process.exitCode = 2;
 }
 
-module.exports = { extract };
+module.exports = { extract, pickGeohash, withGeohash };
 
 if (require.main === module) {
   main().catch(e => {
