@@ -1,0 +1,60 @@
+name: Deliveroo UAE – Register Branch
+
+# Started automatically by Supabase (deliveroo_dispatch_registration trigger) when the
+# ranking scrape finds partner IDs that are not in deliveroo_branch. Can also be run by hand.
+on:
+  workflow_dispatch:
+
+# One run at a time; an extra request while a run is going waits (it will find an empty or
+# smaller queue). Each run drains the whole queue.
+concurrency:
+  group: deliveroo-uae-register-branch
+  cancel-in-progress: false
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        job: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Register job ${{ matrix.job }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          JOB_INDEX: ${{ matrix.job }}
+          JOB_COUNT: '10'
+          SUMMARY_FILE: register-job-${{ matrix.job }}.json
+        run: node deliveroo/uae/register-branch.js
+      - name: Upload job summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: register-summary-job-${{ matrix.job }}
+          path: register-job-${{ matrix.job }}.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  report:
+    needs: register
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: register-summary-job-*
+          path: summaries
+          merge-multiple: true
+      - name: Build report
+        run: node deliveroo/uae/register-report.js summaries >> "$GITHUB_STEP_SUMMARY"
