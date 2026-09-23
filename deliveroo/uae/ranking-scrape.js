@@ -177,7 +177,7 @@ async function main() {
       declared_count: null, cards: 0, ranking_rows: 0, pending_rows: 0, queued_partners: 0,
       delivery_pairs_added: 0, images_updated: 0, rank_gaps: 0, duplicate_partners: 0,
       rated: 0, not_rated: 0, new: 0, open: 0, closed: 0, fast: 0, with_promo: 0,
-      scope: {}, unknown_promos: {}, anomalies: {}, error: null,
+      scope: {}, unknown_promos: {}, anomalies: {}, image_examples: [], error: null,
     };
 
     try {
@@ -245,6 +245,9 @@ async function main() {
             // Keep the stored URL's query template if there is one; swap only the image path.
             const q = stored && stored.includes('?') ? stored.slice(stored.indexOf('?')) : (c.imageUrl.includes('?') ? c.imageUrl.slice(c.imageUrl.indexOf('?')) : '');
             imageUpdates.push({ partnerId: c.partnerId, url: imageBase(c.imageUrl) + q });
+            if (s.image_examples.length < 5) {
+              s.image_examples.push({ partner: c.partnerId, name: c.name, stored: imageBase(stored), card: imageBase(c.imageUrl) });
+            }
           }
         } else {
           pendingRows.push(row);

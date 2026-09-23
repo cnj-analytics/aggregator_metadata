@@ -43,6 +43,13 @@ const an = merge('anomalies');
 md += `### Anomalies (${Object.keys(an).length})\n\n`;
 md += Object.keys(an).length ? Object.entries(an).sort((a, b) => b[1] - a[1]).slice(0, 50).map(([k, v]) => `- ${k} (${v})`).join('\n') + '\n\n' : 'None.\n\n';
 
+const imgs = areas.flatMap(a => (a.image_examples || []).map(x => ({ area: a.area_name, ...x })));
+md += `### Image changes – examples (${sum('images_updated')} total)\n\n`;
+md += imgs.length
+  ? `| Area | Restaurant | Stored image | Card image |\n|---|---|---|---|\n` +
+    imgs.map(x => `| ${x.area} | ${x.name || x.partner} | ${x.stored || '(none)'} | ${x.card} |`).join('\n') + '\n\n'
+  : 'None.\n\n';
+
 md += `### Per area\n\n| Job | Area | Status | Cards / declared | Ranking | Pending | Pairs + | Images | MB | Fetch s | Total s |\n|---|---|---|---|---|---|---|---|---|---|---|\n`;
 for (const a of areas) {
   md += `| ${a.job + 1} | ${a.area_name || ''} (${a.area_id || ''}) | ${a.status}${a.error ? ` – ${a.error}` : ''} | ${a.cards ?? ''} / ${a.declared_count ?? ''} | ${a.ranking_rows ?? ''} | ${a.pending_rows ?? ''} | ${a.delivery_pairs_added ?? ''} | ${a.images_updated ?? ''} | ${a.bytes ? mb(a.bytes) : ''} | ${a.fetch_ms ? (a.fetch_ms / 1000).toFixed(1) : ''} | ${a.total_ms ? (a.total_ms / 1000).toFixed(1) : ''} |\n`;
