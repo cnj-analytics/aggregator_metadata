@@ -41,6 +41,8 @@ const MAX_RATE_LIMIT_RETRIES = 5;
 const RATE_LIMIT_INITIAL_BACKOFF_MS = 60000;
 const DELAY_BETWEEN_AREAS_MS = 2000;
 const MAX_CONSECUTIVE_BLOCKS = 3;
+const MAX_403_RETRIES = 2;
+const BLOCK_RETRY_DELAY_MS = 20000;
 const WRITE_CHUNK = 1000;
 const START_STAGGER_MS = 3000; // job N starts N×3s after job 0, so writes don't all land at once
 
@@ -105,10 +107,18 @@ async function writeChunks(path, rows, prefer) {
 // --- Page fetch -----------------------------------------------------------------
 
 async function fetchPage(url) {
-  let errors = 0, rateLimits = 0, lastErr = null;
+  let errors = 0, rateLimits = 0, blocks = 0, lastErr = null;
   while (errors <= MAX_RETRIES && rateLimits <= MAX_RATE_LIMIT_RETRIES) {
     try {
       const resp = await fetch(url, { headers: HEADERS, redirect: 'follow' });
+      // An occasional one-off 403: wait and try again (20s, then 40s) before giving up.
+      if (resp.status === 403 && blocks < MAX_403_RETRIES) {
+        blocks++;
+        await resp.text().catch(() => {});
+        log(`  403 – retrying in ${(BLOCK_RETRY_DELAY_MS * blocks) / 1000}s`);
+        await sleep(BLOCK_RETRY_DELAY_MS * blocks);
+        continue;
+      }
       if (resp.status === 429) {
         rateLimits++; lastErr = 'http_429';
         if (rateLimits > MAX_RATE_LIMIT_RETRIES) break;
@@ -124,7 +134,7 @@ async function fetchPage(url) {
         continue;
       }
       const html = await resp.text();
-      return { status: resp.status, html, rateLimits };
+      return { status: resp.status, html, rateLimits, blocks };
     } catch (e) {
       errors++; lastErr = e.message;
       if (errors > MAX_RETRIES) break;
