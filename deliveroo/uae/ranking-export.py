@@ -6,7 +6,7 @@ Analytics Bucket (Apache Iceberg), so Postgres only needs to keep the last 24 ho
 Runs at 04:00 Dubai (inside the 03:00-05:59 pause), from GitHub Actions:
   1. Ask Postgres which hour sections are finished (started 2+ hours ago) and not yet
      exported: deliveroo_ranking_export_candidates().
-  2. For each scrape date, read those hours sorted by partner, then hour/area, and write
+  2. For each scrape date, read those hours (sorted by partner, then hour/area, in Arrow) and write
      them to deliveroo.ranking_analysis (partitioned by scrape date). Charts are per
      restaurant, so this sort lets a restaurant lookup skip almost all of each file.
      The write replaces those exact hours, so a re-run never duplicates.
@@ -135,25 +135,34 @@ def pg():
 
 
 def read_hours(conn, day, hours):
-    """Read the given hours of one day, sorted for partner lookups, as an Arrow table."""
+    """Read the given hours of one day as an Arrow table, sorted for partner lookups.
+
+    Postgres only streams each hour section as stored (no ORDER BY): on Micro compute a
+    database-side sort of millions of rows spills to disk and takes many minutes. The sort
+    (partner, hour, area) is done here in Arrow instead, in memory on the runner.
+    """
     sql = (
         f"select {SELECT_LIST} from public.deliveroo_ranking_analysis "
-        "where deliveroo_area_scrape_date = %s and deliveroo_area_scrape_hour = any(%s) "
-        "order by deliveroo_branch_partner_id, deliveroo_area_scrape_hour, deliveroo_area_id"
+        "where deliveroo_area_scrape_date = %s and deliveroo_area_scrape_hour = %s"
     )
     batches = []
-    # Server-side cursor (streams rows) needs a transaction; the connection is autocommit.
-    with conn.transaction(), conn.cursor(name="export_cur") as cur:
-        cur.itersize = FETCH_BATCH
-        cur.execute(sql, (day, hours))
-        while True:
-            rows = cur.fetchmany(FETCH_BATCH)
-            if not rows:
-                break
-            cols = list(zip(*rows))
-            batches.append(pa.record_batch([pa.array(c, type=t) for c, (_, t, _) in zip(cols, COLUMNS)],
-                                           schema=ARROW_SCHEMA))
-    return pa.Table.from_batches(batches, schema=ARROW_SCHEMA)
+    for h in hours:
+        # Server-side cursor (streams rows) needs a transaction; the connection is autocommit.
+        with conn.transaction(), conn.cursor(name="export_cur") as cur:
+            cur.itersize = FETCH_BATCH
+            cur.execute(sql, (day, h))
+            while True:
+                rows = cur.fetchmany(FETCH_BATCH)
+                if not rows:
+                    break
+                cols = list(zip(*rows))
+                batches.append(pa.record_batch([pa.array(c, type=t) for c, (_, t, _) in zip(cols, COLUMNS)],
+                                               schema=ARROW_SCHEMA))
+    data = pa.Table.from_batches(batches, schema=ARROW_SCHEMA)
+    order = pc.sort_indices(data, sort_keys=[("deliveroo_branch_partner_id", "ascending"),
+                                             ("deliveroo_area_scrape_hour", "ascending"),
+                                             ("deliveroo_area_id", "ascending")])
+    return data.take(order)
 
 
 def bucket_counts(table, day, hours):
