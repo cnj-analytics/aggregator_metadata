@@ -1,54 +1,47 @@
-// ranking-scrape.js
+// ranking-scrape.js – one worker machine of the hourly ranking scrape.
 //
-// Deliveroo UAE – hourly area ranking scrape (one job of JOB_COUNT).
-//
-// Supabase runs the hour (deliveroo_ranking_run*): the job asks for its next area, waits for
-// the time slot it is given, fetches, and reports the outcome. Supabase keeps requests evenly
-// spaced across all jobs, takes a planned break for everyone after each batch, pauses every
-// job on a 429, stops this job on a 403 (the area is not handed to another machine), stops
-// the whole run on a second 403, and stops handing out areas at the deadline.
+// Supabase is the traffic controller (deliveroo_ranking_* functions). It starts this workflow
+// once per machine, tells the machine which run it belongs to, and from then on hands out one
+// area at a time with a time slot. The machine only fetches, saves and reports:
+//   1. deliveroo_ranking_machine_start – check in, get the run's date/hour
+//   2. deliveroo_ranking_claim         – next area + time slot (Supabase sets the pace, planned
+//                                        breaks and pauses; it slows down on a 429 and speeds up
+//                                        after clean stretches)
+//   3. deliveroo_ranking_check         – just before sending: still on, not paused?
+//   4. fetch + parse + save (below)
+//   5. deliveroo_ranking_report        – outcome; Supabase replies continue / stop this machine /
+//                                        stop the run. A refusal on this machine's FIRST request
+//                                        means its address was already flagged: Supabase retires
+//                                        the machine and starts a replacement (capped). A refusal
+//                                        after working means our pace: everyone pauses and slows.
+//   6. deliveroo_ranking_machine_end   – always, when the machine stops for any reason
 //
 // For each area:
 //   1. Fetch the area's full listing page (deliveroo_area.deliveroo_area_url).
 //   2. Read every restaurant card in order -> rank 1..N plus rating, open/closed,
 //      fast tag and promo badge.
-//   3. Known partners  -> deliveroo_ranking_analysis (upsert on the unique index).
-//      Unknown partners -> deliveroo_ranking_pending + deliveroo_partner_registration_queue.
-//   4. (Supabase) the save call also adds new (partner, area) links to
-//      deliveroo_branch_delivery_area, skipping ones that already exist.
-//   5. Update deliveroo_branch.deliveroo_branch_image_url when the card image changed.
-//   6. Write a per-area summary (JSON) for the report job.
+//   3. Known partners  -> deliveroo_ranking_analysis. Unknown partners -> deliveroo_ranking_pending
+//      + deliveroo_partner_registration_queue. The save call also adds new (partner, area) links.
+//   4. Update deliveroo_branch.deliveroo_branch_image_url when the card image changed.
 //
-// Env:
-//   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-//   RUN_ID     (from the setup job: deliveroo_ranking_run.run_id)
-//   JOB_INDEX (0-based), JOB_COUNT (3)
-//   SCRAPE_DATE (YYYY-MM-DD, Dubai), SCRAPE_HOUR (HH:00) – set once by the setup job
-//   PER_JOB_GAP_SECONDS (3) – pause on this machine after each area is finished, before the next request
-//   DRY_RUN    ("true" = read and parse only, write nothing)
-//   UPDATE_IMAGES ("true" default)
-//   SUMMARY_FILE (default summary.json)
+// Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, RUN_ID, MACHINE_NO, GITHUB_RUN_ID,
+//      UPDATE_IMAGES ("true" default), SUMMARY_FILE (default summary.json)
 
 const fs = require('fs');
 const { parseListing, imageBase } = require('./ranking-parse');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const JOB_INDEX = parseInt(process.env.JOB_INDEX || '0', 10);
-const JOB_COUNT = parseInt(process.env.JOB_COUNT || '3', 10);
-const SCRAPE_DATE = process.env.SCRAPE_DATE;
-const SCRAPE_HOUR = process.env.SCRAPE_HOUR;
 const RUN_ID = parseInt(process.env.RUN_ID || '0', 10);
-const DRY_RUN = (process.env.DRY_RUN || 'false').toLowerCase() === 'true';
+const MACHINE_NO = parseInt(process.env.MACHINE_NO || '0', 10);
 const UPDATE_IMAGES = (process.env.UPDATE_IMAGES || 'true').toLowerCase() === 'true';
 const SUMMARY_FILE = process.env.SUMMARY_FILE || 'summary.json';
+// Set from Supabase when the machine checks in.
+let SCRAPE_DATE = null, SCRAPE_HOUR = null, DRY_RUN = false;
 
-const MAX_RETRIES = 3;          // network errors / 5xx only
+const MAX_RETRIES = 3;          // network errors / 5xx only (429/403 go to Supabase)
 const RETRY_DELAY_MS = 5000;
 const WRITE_CHUNK = 1000;
-// Pacing (3 machines): each machine waits PER_JOB_GAP_SECONDS after finishing an area before
-// its next request, and Supabase adds a planned break for all machines after each batch.
-const PER_JOB_GAP_SECONDS = Number(process.env.PER_JOB_GAP_SECONDS || 3);
 
 const HEADERS = {
   'User-Agent':
@@ -180,23 +173,16 @@ const rpc = (name, body) => supabase(`/rpc/${name}`, 'POST', body);
 
 async function main() {
   if (!SUPABASE_URL || !SUPABASE_KEY) throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(SCRAPE_DATE || '') || !/^\d{2}:00$/.test(SCRAPE_HOUR || '')) {
-    throw new Error(`Bad SCRAPE_DATE/SCRAPE_HOUR: ${SCRAPE_DATE} ${SCRAPE_HOUR}`);
-  }
-  if (!RUN_ID) throw new Error('Missing RUN_ID (set by the setup job)');
-  // JOB_COUNT can be lowered for tests (e.g. 1); matrix jobs above it do nothing.
-  if (JOB_INDEX >= JOB_COUNT) {
-    log(`Job ${JOB_INDEX + 1} not used (job_count=${JOB_COUNT}).`);
-    fs.writeFileSync(SUMMARY_FILE, '[]');
-    return;
-  }
-  log(`Job ${JOB_INDEX + 1}/${JOB_COUNT} · run ${RUN_ID} · ${SCRAPE_DATE} ${SCRAPE_HOUR} · dry_run=${DRY_RUN} · machine gap ${PER_JOB_GAP_SECONDS}s`);
+  if (!RUN_ID || !MACHINE_NO) throw new Error('Missing RUN_ID / MACHINE_NO (set by Supabase when it starts this machine)');
+
+  const hello = await rpc('deliveroo_ranking_machine_start',
+    { p_run_id: RUN_ID, p_machine_no: MACHINE_NO, p_github_run_id: process.env.GITHUB_RUN_ID || null });
+  if (hello.stop) { log(`Not needed: ${hello.reason}`); fs.writeFileSync(SUMMARY_FILE, '[]'); return 'not needed: ' + hello.reason; }
+  SCRAPE_DATE = hello.scrape_date; SCRAPE_HOUR = hello.scrape_hour; DRY_RUN = !!hello.dry_run;
+  log(`Run ${RUN_ID} · machine ${MACHINE_NO} · ${SCRAPE_DATE} ${SCRAPE_HOUR} · dry_run=${DRY_RUN}`);
 
   const summaries = [];
-  // Stagger job start-up so the first claims don't arrive at the same instant.
-  await sleep(JOB_INDEX * 700);
-
-  // Known partners + current images (one read per job).
+  // Known partners + current images (one read per machine).
   const branches = await fetchAll(
     'deliveroo_branch',
     'deliveroo_branch_partner_id,deliveroo_branch_image_url',
@@ -205,30 +191,29 @@ async function main() {
   const known = new Map(branches.map(b => [b.deliveroo_branch_partner_id, b.deliveroo_branch_image_url]));
   log(`Known partners: ${known.size}`);
 
-  let lastFetchAt = 0;   // last request sent (used for the geohash retry)
-  let lastDoneAt = 0;    // last area fully processed – the machine's gap counts from here
+  let lastFetchAt = 0, gapSeconds = 20, endReason = 'finished';
   for (;;) {
-    const notBefore = lastDoneAt ? new Date(lastDoneAt + PER_JOB_GAP_SECONDS * 1000).toISOString() : null;
-    const c = await rpc('deliveroo_ranking_run_claim', { p_run_id: RUN_ID, p_job: JOB_INDEX, p_not_before: notBefore });
-    if (c.done) { log(`No more areas for this job: ${c.reason}`); break; }
+    const c = await rpc('deliveroo_ranking_claim', { p_run_id: RUN_ID, p_machine_no: MACHINE_NO });
+    if (c.done) { log(`No more areas for this machine: ${c.reason}`); endReason = c.reason; break; }
     if (!c.area) {
-      log(`Paused ${c.wait_seconds}s – ${c.reason}`);
+      log(`Paused – ${c.reason} (checking again in ${c.wait_seconds}s)`);
       await sleep(Math.max(5, Number(c.wait_seconds) || 5) * 1000);
       continue;
     }
     const area = c.area;
+    gapSeconds = Number(c.gap_seconds) || gapSeconds;
     if (c.wait_ms > 0) await sleep(c.wait_ms);
-    // The run may have been paused or stopped while this job waited for its slot.
-    const chk = await rpc('deliveroo_ranking_run_check', { p_run_id: RUN_ID });
-    if (chk.status !== 'running' || Number(chk.wait_seconds) > 0) {
-      await rpc('deliveroo_ranking_run_report', { p_run_id: RUN_ID, p_area_id: area.deliveroo_area_id, p_job: JOB_INDEX, p_result: { status: 'released' } });
-      if (chk.status !== 'running') { log(`Run ${chk.status}: ${chk.reason}`); break; }
+    // The run may have been paused or stopped while this machine waited for its slot.
+    const chk = await rpc('deliveroo_ranking_check', { p_run_id: RUN_ID, p_machine_no: MACHINE_NO });
+    if (!chk.go) {
+      await rpc('deliveroo_ranking_report', { p_run_id: RUN_ID, p_area_id: area.deliveroo_area_id, p_machine_no: MACHINE_NO, p_result: { status: 'released' } });
+      if (chk.run_status !== 'running' || chk.machine_status !== 'working') { log(`Stopping: ${chk.reason || chk.run_status}`); endReason = chk.reason || 'run stopped'; break; }
       continue;
     }
-    if (c.batch_break) log('Planned break for all jobs after this area.');
+    if (c.batch_break) log('Planned break for all machines after this area.');
     const t0 = Date.now();
     const s = {
-      job: JOB_INDEX, run_id: RUN_ID, area_id: area.deliveroo_area_id, area_name: area.deliveroo_area_name,
+      machine: MACHINE_NO, run_id: RUN_ID, area_id: area.deliveroo_area_id, area_name: area.deliveroo_area_name,
       status: null, http_status: null, bytes: 0, fetch_ms: 0, total_ms: 0, rate_limits: 0,
       declared_count: null, cards: 0, ranking_rows: 0, pending_rows: 0, queued_partners: 0, replaced_rows: 0,
       delivery_pairs_added: 0, images_updated: 0, rank_gaps: 0, duplicate_partners: 0,
@@ -259,7 +244,7 @@ async function main() {
       // Some areas (e.g. JBR) show 0 restaurants at Deliveroo's default point for the area
       // but a full list at a real address. Retry once at the area's stored geohash.
       if (parsed.cards.length === 0 && area.deliveroo_area_geohash && !/[?&]geohash=/.test(listing.url)) {
-        const wait = lastFetchAt + PER_JOB_GAP_SECONDS * 1000 - Date.now();
+        const wait = lastFetchAt + gapSeconds * 1000 - Date.now();
         if (wait > 0) await sleep(wait);
         const geoUrl = `${listing.url}&geohash=${encodeURIComponent(area.deliveroo_area_geohash)}`;
         const retry = await fetchPage(geoUrl);
@@ -382,41 +367,57 @@ async function main() {
     }
 
     s.total_ms = Date.now() - t0;
-    lastDoneAt = Date.now();
 
-    // Report to Supabase: it records the area and decides what this job does next.
+    // Report to Supabase: it records the area and decides what this machine does next.
     const outcome = /^ok/.test(s.status) ? s.status.replace('_dry_run', '')
       : ['not_found', 'rate_limited', 'blocked'].includes(s.status) ? s.status : 'failed';
-    const rep = await rpc('deliveroo_ranking_run_report', {
-      p_run_id: RUN_ID, p_area_id: area.deliveroo_area_id, p_job: JOB_INDEX,
+    const rep = await rpc('deliveroo_ranking_report', {
+      p_run_id: RUN_ID, p_area_id: area.deliveroo_area_id, p_machine_no: MACHINE_NO,
       p_result: { status: outcome, http_status: s.http_status, cards: s.cards, ranking_rows: s.ranking_rows,
                   pending_rows: s.pending_rows, bytes: s.bytes, fetch_ms: s.fetch_ms, error: s.error },
     });
-    if (s.status === 'rate_limited' && rep.requeued) s.status = 'requeued_429';   // Supabase put it back in the queue (once)
+    if (s.status === 'rate_limited' && (rep.requeued || rep.flagged_address)) s.status = 'requeued_429';
+    if (s.status === 'blocked' && rep.flagged_address) s.status = 'requeued_403';
     summaries.push(s);
     log(`${String(area.deliveroo_area_id).padStart(6)} ${area.deliveroo_area_name.padEnd(28)} ${s.status.padEnd(11)} ` +
         `cards=${s.cards}/${s.declared_count ?? '?'} rank=${s.ranking_rows} pending=${s.pending_rows} ` +
         `pairs+${s.delivery_pairs_added} img~${s.images_updated} ${(s.bytes / 1048576).toFixed(1)}MB ${s.total_ms}ms` +
         (s.error ? `  ERROR ${s.error}` : ''));
-    // Keep the summary on disk after every area so a cancelled job still reports.
+    // Keep the summary on disk after every area so a cancelled machine still reports.
     fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries, null, 1));
 
-    if (rep.paused_seconds) log(`429 – Supabase paused all jobs for ${rep.paused_seconds}s.`);
-    if (rep.action === 'stop_job') { log('403 – this machine is blocked: job stops (area not handed to another machine).'); process.exitCode = 2; break; }
-    if (rep.action === 'stop') { log('Run stopped by Supabase (second 403).'); process.exitCode = 2; break; }
+    if (rep.flagged_address) {
+      log(`Refused on this machine's first request – its address was already flagged. Supabase retired this machine` +
+          (rep.replacement_machine ? ` and started machine ${rep.replacement_machine}.` : ' (replacement limit reached).'));
+      endReason = 'flagged address'; break;
+    }
+    if (rep.paused_seconds) log(`429 – Supabase paused all machines for ${rep.paused_seconds}s; pace now ${rep.gap_seconds}s.`);
+    if (rep.action === 'stop_job') { log(`Supabase stopped this machine${rep.reason ? `: ${rep.reason}` : ' (403 after working – not replaced)'}.`); endReason = rep.reason || '403 after working'; process.exitCode = 2; break; }
+    if (rep.action === 'stop') { log('Run stopped by Supabase (second 403).'); endReason = 'run stopped (second 403)'; process.exitCode = 2; break; }
   }
 
   fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries, null, 1));
-  // Areas that failed for reasons other than 429/403 fail the job so they are noticed.
   if (summaries.some(s => s.status === 'failed' || s.status === 'fetch_failed' || /^http_|^parse|^error/.test(s.status))) {
     process.exitCode = process.exitCode || 1;
   }
+  return endReason;
 }
 
 if (require.main === module) {
-  main().catch(e => {
-    console.error('FATAL:', e.message || e);
-    try { fs.writeFileSync(SUMMARY_FILE, JSON.stringify([{ job: JOB_INDEX, status: 'fatal', error: String(e.message || e) }])); } catch (_) {}
-    process.exit(1);
-  });
+  (async () => {
+    let reason = 'finished';
+    try {
+      reason = (await main()) || 'finished';
+    } catch (e) {
+      console.error('FATAL:', e.message || e);
+      reason = 'crashed: ' + String(e.message || e).slice(0, 200);
+      try { if (!fs.existsSync(SUMMARY_FILE)) fs.writeFileSync(SUMMARY_FILE, JSON.stringify([{ machine: MACHINE_NO, status: 'fatal', error: String(e.message || e) }])); } catch (_) {}
+      process.exitCode = 1;
+    } finally {
+      if (RUN_ID && MACHINE_NO) {
+        try { await rpc('deliveroo_ranking_machine_end', { p_run_id: RUN_ID, p_machine_no: MACHINE_NO, p_reason: reason }); }
+        catch (e) { console.error('Could not report machine end:', e.message); }
+      }
+    }
+  })();
 }

@@ -1,4 +1,4 @@
-// ranking-report.js – merges the per-job summaries into one Markdown report.
+// ranking-report.js – Markdown report of one worker machine's areas (its GitHub run summary).
 // Usage: node ranking-report.js <dir-with-summary-json-files> >> $GITHUB_STEP_SUMMARY
 
 const fs = require('fs');
@@ -18,18 +18,19 @@ const merge = k => {
   for (const a of areas) for (const [x, n] of Object.entries(a[k] || {})) o[x] = (o[x] || 0) + n;
   return o;
 };
-// An area that hit a 429 goes back into Supabase's queue once; its first attempt is listed as
-// 'requeued_429' and is not a separate area.
+// An area that went back into Supabase's queue (429 once, or a refusal on a flagged address)
+// is listed as 'requeued_…' and is not counted as a separate area.
 const total429 = areas.reduce((t, a) => t + (Number(a.rate_limits) || 0), 0);
-areas.splice(0, areas.length, ...areas.filter(a => a.status !== 'requeued_429'));
+areas.splice(0, areas.length, ...areas.filter(a => !/^requeued_/.test(a.status || '')));
 const ok = areas.filter(a => /^ok/.test(a.status || ''));
 const notFound = areas.filter(a => a.status === 'not_found');
 const viaGeohash = areas.filter(a => /_geohash$/.test(a.status || ''));
 const failed = areas.filter(a => !/^ok/.test(a.status || '') && a.status !== 'not_found');
 const mb = b => (b / 1048576).toFixed(1);
 
-let md = `## Deliveroo ranking scrape – ${process.env.SCRAPE_DATE || ''} ${process.env.SCRAPE_HOUR || ''}${process.env.DRY_RUN === 'true' ? ' (DRY RUN – nothing written)' : ''}\n\n`;
-md += `Job files: ${files.length} · Areas: ${areas.length} (ok ${ok.length}, of which ${viaGeohash.length} via stored geohash · no public page ${notFound.length} · failed ${failed.length})\n\n`;
+let md = `## Ranking run ${process.env.RUN_ID || ''} · machine ${process.env.MACHINE_NO || ''}\n\n`;
+md += `Full run log (all machines): Supabase table deliveroo_ranking_run_event / view deliveroo_ranking_run_overview.\n\n`;
+md += `Areas: ${areas.length} (ok ${ok.length}, of which ${viaGeohash.length} via stored geohash · no public page ${notFound.length} · failed ${failed.length})\n\n`;
 md += `| Total | Value |\n|---|---|\n`;
 md += `| Cards read | ${sum('cards')} |\n| Ranking rows | ${sum('ranking_rows')} |\n| Pending rows (unknown partners) | ${sum('pending_rows')} |\n`;
 md += `| Rows replaced (same hour re-run) | ${sum('replaced_rows')} |\n`;
@@ -57,8 +58,8 @@ md += imgs.length
     imgs.map(x => `| ${x.area} | ${x.name || x.partner} | ${x.stored || '(none)'} | ${x.card} |`).join('\n') + '\n\n'
   : 'None.\n\n';
 
-md += `### Per area\n\n| Job | Area | Status | Cards / declared | Ranking | Pending | Pairs + | Images | MB | Fetch s | Total s |\n|---|---|---|---|---|---|---|---|---|---|---|\n`;
+md += `### Per area\n\n| Machine | Area | Status | Cards / declared | Ranking | Pending | Pairs + | Images | MB | Fetch s | Total s |\n|---|---|---|---|---|---|---|---|---|---|---|\n`;
 for (const a of areas) {
-  md += `| ${a.job + 1} | ${a.area_name || ''} (${a.area_id || ''}) | ${a.status}${a.error ? ` – ${a.error}` : ''} | ${a.cards ?? ''} / ${a.declared_count ?? ''} | ${a.ranking_rows ?? ''} | ${a.pending_rows ?? ''} | ${a.delivery_pairs_added ?? ''} | ${a.images_updated ?? ''} | ${a.bytes ? mb(a.bytes) : ''} | ${a.fetch_ms ? (a.fetch_ms / 1000).toFixed(1) : ''} | ${a.total_ms ? (a.total_ms / 1000).toFixed(1) : ''} |\n`;
+  md += `| ${a.machine ?? ''} | ${a.area_name || ''} (${a.area_id || ''}) | ${a.status}${a.error ? ` – ${a.error}` : ''} | ${a.cards ?? ''} / ${a.declared_count ?? ''} | ${a.ranking_rows ?? ''} | ${a.pending_rows ?? ''} | ${a.delivery_pairs_added ?? ''} | ${a.images_updated ?? ''} | ${a.bytes ? mb(a.bytes) : ''} | ${a.fetch_ms ? (a.fetch_ms / 1000).toFixed(1) : ''} | ${a.total_ms ? (a.total_ms / 1000).toFixed(1) : ''} |\n`;
 }
 process.stdout.write(md);
