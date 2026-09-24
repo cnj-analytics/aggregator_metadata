@@ -18,7 +18,7 @@
 // Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DRY_RUN,
 //      SCRAPE_DATE_OVERRIDE (YYYY-MM-DD), SCRAPE_HOUR_OVERRIDE (HH:00),
 //      AREA_IDS (optional comma list), GITHUB_RUN_ID,
-//      GAP_SECONDS (5), PER_JOB_GAP_SECONDS (75), BATCH_SIZE (150), BATCH_PAUSE_SECONDS (120)
+//      GAP_SECONDS (1), PER_JOB_GAP_SECONDS (3), BATCH_SIZE (75), BATCH_PAUSE_SECONDS (90)
 
 const fs = require('fs');
 
@@ -134,10 +134,12 @@ async function main() {
       p_github_run_id: process.env.GITHUB_RUN_ID || null,
       p_area_ids: areaIds.length ? areaIds : null,
       p_dry_run: DRY_RUN,
-      p_gap_seconds: num(process.env.GAP_SECONDS, 5),
-      p_per_job_gap_seconds: num(process.env.PER_JOB_GAP_SECONDS, 75),
-      p_batch_size: num(process.env.BATCH_SIZE, 150),
-      p_batch_pause_seconds: num(process.env.BATCH_PAUSE_SECONDS, 120),
+      p_gap_seconds: num(process.env.GAP_SECONDS, 1),
+      p_per_job_gap_seconds: num(process.env.PER_JOB_GAP_SECONDS, 3),
+      p_batch_size: num(process.env.BATCH_SIZE, 75),
+      p_batch_pause_seconds: num(process.env.BATCH_PAUSE_SECONDS, 90),
+      // Started by hand (Run workflow button): 45 minutes from now instead of the :55 cutoff.
+      p_manual: process.env.GITHUB_EVENT_NAME === 'workflow_dispatch',
     }),
   });
   const startText = await startResp.text();

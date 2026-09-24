@@ -22,9 +22,9 @@
 // Env:
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 //   RUN_ID     (from the setup job: deliveroo_ranking_run.run_id)
-//   JOB_INDEX (0-based), JOB_COUNT (15)
+//   JOB_INDEX (0-based), JOB_COUNT (3)
 //   SCRAPE_DATE (YYYY-MM-DD, Dubai), SCRAPE_HOUR (HH:00) – set once by the setup job
-//   PER_JOB_GAP_SECONDS (75) – minimum spacing between this machine's requests
+//   PER_JOB_GAP_SECONDS (3) – pause on this machine after each area is finished, before the next request
 //   DRY_RUN    ("true" = read and parse only, write nothing)
 //   UPDATE_IMAGES ("true" default)
 //   SUMMARY_FILE (default summary.json)
@@ -35,7 +35,7 @@ const { parseListing, imageBase } = require('./ranking-parse');
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const JOB_INDEX = parseInt(process.env.JOB_INDEX || '0', 10);
-const JOB_COUNT = parseInt(process.env.JOB_COUNT || '15', 10);
+const JOB_COUNT = parseInt(process.env.JOB_COUNT || '3', 10);
 const SCRAPE_DATE = process.env.SCRAPE_DATE;
 const SCRAPE_HOUR = process.env.SCRAPE_HOUR;
 const RUN_ID = parseInt(process.env.RUN_ID || '0', 10);
@@ -46,10 +46,9 @@ const SUMMARY_FILE = process.env.SUMMARY_FILE || 'summary.json';
 const MAX_RETRIES = 3;          // network errors / 5xx only
 const RETRY_DELAY_MS = 5000;
 const WRITE_CHUNK = 1000;
-// Deliveroo tolerates roughly one full-listing page per minute per machine (tested 23 Sep
-// 2026: 75s apart = no 429s; ~40s apart = 429s). Supabase spaces requests across all jobs;
-// this is the floor for one machine.
-const PER_JOB_GAP_SECONDS = Number(process.env.PER_JOB_GAP_SECONDS || 75);
+// Pacing (3 machines): each machine waits PER_JOB_GAP_SECONDS after finishing an area before
+// its next request, and Supabase adds a planned break for all machines after each batch.
+const PER_JOB_GAP_SECONDS = Number(process.env.PER_JOB_GAP_SECONDS || 3);
 
 const HEADERS = {
   'User-Agent':
@@ -194,7 +193,7 @@ async function main() {
   log(`Job ${JOB_INDEX + 1}/${JOB_COUNT} · run ${RUN_ID} · ${SCRAPE_DATE} ${SCRAPE_HOUR} · dry_run=${DRY_RUN} · machine gap ${PER_JOB_GAP_SECONDS}s`);
 
   const summaries = [];
-  // Stagger job start-up so the 15 first claims don't arrive at the same instant.
+  // Stagger job start-up so the first claims don't arrive at the same instant.
   await sleep(JOB_INDEX * 700);
 
   // Known partners + current images (one read per job).
@@ -206,9 +205,10 @@ async function main() {
   const known = new Map(branches.map(b => [b.deliveroo_branch_partner_id, b.deliveroo_branch_image_url]));
   log(`Known partners: ${known.size}`);
 
-  let lastFetchAt = 0;
+  let lastFetchAt = 0;   // last request sent (used for the geohash retry)
+  let lastDoneAt = 0;    // last area fully processed – the machine's gap counts from here
   for (;;) {
-    const notBefore = lastFetchAt ? new Date(lastFetchAt + PER_JOB_GAP_SECONDS * 1000).toISOString() : null;
+    const notBefore = lastDoneAt ? new Date(lastDoneAt + PER_JOB_GAP_SECONDS * 1000).toISOString() : null;
     const c = await rpc('deliveroo_ranking_run_claim', { p_run_id: RUN_ID, p_job: JOB_INDEX, p_not_before: notBefore });
     if (c.done) { log(`No more areas for this job: ${c.reason}`); break; }
     if (!c.area) {
@@ -382,6 +382,7 @@ async function main() {
     }
 
     s.total_ms = Date.now() - t0;
+    lastDoneAt = Date.now();
 
     // Report to Supabase: it records the area and decides what this job does next.
     const outcome = /^ok/.test(s.status) ? s.status.replace('_dry_run', '')
