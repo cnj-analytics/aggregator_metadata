@@ -10,6 +10,9 @@ Runs at 04:00 Dubai (inside the 03:00-05:59 pause), from GitHub Actions:
      them to deliveroo.ranking_analysis (partitioned by scrape date). Charts are per
      restaurant, so this sort lets a restaurant lookup skip almost all of each file.
      The write replaces those exact hours, so a re-run never duplicates.
+     Hours are written in chunks of up to CHUNK_HOURS (default 6). Each chunk reconnects to the
+     bucket catalog right before writing and retries up to 3 times if the connection drops
+     (safe: a retry replaces exactly the same hours, so it never duplicates).
   3. Read the hours back from the bucket, count rows per hour and record each hour with
      deliveroo_ranking_record_export(), which refuses if Postgres and the bucket differ.
      Only recorded hours can ever be dropped from Postgres (hourly retention step).
@@ -39,6 +42,8 @@ NAMESPACE = "deliveroo"
 TABLE = "ranking_analysis"  # sorted by restaurant (charts are per restaurant)
 RUN_ID = os.environ.get("GITHUB_RUN_ID", "local")
 FETCH_BATCH = 200_000
+CHUNK_HOURS = int(os.environ.get("CHUNK_HOURS", "6"))
+MAX_ATTEMPTS = 3
 
 COLUMNS = [
     ("deliveroo_branch_partner_id", pa.string(), False),
@@ -122,6 +127,13 @@ def load_table(name=TABLE, sort_col="deliveroo_branch_partner_id"):
     return table
 
 
+def pg():
+    """Fresh Postgres connection (a long bucket write can leave an old one idle for many minutes)."""
+    c = psycopg.connect(os.environ["SUPABASE_DB_URL"], autocommit=True)
+    c.execute("set statement_timeout = 0")
+    return c
+
+
 def read_hours(conn, day, hours):
     """Read the given hours of one day, sorted for partner lookups, as an Arrow table."""
     sql = (
@@ -179,36 +191,64 @@ def main():
         out(f"Hours to export: **{len(cands)}** across {len(by_day)} day(s), "
             f"{sum(c[3] for c in cands):,} rows.")
         out()
-        out("| Day | Hours | Rows (Postgres) | Rows (bucket) | Recorded | Seconds |")
+        out("| Day / hours | Hours | Rows (Postgres) | Rows (bucket) | Recorded | Seconds |")
         out("|---|---|---|---|---|---|")
 
-        table = None if DRY_RUN else load_table(TABLE, "deliveroo_branch_partner_id")
         failures = 0
         for day, items in sorted(by_day.items()):
-            t0 = time.time()
-            hours = [h for h, _, _ in items]
-            pg_rows = sum(n for _, _, n in items)
-            if DRY_RUN:
-                out(f"| {day} | {len(hours)} | {pg_rows:,} | – | dry run | – |")
-                continue
-            data = read_hours(conn, day, hours)
-            from pyiceberg.expressions import And, EqualTo, In
-            # Replace exactly these hours (safe to re-run; never duplicates).
-            flt = And(EqualTo("deliveroo_area_scrape_date", day), In("deliveroo_area_scrape_hour", set(hours)))
-            table.overwrite(data, overwrite_filter=flt)
-            table.refresh()
-            counts = bucket_counts(table, day, hours)
-            recorded = 0
-            for h, sec, n in items:
-                try:
-                    conn.execute("select public.deliveroo_ranking_record_export(%s, %s, %s, %s)",
-                                 (day, h, counts.get(h, 0), RUN_ID))
-                    recorded += 1
-                except Exception as e:
-                    failures += 1
-                    out(f"| {day} {h} | 1 | {n:,} | {counts.get(h, 0):,} | **NOT recorded**: {str(e)[:120]} | |")
-            out(f"| {day} | {len(hours)} | {pg_rows:,} | {sum(counts.values()):,} | {recorded}/{len(hours)} | "
-                f"{time.time() - t0:.0f} |")
+            chunks = [items[i:i + CHUNK_HOURS] for i in range(0, len(items), CHUNK_HOURS)]
+            for chunk in chunks:
+                hours = [h for h, _, _ in chunk]
+                label = f"{day} {hours[0].strftime('%H')}-{hours[-1].strftime('%H')}h"
+                pg_rows = sum(n for _, _, n in chunk)
+                if DRY_RUN:
+                    out(f"| {label} | {len(hours)} | {pg_rows:,} | – | dry run | – |")
+                    continue
+                t0 = time.time()
+                with pg() as rc:
+                    data = read_hours(rc, day, hours)
+                t_read = time.time() - t0
+                print(f"[{label}] read {data.num_rows:,} rows from Postgres in {t_read:.0f}s", flush=True)
+                counts, t_write = None, 0.0
+                for attempt in range(1, MAX_ATTEMPTS + 1):
+                    try:
+                        t1 = time.time()
+                        table = load_table(TABLE, "deliveroo_branch_partner_id")  # fresh catalog connection
+                        from pyiceberg.expressions import And, EqualTo, In
+                        # Replace exactly these hours (safe to re-run; never duplicates).
+                        flt = And(EqualTo("deliveroo_area_scrape_date", day),
+                                  In("deliveroo_area_scrape_hour", set(hours)))
+                        table.overwrite(data, overwrite_filter=flt)
+                        t_write = time.time() - t1
+                        table = load_table(TABLE, "deliveroo_branch_partner_id")
+                        counts = bucket_counts(table, day, hours)
+                        print(f"[{label}] written in {t_write:.0f}s (attempt {attempt})", flush=True)
+                        break
+                    except Exception as e:  # connection drops etc.; retrying the same overwrite is safe
+                        print(f"[{label}] attempt {attempt} failed after {time.time() - t1:.0f}s: "
+                              f"{type(e).__name__}: {str(e)[:200]}", flush=True)
+                        if attempt == MAX_ATTEMPTS:
+                            failures += len(chunk)
+                            out(f"| {label} | {len(hours)} | {pg_rows:,} | – | **NOT exported**: "
+                                f"{type(e).__name__} | {time.time() - t0:.0f} |")
+                        else:
+                            time.sleep(20 * attempt)
+                if counts is None:
+                    continue
+                del data
+                recorded = 0
+                rec = pg()
+                for h, sec, n in chunk:
+                    try:
+                        rec.execute("select public.deliveroo_ranking_record_export(%s, %s, %s, %s)",
+                                     (day, h, counts.get(h, 0), RUN_ID))
+                        recorded += 1
+                    except Exception as e:
+                        failures += 1
+                        out(f"| {day} {h} | 1 | {n:,} | {counts.get(h, 0):,} | **NOT recorded**: {str(e)[:120]} | |")
+                rec.close()
+                out(f"| {label} | {len(hours)} | {pg_rows:,} | {sum(counts.values()):,} | {recorded}/{len(hours)} | "
+                    f"{time.time() - t0:.0f} (read {t_read:.0f}, write {t_write:.0f}) |")
 
     out()
     out(f"Total time: {time.time() - t_start:.0f}s. Hours not recorded stay in Postgres and are retried next run.")
