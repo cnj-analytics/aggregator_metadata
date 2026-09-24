@@ -1,150 +1,57 @@
-name: Deliveroo UAE – Ranking Scrape (hourly)
+name: Deliveroo UAE – Ranking Worker (started by Supabase)
+run-name: Ranking run ${{ inputs.run_id }} · machine ${{ inputs.machine_no }}
 
-# 3 machines. Supabase runs each hour (deliveroo_ranking_run*): one area at a time to whichever
-# machine asks, each machine pausing 3 s after every area, a 90 s break for all machines after
-# every 75 areas (25 per machine), all machines paused
-# on a 429, a job stopped on a 403 (its area is not handed to another machine), the run stopped
-# on a second 403, and no new area after :55. Every area's outcome is logged in
-# deliveroo_ranking_run_area.
+# One worker machine. Supabase starts this workflow (one per machine) and controls it:
+# which areas, when to send each request, planned breaks, pauses, slow-down/speed-up, and
+# when to stop. The machine only fetches, saves and reports back. Do not start it by hand –
+# use "Deliveroo UAE – Ranking Control" (Start) or the Supabase schedule.
 on:
-  # Schedule OFF until the controlled test run has passed – switch on only when instructed.
-  # Planned: on the hour, 06:00 -> 02:00 Dubai (UTC+4) = 02:00 -> 22:00 UTC. GitHub starts
-  # scheduled runs ~10-15 min late, so a run normally begins around :10-:15.
-  # schedule:
-  #   - cron: '0 2-22 * * *'
   workflow_dispatch:
     inputs:
-      area_ids:
-        description: 'Only these deliveroo_area_ids (comma separated). Empty = all active areas'
+      run_id:
+        description: 'Supabase run id (set by Supabase)'
+        required: true
         type: string
-        default: ''
-      dry_run:
-        description: 'Dry run (read and parse only, write nothing)'
-        type: boolean
-        default: false
+      machine_no:
+        description: 'Machine number within the run (set by Supabase)'
+        required: true
+        type: string
       update_images:
         description: 'Update deliveroo_branch_image_url when the card image changed'
         type: boolean
         default: true
-      scrape_hour_override:
-        description: 'Optional hour label (0-23, Dubai). Empty = current Dubai hour'
-        type: string
-        default: ''
-      job_count:
-        description: 'How many of the 3 machines to use (1-3). Empty = 3'
-        type: string
-        default: ''
-      gap_seconds:
-        description: 'Minimum seconds between any two requests (all machines). Empty = 1'
-        type: string
-        default: ''
-      per_job_gap_seconds:
-        description: 'Pause on each machine after finishing an area. Empty = 3'
-        type: string
-        default: ''
-      batch_size:
-        description: 'Planned break for all machines after this many areas. Empty = 75 (25 per machine)'
-        type: string
-        default: ''
-      batch_pause_seconds:
-        description: 'Length of the planned break in seconds. Empty = 90'
-        type: string
-        default: ''
-
-# No GitHub concurrency group: a queued run would start the moment the previous one ends,
-# with no rest for Deliveroo. Supabase refuses to start a run while another is going, so the
-# later run simply skips its hour.
 
 jobs:
-  setup:
+  worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      skip: ${{ steps.s.outputs.skip }}
-      scrape_date: ${{ steps.s.outputs.scrape_date }}
-      scrape_hour: ${{ steps.s.outputs.scrape_hour }}
-      run_id: ${{ steps.s.outputs.run_id }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - id: s
-        name: Work out hour window + prepare day section
+      - name: Machine ${{ inputs.machine_no }} of run ${{ inputs.run_id }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          DRY_RUN: ${{ inputs.dry_run || 'false' }}
-          SCRAPE_HOUR_OVERRIDE: ${{ inputs.scrape_hour_override }}
-          AREA_IDS: ${{ inputs.area_ids }}
-          GAP_SECONDS: ${{ inputs.gap_seconds }}
-          PER_JOB_GAP_SECONDS: ${{ inputs.per_job_gap_seconds }}
-          BATCH_SIZE: ${{ inputs.batch_size }}
-          BATCH_PAUSE_SECONDS: ${{ inputs.batch_pause_seconds }}
-        run: node deliveroo/uae/ranking-setup.js
-
-  scrape:
-    needs: setup
-    if: needs.setup.outputs.skip != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 55
-    strategy:
-      fail-fast: false
-      max-parallel: 3
-      matrix:
-        job: [0, 1, 2]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - name: Scrape job ${{ matrix.job }}
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          RUN_ID: ${{ needs.setup.outputs.run_id }}
-          JOB_INDEX: ${{ matrix.job }}
-          JOB_COUNT: ${{ inputs.job_count || '3' }}
-          SCRAPE_DATE: ${{ needs.setup.outputs.scrape_date }}
-          SCRAPE_HOUR: ${{ needs.setup.outputs.scrape_hour }}
-          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          RUN_ID: ${{ inputs.run_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
           UPDATE_IMAGES: ${{ inputs.update_images == false && 'false' || 'true' }}
-          PER_JOB_GAP_SECONDS: ${{ inputs.per_job_gap_seconds }}
-          SUMMARY_FILE: summary-job-${{ matrix.job }}.json
+          SUMMARY_FILE: summary-machine-${{ inputs.machine_no }}.json
         run: node --max-old-space-size=4096 deliveroo/uae/ranking-scrape.js
-      - name: Upload job summary
+      - name: Machine report
+        if: always()
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+        run: |
+          mkdir -p s && cp summary-machine-${{ inputs.machine_no }}.json s/ 2>/dev/null || true
+          node deliveroo/uae/ranking-report.js s >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload machine summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ranking-summary-job-${{ matrix.job }}
-          path: summary-job-${{ matrix.job }}.json
+          name: ranking-run-${{ inputs.run_id }}-machine-${{ inputs.machine_no }}
+          path: summary-machine-${{ inputs.machine_no }}.json
           if-no-files-found: warn
           retention-days: 7
-
-  report:
-    needs: [setup, scrape]
-    if: always() && needs.setup.outputs.skip != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: ranking-summary-job-*
-          path: summaries
-          merge-multiple: true
-      - name: Build report
-        env:
-          SCRAPE_DATE: ${{ needs.setup.outputs.scrape_date }}
-          SCRAPE_HOUR: ${{ needs.setup.outputs.scrape_hour }}
-          DRY_RUN: ${{ inputs.dry_run || 'false' }}
-        run: node deliveroo/uae/ranking-report.js summaries >> "$GITHUB_STEP_SUMMARY"
-      - name: Close run in Supabase + run log
-        if: always()
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          RUN_ID: ${{ needs.setup.outputs.run_id }}
-        run: node deliveroo/uae/ranking-run-log.js >> "$GITHUB_STEP_SUMMARY"

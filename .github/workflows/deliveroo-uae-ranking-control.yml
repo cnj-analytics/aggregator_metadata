@@ -1,0 +1,59 @@
+name: Deliveroo UAE – Ranking Control
+run-name: Ranking control – ${{ inputs.action }}
+
+# Buttons for the ranking scrape. Everything is decided in Supabase; this only calls it.
+#   start          start one run now (Supabase starts the worker machines)
+#   stop           stop the run in progress (machines finish their current area and stop)
+#   schedule_on    hourly runs on  (Supabase starts a run every hour at :00, 06:00 -> 02:00 Dubai)
+#   schedule_off   hourly runs off
+#   status         show settings and the last 10 runs
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'What to do'
+        type: choice
+        options: [status, start, stop, schedule_on, schedule_off]
+        default: status
+      area_ids:
+        description: 'Start only: limit to these deliveroo_area_ids (comma separated). Empty = all active areas'
+        type: string
+        default: ''
+      dry_run:
+        description: 'Start only: dry run (read and parse, write nothing)'
+        type: boolean
+        default: false
+
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: ${{ inputs.action }}
+        env:
+          DB: ${{ secrets.SUPABASE_DB_URL }}
+          ACTION: ${{ inputs.action }}
+          AREA_IDS: ${{ inputs.area_ids }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          q() { psql "$DB" -v ON_ERROR_STOP=1 -At -c "$1"; }
+          ids="$(echo "$AREA_IDS" | tr -d ' ')"
+          if [ -n "$ids" ] && ! [[ "$ids" =~ ^[0-9]+(,[0-9]+)*$ ]]; then echo "area_ids must be numbers separated by commas"; exit 1; fi
+          arr="null"; [ -n "$ids" ] && arr="array[$ids]::bigint[]"
+          case "$ACTION" in
+            start)        out="$(q "select public.deliveroo_ranking_run_begin('manual', $arr, $DRY_RUN)::text")" ;;
+            stop)         out="$(q "select public.deliveroo_ranking_stop('stopped from GitHub Ranking Control')::text")" ;;
+            schedule_on)  out="$(q "update public.deliveroo_ranking_settings set schedule_enabled = true,  updated_at = now() returning 'hourly schedule ON'")" ;;
+            schedule_off) out="$(q "update public.deliveroo_ranking_settings set schedule_enabled = false, updated_at = now() returning 'hourly schedule OFF'")" ;;
+            status)       out="" ;;
+          esac
+          {
+            echo "## Ranking control – $ACTION"
+            [ -n "$out" ] && { echo; echo '```'; echo "$out"; echo '```'; }
+            echo; echo "### Settings"; echo '```'
+            psql "$DB" -v ON_ERROR_STOP=1 -x -c "select schedule_enabled, machines, max_replacements, initial_gap_seconds, min_gap_seconds, max_gap_seconds, break_every_per_machine, break_seconds, deadline_minute, manual_window_minutes from public.deliveroo_ranking_settings"
+            echo '```'; echo; echo "### Last 10 runs"; echo '```'
+            psql "$DB" -v ON_ERROR_STOP=1 -c "select run_id, trigger, scrape_hour, status, started_dubai, minutes, areas, ok, no_page, failed, not_reached, rate_limits, blocks, flagged_addresses, replacements, start_pace_s, end_pace_s from public.deliveroo_ranking_run_overview order by run_id desc limit 10"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
