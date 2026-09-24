@@ -10,10 +10,11 @@
 //   3. deliveroo_ranking_check         – just before sending: still on, not paused?
 //   4. fetch + parse + save (below)
 //   5. deliveroo_ranking_report        – outcome; Supabase replies continue / stop this machine /
-//                                        stop the run. A refusal on this machine's FIRST request
-//                                        means its address was already flagged: Supabase retires
-//                                        the machine and starts a replacement (capped). A refusal
-//                                        after working means our pace: everyone pauses and slows.
+//                                        stop the run. On a 429: Supabase immediately stops this
+//                                        machine and dispatches a replacement from the pool (up to
+//                                        15 total). The area is requeued for the next machine.
+//                                        On a 403: machine stops, not replaced; second 403 stops
+//                                        the entire run.
 //   6. deliveroo_ranking_machine_end   – always, when the machine stops for any reason
 //
 // For each area:
@@ -376,8 +377,9 @@ async function main() {
       p_result: { status: outcome, http_status: s.http_status, cards: s.cards, ranking_rows: s.ranking_rows,
                   pending_rows: s.pending_rows, bytes: s.bytes, fetch_ms: s.fetch_ms, error: s.error },
     });
-    if (s.status === 'rate_limited' && (rep.requeued || rep.flagged_address)) s.status = 'requeued_429';
-    if (s.status === 'blocked' && rep.flagged_address) s.status = 'requeued_403';
+    // On 429: Supabase stops this machine and dispatches a replacement from the pool.
+    if (s.status === 'rate_limited' && rep.action === 'stop_job') s.status = 'requeued_429';
+    if (s.status === 'blocked' && rep.action === 'stop_job') s.status = 'requeued_403';
     summaries.push(s);
     log(`${String(area.deliveroo_area_id).padStart(6)} ${area.deliveroo_area_name.padEnd(28)} ${s.status.padEnd(11)} ` +
         `cards=${s.cards}/${s.declared_count ?? '?'} rank=${s.ranking_rows} pending=${s.pending_rows} ` +
@@ -386,13 +388,11 @@ async function main() {
     // Keep the summary on disk after every area so a cancelled machine still reports.
     fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries, null, 1));
 
-    if (rep.flagged_address) {
-      log(`Refused on this machine's first request – its address was already flagged. Supabase retired this machine` +
-          (rep.replacement_machine ? ` and started machine ${rep.replacement_machine}.` : ' (replacement limit reached).'));
-      endReason = 'flagged address'; break;
+    if (rep.action === 'stop_job') {
+      const replaced = rep.replaced ? ` Replacement machine ${rep.replacement_machine} dispatched.` : ' No replacement (pool exhausted or no work left).';
+      log(`429/403 – Supabase stopped this machine.${replaced}`);
+      endReason = rep.reason || 'stopped by Supabase'; process.exitCode = 2; break;
     }
-    if (rep.paused_seconds) log(`429 – Supabase paused all machines for ${rep.paused_seconds}s; pace now ${rep.gap_seconds}s.`);
-    if (rep.action === 'stop_job') { log(`Supabase stopped this machine${rep.reason ? `: ${rep.reason}` : ' (403 after working – not replaced)'}.`); endReason = rep.reason || '403 after working'; process.exitCode = 2; break; }
     if (rep.action === 'stop') { log('Run stopped by Supabase (second 403).'); endReason = 'run stopped (second 403)'; process.exitCode = 2; break; }
   }
 
