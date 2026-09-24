@@ -18,6 +18,10 @@ const merge = k => {
   for (const a of areas) for (const [x, n] of Object.entries(a[k] || {})) o[x] = (o[x] || 0) + n;
   return o;
 };
+// An area that hit a 429 goes back into Supabase's queue once; its first attempt is listed as
+// 'requeued_429' and is not a separate area.
+const total429 = areas.reduce((t, a) => t + (Number(a.rate_limits) || 0), 0);
+areas.splice(0, areas.length, ...areas.filter(a => a.status !== 'requeued_429'));
 const ok = areas.filter(a => /^ok/.test(a.status || ''));
 const notFound = areas.filter(a => a.status === 'not_found');
 const viaGeohash = areas.filter(a => /_geohash$/.test(a.status || ''));
@@ -31,7 +35,7 @@ md += `| Cards read | ${sum('cards')} |\n| Ranking rows | ${sum('ranking_rows')}
 md += `| Rows replaced (same hour re-run) | ${sum('replaced_rows')} |\n`;
 md += `| Partners queued for registration | ${sum('queued_partners')} |\n| Delivery-area pairs added | ${sum('delivery_pairs_added')} |\n`;
 md += `| Branch images updated | ${sum('images_updated')} |\n| Rank gaps | ${sum('rank_gaps')} |\n| Duplicate cards dropped | ${sum('duplicate_partners')} |\n`;
-md += `| Downloaded | ${mb(sum('bytes'))} MB |\n| 429s | ${sum('rate_limits')} |\n\n`;
+md += `| Downloaded | ${mb(sum('bytes'))} MB |\n| 429s | ${total429} |\n\n`;
 
 md += `| Field | Split |\n|---|---|\n`;
 md += `| Rating | rated ${sum('rated')} · not rated ${sum('not_rated')} · new ${sum('new')} |\n`;

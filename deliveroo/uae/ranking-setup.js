@@ -9,10 +9,16 @@
 //   - runs 24h retention (deliveroo_ranking_housekeeping): drops hour sections older than
 //     24h that have a verified export in the Analytics Bucket, clears old parked rows and
 //     old registered queue rows. A retention problem is logged but never stops the scrape.
-// Writes scrape_date / scrape_hour / skip to $GITHUB_OUTPUT.
+//   - starts the run in Supabase (deliveroo_ranking_run_start), which queues every active
+//     area in random order and from then on hands areas out to the jobs one at a time,
+//     keeps the pace, takes planned breaks and pauses everyone on a 429/403. If another
+//     run is still going, this run is skipped (never two runs at once).
+// Writes scrape_date / scrape_hour / skip / run_id to $GITHUB_OUTPUT.
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DRY_RUN,
-//      SCRAPE_DATE_OVERRIDE (YYYY-MM-DD), SCRAPE_HOUR_OVERRIDE (HH:00)
+//      SCRAPE_DATE_OVERRIDE (YYYY-MM-DD), SCRAPE_HOUR_OVERRIDE (HH:00),
+//      AREA_IDS (optional comma list), GITHUB_RUN_ID,
+//      GAP_SECONDS (5), PER_JOB_GAP_SECONDS (75), BATCH_SIZE (150), BATCH_PAUSE_SECONDS (120)
 
 const fs = require('fs');
 
@@ -112,7 +118,42 @@ async function main() {
     }
   }
 
+  // Start the run in Supabase (also in dry runs: pacing and log still apply).
+  const num = (v, d) => (v === undefined || v === '' ? d : Number(v));
+  const areaIds = (process.env.AREA_IDS || '').split(',').map(x => x.trim()).filter(Boolean).map(Number);
+  const startResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/deliveroo_ranking_run_start`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      p_date: date,
+      p_hour: hour,
+      p_github_run_id: process.env.GITHUB_RUN_ID || null,
+      p_area_ids: areaIds.length ? areaIds : null,
+      p_dry_run: DRY_RUN,
+      p_gap_seconds: num(process.env.GAP_SECONDS, 5),
+      p_per_job_gap_seconds: num(process.env.PER_JOB_GAP_SECONDS, 75),
+      p_batch_size: num(process.env.BATCH_SIZE, 150),
+      p_batch_pause_seconds: num(process.env.BATCH_PAUSE_SECONDS, 120),
+    }),
+  });
+  const startText = await startResp.text();
+  if (!startResp.ok) throw new Error(`run_start failed: ${startResp.status} ${startText.slice(0, 300)}`);
+  const start = JSON.parse(startText);
+  if (start.skip) {
+    console.log(`::warning::Skipping this hour: ${start.reason}`);
+    setOutput('skip', 'true');
+    setOutput('scrape_date', date);
+    setOutput('scrape_hour', hour);
+    return;
+  }
+  console.log(`Run ${start.run_id} started: ${start.areas} areas queued, no new area after ${start.deadline} Dubai`);
+
   setOutput('skip', 'false');
+  setOutput('run_id', start.run_id);
   setOutput('scrape_date', date);
   setOutput('scrape_hour', hour);
 }
