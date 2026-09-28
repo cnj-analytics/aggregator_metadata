@@ -6,7 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
-COPY prefetch.py analyze.py ./
-# download every model once, at build time
+COPY prefetch.py ./
+# download every model once, at build time (cached, so code-only changes rebuild in about a minute)
 RUN python prefetch.py
+COPY analyze.py ./
 CMD ["python", "/app/analyze.py"]

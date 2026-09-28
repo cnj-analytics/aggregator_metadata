@@ -7,6 +7,6 @@ open_clip.get_tokenizer('ViT-L-14')
 # LAION "improved aesthetic predictor" head (sac+logos+ava1, linear MSE) that sits on CLIP ViT-L/14
 url = 'https://github.com/christophschuhmann/improved-aesthetic-predictor/raw/main/sac%2Blogos%2Bava1-l14-linearMSE.pth'
 urllib.request.urlretrieve(url, '/models/laion_aesthetic_l14.pth')
-for name in ('topiq_nr', 'nima'):
+for name in ('topiq_nr',):
     pyiqa.create_metric(name, device=torch.device('cpu'))
 print('models ready')
