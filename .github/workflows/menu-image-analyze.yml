@@ -1,0 +1,35 @@
+name: Menu Image Analysis – Run
+
+# Started by Supabase (radar_image_dispatch) as soon as a menu analysis finishes.
+# Scores that menu's images and hands the report straight back to Supabase; nothing is stored here.
+# Logs only show counts (this repository is public).
+on:
+  workflow_dispatch:
+    inputs:
+      ticket:
+        description: 'Menu request number'
+        required: true
+
+run-name: Menu images · request ${{ inputs.ticket }}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  analyse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/cnj-analytics/menu-image-analyzer:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Analyse menu images
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TICKET: ${{ inputs.ticket }}
+          HOME: /root   # the models were cached under /root when the container was built
+        run: python /app/analyze.py
