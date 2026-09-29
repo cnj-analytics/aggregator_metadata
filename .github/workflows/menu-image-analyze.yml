@@ -9,13 +9,18 @@ on:
     inputs:
       ticket:
         description: 'Menu request number'
-        required: true
+        required: false
+        default: '0'
       shard:
         description: 'Which third of the images (0, 1 or 2)'
         required: false
         default: '0'
+      mode:
+        description: 'menu (normal) or calib (score the owner-graded calibration photos)'
+        required: false
+        default: 'menu'
 
-run-name: Menu images · request ${{ inputs.ticket }} · part ${{ inputs.shard }}
+run-name: Menu images · ${{ inputs.mode == 'calib' && 'calibration' || format('request {0} · part {1}', inputs.ticket, inputs.shard) }}
 
 permissions:
   contents: read
@@ -31,6 +36,8 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      # the analysis code comes from this branch, so scoring changes can be tried before the package is rebuilt
+      - uses: actions/checkout@v4
       - name: Analyse menu images
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -38,5 +45,6 @@ jobs:
           TICKET: ${{ inputs.ticket }}
           SHARD: ${{ inputs.shard }}
           SHARDS: '3'
+          MODE: ${{ inputs.mode }}
           HOME: /root   # the models were cached under /root when the container was built
-        run: python /app/analyze.py
+        run: python image-analysis/analyze.py
