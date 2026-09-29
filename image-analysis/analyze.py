@@ -120,6 +120,85 @@ def measured(im):
                 neutral_bg=bool(neutral_bg), busy_bg=bool(border_edges > 8), blank=bool(blank))
 
 
+def scene(im):
+    """Scene layout for tabletop photos: the object (plate/cup + food), the food itself (plate removed) and the background.
+    The food is what must stand out; the plate is ignored. A busy background only counts when it is in focus."""
+    import cv2
+    cv2.setRNGSeed(7)
+    S = 256
+    a = np.asarray(im.resize((S, S))).astype(np.uint8)
+    lab = cv2.cvtColor(a, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab[..., 0] *= 100 / 255; lab[..., 1] -= 128; lab[..., 2] -= 128
+    L = lab[..., 0]
+    # object: GrabCut started from a box a little inside the frame
+    gm = np.zeros((S, S), np.uint8); bgd = np.zeros((1, 65), np.float64); fgd = np.zeros((1, 65), np.float64)
+    m = int(S * .06)
+    try:
+        cv2.grabCut(a, gm, (m, m, S - 2 * m, S - 2 * m), bgd, fgd, 4, cv2.GC_INIT_WITH_RECT)
+        obj = (gm == cv2.GC_FGD) | (gm == cv2.GC_PR_FGD)
+    except Exception:
+        obj = np.zeros((S, S), bool)
+    if obj.mean() < .05 or obj.mean() > .97:
+        obj = np.zeros((S, S), bool); obj[int(S * .15):int(S * .85), int(S * .15):int(S * .85)] = True
+    k = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    # plate / cup / container: light, colourless, fairly smooth areas inside the object (white or grey ceramic, enamel,
+    # paper, a saucer), plus the object's outer ring colour when one colour dominates it. The food is the rest.
+    # The plate itself is never judged: only whether the food stands out from whatever is right next to it.
+    mu = cv2.blur(L, (5, 5)); sd = np.sqrt(np.maximum(cv2.blur(L * L, (5, 5)) - mu * mu, 0))
+    chroma = np.hypot(lab[..., 1], lab[..., 2])
+    plate = obj & (chroma < 12) & (L > 62) & (sd < 6)
+    ring_o = (cv2.erode(obj.astype(np.uint8), k(3)) > 0) & ~(cv2.erode(obj.astype(np.uint8), k(12)) > 0)
+    if ring_o.sum() > 80:
+        Z = lab[ring_o].astype(np.float32)
+        _, lbl, cen = cv2.kmeans(Z, 3, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1), 3, cv2.KMEANS_PP_CENTERS)
+        cnt = np.bincount(lbl.ravel(), minlength=3) / len(lbl); i = int(cnt.argmax())
+        if cnt[i] >= .55:
+            plate |= obj & (np.linalg.norm(lab - cen[i], axis=2) < 10) & (sd < 6)
+    plate = cv2.morphologyEx(plate.astype(np.uint8), cv2.MORPH_OPEN, k(1)) > 0
+    food = obj & ~plate
+    food = cv2.morphologyEx(food.astype(np.uint8), cv2.MORPH_OPEN, k(1)) > 0
+    food = cv2.morphologyEx(food.astype(np.uint8), cv2.MORPH_CLOSE, k(3)) > 0
+    plate_found = plate.sum() > obj.sum() * .08
+    food_diff_share = float(food.sum() / max(1, obj.sum()) * 100)
+    plate_lab = lab[plate].mean(axis=0) if plate.any() else None
+    if food.mean() < .02:
+        food = obj
+    inner = food & ~(cv2.erode(food.astype(np.uint8), k(5)) > 0)
+    outer = (cv2.dilate(food.astype(np.uint8), k(8)) > 0) & ~food
+    de = lambda x, y: float(np.linalg.norm(x - y))
+    mean = lambda msk: lab[msk].mean(axis=0) if msk.any() else np.zeros(3)
+    food_sep = de(mean(inner), mean(outer)) if inner.any() and outer.any() else 0.0
+    food_sep_all = de(mean(food), mean(outer)) if outer.any() else 0.0
+    # per-pixel: how much of the food edge is clearly different from what is right next to it
+    near = cv2.dilate(food.astype(np.uint8), k(3)) > 0
+    ring = near & ~food
+    edge_contrast = 0.0
+    if ring.any() and inner.any():
+        o_mean = mean(outer)
+        edge_contrast = float((np.linalg.norm(lab[inner] - o_mean, axis=1) > 15).mean() * 100)
+    # background: everything clearly outside the object
+    bgm = ~(cv2.dilate(obj.astype(np.uint8), k(6)) > 0)
+    g = cv2.GaussianBlur(L, (0, 0), 0.8)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0); gy = cv2.Sobel(g, cv2.CV_32F, 0, 1)
+    mag = np.hypot(gx, gy)
+    lap = cv2.Laplacian(g, cv2.CV_32F)
+    bg_share = float(bgm.mean() * 100)
+    if bgm.mean() > .03:
+        bg_edge = float(mag[bgm].mean()); bg_lap = float(lap[bgm].var()); bg_tex = float(sd[bgm].mean())
+        bl = lab[bgm]; bg_colvar = float(np.linalg.norm(bl - bl.mean(axis=0), axis=1).mean())
+        bg_strong = float((mag[bgm] > 20).mean() * 100)
+    else:
+        bg_edge = bg_lap = bg_tex = bg_colvar = bg_strong = 0.0
+    obj_lap = float(lap[food].var()) if food.any() else 1.0
+    focus_ratio = bg_lap / (obj_lap + 1e-6)
+    r1 = lambda v: round(float(v), 2)
+    return dict(obj_share=r1(obj.mean() * 100), food_share=r1(food.mean() * 100), plate_found=bool(plate_found), food_diff_share=r1(food_diff_share),
+                plate_L=r1(plate_lab[0]) if plate_found else None,
+                food_sep=r1(food_sep), food_sep_all=r1(food_sep_all), edge_contrast=r1(edge_contrast),
+                bg_share=r1(bg_share), bg_edge=r1(bg_edge), bg_strong=r1(bg_strong), bg_tex=r1(bg_tex), bg_colvar=r1(bg_colvar),
+                bg_lap=r1(bg_lap), food_lap=r1(obj_lap), focus_ratio=r1(focus_ratio))
+
+
 # ---------------------------------------------------------------- learned models
 class Models:
     def __init__(self):
@@ -187,6 +266,7 @@ PAIRS = {
     'lit': ['a well-lit, evenly exposed photo', 'a badly lit photo with dark shadows or blown-out bright areas'],
     'whole': ['the whole product is visible in the frame', 'a cropped close-up where only part of the product is visible'],
     'overlay': ['a photo with text or a logo printed over it', 'a clean photo with no text on it'],
+    'clutter': ['a cluttered, busy photo with a distracting, noisy background', 'a clean photo with a simple, uncluttered background'],
 }
 PROMPT_SETS = [list(KIND.values()), list(CONTENT.values())] + list(PAIRS.values())
 
@@ -251,14 +331,18 @@ P = dict(
     w_appeal=.45, w_clarity=.25, w_pres=.20, w_light=.10,
     # Replace: blurry AND pixelated (subject sharpness and real fine detail both very low)
     severe_sharp=40, severe_detail=1.6,
-    # Needs work: soft or low resolution
-    soft_quality=62, soft_sharp=45, low_res=400,
+    # Needs work: soft or low resolution (any one clear sign, or several borderline signs together)
+    soft_quality=62, soft_sharp=45, soft_clarity=55, low_res=400,
     # Needs work: light
     dark_share=45, dark_bright=30, washed_bright=85, blown_share=30,
-    # background: "white-ish" backdrop = very light and colourless
-    white_L=88, white_chroma=12, white_styled=50, unstyled=20,
-    # Needs work: product blends into the background, product tiny in the frame
-    blend=10, small_fill=12,
+    # background: a plain, light, colourless backdrop (patterned tiles or a textured surface are not "white")
+    white_L=88, white_chroma=12, plain_tex=1.5, white_styled=50, unstyled=20,
+    # Needs work: the food blends into what is right next to it (the AI check and the pixels must both agree)
+    blend_clip=10, blend_food=16, blend_food_all=20,
+    # Needs work: a busy background: strong, in-focus texture, or the food small in a cluttered scene
+    busy_tex=9, clutter_clip=65,
+    # Needs work: product small in a plain frame
+    small_fill=12,
     # Excellent needs the product to pop: colour separation and contrast
     pop_sep=29, pop_contrast=25, pop_styled=35,
     # bands
@@ -280,6 +364,7 @@ def assess(r, p=P):
     """Grade one photo. The label comes from the problems found (the owner's rules); the number places the photo inside
     that label's band using the four parts (appeal 45%, clarity 25%, presentation 20%, light 10%)."""
     m, s, y, kind = r['measured'], r.get('scores') or {}, r.get('pairs') or {}, r['kind']
+    c = r.get('scene') or {}
     fix, tip, good = [], [], []
     if m['blank']:
         return dict(grade=5, label='replace', fix=['Looks like a placeholder or blank image, not a real photo of the item. Add a real photo.'], tip=[], good=[], parts={})
@@ -287,12 +372,15 @@ def assess(r, p=P):
     tech, aes_raw = s.get('technical', 65), s.get('aesthetic', 5)
     styled, csep = y.get('styled', 50), y.get('separation', 50)
     want = y.get('appetising', 50) if food else y.get('pro', 50)
+    bg_tex = c.get('bg_tex', 5 if not m['plain_bg'] else 0)
+    plain = m['plain_bg'] or bg_tex < p['plain_tex']
+    whiteish = plain and m.get('bg_L', 0) >= p['white_L'] and m.get('bg_chroma', 99) < p['white_chroma']
     # ---- the four parts (0-100)
     clarity = .35 * lin(m['sharpness'], 30, 90) + .25 * lin(m['detail'], 1, 5) + .40 * lin(tech, 40, 72)
     appeal = .5 * lin(aes_raw, 4.2, 5.6) + .5 * want
-    whiteish = m.get('bg_L', 0) >= p['white_L'] and m.get('bg_chroma', 99) < p['white_chroma']
     pop = .5 * lin(m['separation'], 12, 35) + .5 * lin(m.get('contrast', 20), 10, 30)
-    bg = 40 if whiteish else 70 if (m['neutral_bg'] and m['plain_bg']) else 100
+    busy_level = lin(bg_tex, 3, 12)
+    bg = 40 if whiteish else 70 if plain else 100 - .4 * busy_level
     pres = .4 * styled + .4 * pop + .2 * bg
     light = 100 - max(0.0, 45 - m['brightness']) * 2 - max(0.0, m['brightness'] - 75) * 3 - max(0.0, m['dark_share'] - 30) * 1.5 \
         - max(0.0, m['blown_share'] - 10) * 1.5 - max(0.0, m['uneven'] - 25) * 1.2 - (100 - y.get('lit', 60)) * .15
@@ -309,8 +397,8 @@ def assess(r, p=P):
         msg = 'Blurry and pixelated: the photo is out of focus and too low in resolution. Replace it with a sharp, higher-resolution photo.'
         # still clearly recognisable and appetising (the owner's jalapeño-poppers rule): Needs work, not Replace
         (needs if (want >= 70 and tech >= 55) else replace).append(msg)
-    elif tech < p['soft_quality'] or m['sharpness'] < p['soft_sharp']:
-        needs.append('Soft or slightly blurry: the subject is not crisp. Use a sharper, better-focused photo.')
+    elif tech < p['soft_quality'] or m['sharpness'] < p['soft_sharp'] or clarity < p['soft_clarity']:
+        needs.append('Soft or slightly blurry: the food is not crisp. Use a sharper, better-focused photo.')
     if small and not severe:
         needs.append(f"Low resolution ({m.get('w')}×{m.get('h')} px): it will look soft on large phones. Upload a bigger original.")
     if m['dark_share'] > p['dark_share'] or m['brightness'] < p['dark_bright']:
@@ -319,10 +407,17 @@ def assess(r, p=P):
         needs.append('Washed out: bright areas have lost their detail. Reduce the exposure.')
     if whiteish and styled < p['white_styled']:
         needs.append('Plain white background with little styling: the photo looks flat next to other listings. Use a styled, coloured background or props.')
-    elif styled < p['unstyled']:
-        needs.append('No styling: a plain product shot. Add a background, surface or props that suit the item.')
-    if csep < p['blend']:
-        needs.append('The product blends into the background and plate (similar colours, little contrast). Use a contrasting background or plate.')
+    elif plain and styled < p['unstyled']:
+        needs.append('No styling: a plain product shot on an empty background. Add a surface or props that suit the item.')
+    blends = csep < p['blend_clip'] and c.get('food_sep', 99) < p['blend_food'] and c.get('food_sep_all', 99) < p['blend_food_all']
+    if blends:
+        needs.append('The food blends into its surroundings (similar colours, little contrast). Use a contrasting background so the food stands out.')
+    busy_tex = bg_tex >= p['busy_tex']
+    cluttered = not plain and y.get('clutter', 0) >= p['clutter_clip']
+    if busy_tex or cluttered:
+        needs.append('Busy background: ' + ('strong, in-focus texture behind the food competes with it.' if busy_tex else
+                     'the scene is cluttered with other items and textures around the food.') +
+                     ' Use a calmer surface, blur the background or crop in so the food is the hero.')
     if m['plain_bg'] and m['fill'] < p['small_fill']:
         needs.append('The product is small in the frame; crop tighter so it is the hero.')
     pops = m['separation'] >= p['pop_sep'] and m.get('contrast', 0) >= p['pop_contrast'] and styled >= p['pop_styled']
@@ -330,9 +425,9 @@ def assess(r, p=P):
     if whiteish and styled >= p['white_styled']:
         tip.append('White background: it works here, but a styled, coloured background would make it Excellent.')
     elif not pops and not replace and not needs:
-        tip.append('The product does not pop: a background or plate with more contrast and colour would make it Excellent.')
-    if m['busy_bg'] and styled < 50 and not pops:
-        tip.append('Busy, cluttered background competes with the product.')
+        tip.append('To reach Excellent: stronger contrast between the food and its background, or a more styled backdrop.')
+    if not plain and busy_level >= 50 and not busy_tex and not cluttered:
+        tip.append('The background is fairly busy; a calmer or softer (out-of-focus) background would help the food stand out.')
     if m['touches_edges'] >= 2 and m['bbox'] > 70:
         tip.append('Tight crop: the product runs off the edges. Leave a little space around it.')
     if m['uneven'] > 30 and not any('dark' in x.lower() or 'washed' in x.lower() for x in needs):
@@ -341,15 +436,17 @@ def assess(r, p=P):
         tip.append('May look artificial or composited (the light on the product and the background do not match).')
     if y.get('overlay', 0) >= 85 and kind not in ('packaged', 'merch'):
         tip.append('Text or a logo is printed over the photo.')
-    label = 'replace' if replace else 'needs_work' if needs else 'good' if (whiteish or not pops) else 'excellent'
+    busy_any = busy_tex or cluttered
+    label = 'replace' if replace else 'needs_work' if needs else 'good' if (whiteish or not pops or busy_level >= 50) else 'excellent'
     lo, hi = BANDS[label]
     g = int(round(lo + (hi - lo) * lin(q, 45, 95) / 100))
     # ---- what is working
-    if not severe and tech >= p['soft_quality'] and m['sharpness'] >= 60: good.append('Sharp and clear.')
+    soft = any(x.startswith('Soft') for x in needs)
+    if not severe and not soft and m['sharpness'] >= 60: good.append('Sharp and clear.')
     if want >= 70 and food: good.append('Looks appetising.')
-    if styled >= 60 and not whiteish: good.append('Nicely styled.')
+    if styled >= 60 and not whiteish and not busy_any: good.append('Nicely styled.')
     if light >= 80 and not replace: good.append('Well lit.')
-    if pops: good.append('Stands out well from the background.')
+    if pops and not blends: good.append('The food stands out well.')
     return dict(grade=g, label=label, fix=replace + needs, tip=tip, good=good,
                 parts=dict(appeal=round(appeal), clarity=round(clarity), presentation=round(pres), light=round(light)))
 
@@ -371,6 +468,10 @@ def measure_item(it, models):
     r = dict(id=it['id'], ord=it.get('ord'), name=it['name'], category=it.get('category'), price=it.get('price'), popular=it.get('popular'))
     im = fetch(it['img'])
     r['measured'] = measured(im)
+    try:
+        r['scene'] = scene(im)
+    except Exception as ex:
+        r['scene'] = dict(error=type(ex).__name__)
     e = None
     if models:
         e, r['scores'] = models.score(im)
