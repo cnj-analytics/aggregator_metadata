@@ -265,6 +265,8 @@ PAIRS = {
     'lit': ['a well-lit, evenly exposed photo', 'a badly lit photo with dark shadows or blown-out bright areas'],
     'whole': ['the whole product is visible in the frame', 'a cropped close-up where only part of the product is visible'],
     'overlay': ['a photo with text or a logo printed over it', 'a clean photo with no text on it'],
+    'clutter': ['a cluttered, busy photo with a distracting, noisy background', 'a clean photo with a simple, uncluttered background'],
+    'hero': ['a close-up where the food is clearly the hero of the photo', 'a wide shot where the food is small among other objects'],
 }
 PROMPT_SETS = [list(KIND.values()), list(CONTENT.values())] + list(PAIRS.values())
 
