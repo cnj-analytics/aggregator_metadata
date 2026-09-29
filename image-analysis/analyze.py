@@ -247,21 +247,24 @@ KIND_LABEL = {'dish': 'Dish', 'drink': 'Drink made here', 'packaged': 'Packaged 
 # ---------------------------------------------------------------- scoring (tuned on the owner's 30 graded photos)
 # Four parts, appeal first: appeal 45%, clarity 25%, presentation 20%, light 10%. Hard problems then cap the grade.
 P = dict(
+    # weights of the four parts (they set the number inside a label's band)
     w_appeal=.45, w_clarity=.25, w_pres=.20, w_light=.10,
-    # blur / softness
-    sharp_lo=38, sharp_hi=70, detail_lo=2.2, detail_hi=5.0, clip_sharp_lo=35, clip_hires_lo=35,
-    cap_soft_pixel=40, cap_soft_pixel_appetising=60, cap_blur=69,
-    # background and separation
-    white_bg_pen=10, neutral_pen=4, cap_white=89, sep_lo=18, sep_hi=45, sep_pen=12, busy_pen=6,
-    # framing
-    small_fill=12, small_pen=10, crop_pen=8,
-    # light
-    dark_cap=50, dark_bright=20, washed_bright=93,
-    # content
-    cap_not_visible=35,
+    # Replace: blurry AND pixelated (subject sharpness and real fine detail both very low)
+    severe_sharp=40, severe_detail=1.6,
+    # Needs work: soft or low resolution
+    soft_quality=62, soft_sharp=45, low_res=400,
+    # Needs work: light
+    dark_share=45, dark_bright=30, washed_bright=85, blown_share=30,
+    # background: "white-ish" backdrop = very light and colourless
+    white_L=88, white_chroma=12, white_styled=50, unstyled=20,
+    # Needs work: product blends into the background, product tiny in the frame
+    blend=10, small_fill=12,
+    # Excellent needs the product to pop: colour separation and contrast
+    pop_sep=29, pop_contrast=25, pop_styled=35,
     # bands
     excellent=90, good=70, needs_work=45)
 
+BANDS = {'excellent': (90, 100), 'good': (70, 89), 'needs_work': (45, 69), 'replace': (5, 44)}
 LABELS = [('excellent', 'Excellent'), ('good', 'Good'), ('needs_work', 'Needs work'), ('replace', 'Replace')]
 
 
@@ -274,80 +277,80 @@ def label_for(g, p=P):
 
 
 def assess(r, p=P):
-    """Turns the measurements into a grade, a label and a fix list. r = one photo's measurements."""
+    """Grade one photo. The label comes from the problems found (the owner's rules); the number places the photo inside
+    that label's band using the four parts (appeal 45%, clarity 25%, presentation 20%, light 10%)."""
     m, s, y, kind = r['measured'], r.get('scores') or {}, r.get('pairs') or {}, r['kind']
     fix, tip, good = [], [], []
     if m['blank']:
         return dict(grade=5, label='replace', fix=['Looks like a placeholder or blank image, not a real photo of the item. Add a real photo.'], tip=[], good=[], parts={})
     food = kind in ('dish', 'drink')
-    # --- clarity: subject sharpness, real fine detail, the quality model and the AI's sharp/blurry judgement
-    sharp_part = lin(m['sharpness'], p['sharp_lo'] - 20, p['sharp_hi'])
-    detail_part = lin(m['detail'], p['detail_lo'] - 1, p['detail_hi'])
-    clarity = .30 * sharp_part + .25 * detail_part + .25 * s.get('technical', 60) + .20 * y.get('sharp', 60)
-    blurry = (m['sharpness'] < p['sharp_lo'] and y.get('sharp', 50) < 60) or y.get('sharp', 100) < p['clip_sharp_lo']
-    pixelated = m['detail'] < p['detail_lo'] or y.get('hires', 100) < p['clip_hires_lo']
-    # --- appeal: visual appeal model + "appetising" (food) or "professional product photo" (products)
-    aes = lin(s.get('aesthetic', 5), 3.5, 6.5)
+    tech, aes_raw = s.get('technical', 65), s.get('aesthetic', 5)
+    styled, csep = y.get('styled', 50), y.get('separation', 50)
     want = y.get('appetising', 50) if food else y.get('pro', 50)
-    appeal = .55 * aes + .45 * want
-    # --- presentation: background, separation, framing, styling
-    pres = 55 + .45 * y.get('styled', 50)
-    if m['white_bg']:
-        pres -= p['white_bg_pen'] * 2; tip.append('Plain white background looks flat on a delivery app; a styled, coloured background would lift it.')
-    elif m['neutral_bg'] and m['plain_bg']:
-        pres -= p['neutral_pen'] * 2; tip.append('Neutral, plain background; more colour or styling behind the product would help.')
-    sep = m['separation']
-    if sep < p['sep_lo'] or y.get('separation', 50) < 35:
-        pres -= p['sep_pen']; fix.append('The product blends into the background (similar colours, little contrast). Use a contrasting background or plate so it stands out.')
-    if m['busy_bg'] and y.get('styled', 50) < 50:
-        pres -= p['busy_pen']; tip.append('Busy, cluttered background competes with the product.')
-    if m['plain_bg'] and m['fill'] < p['small_fill']:
-        pres -= p['small_pen']; tip.append('The product is small in the frame; crop tighter so it is the hero.')
-    if y.get('whole', 60) < 30 and kind in ('packaged', 'merch'):
-        pres -= p['crop_pen']; tip.append('Too close: the whole item is not visible. Show the full product.')
-    elif m['touches_edges'] >= 3 and m['plain_bg'] and m['fill'] > 85:
-        pres -= p['crop_pen'] / 2; tip.append('The product is cut off at the edges; leave a little space around it.')
-    pres = max(0.0, min(100.0, pres))
-    # --- light
-    light = 100 - max(0.0, p['dark_bright'] + 25 - m['brightness']) * 2.5 - max(0.0, m['brightness'] - (p['washed_bright'] - 8)) * 3 \
-        - max(0.0, m['uneven'] - 25) * 1.2 - (100 - y.get('lit', 60)) * .25
+    # ---- the four parts (0-100)
+    clarity = .35 * lin(m['sharpness'], 30, 90) + .25 * lin(m['detail'], 1, 5) + .40 * lin(tech, 40, 72)
+    appeal = .5 * lin(aes_raw, 4.2, 5.6) + .5 * want
+    whiteish = m.get('bg_L', 0) >= p['white_L'] and m.get('bg_chroma', 99) < p['white_chroma']
+    pop = .5 * lin(m['separation'], 12, 35) + .5 * lin(m.get('contrast', 20), 10, 30)
+    bg = 40 if whiteish else 70 if (m['neutral_bg'] and m['plain_bg']) else 100
+    pres = .4 * styled + .4 * pop + .2 * bg
+    light = 100 - max(0.0, 45 - m['brightness']) * 2 - max(0.0, m['brightness'] - 75) * 3 - max(0.0, m['dark_share'] - 30) * 1.5 \
+        - max(0.0, m['blown_share'] - 10) * 1.5 - max(0.0, m['uneven'] - 25) * 1.2 - (100 - y.get('lit', 60)) * .15
     light = max(0.0, min(100.0, light))
-    g = p['w_appeal'] * appeal + p['w_clarity'] * clarity + p['w_pres'] * pres + p['w_light'] * light
-    # --- hard problems cap the grade
-    caps = []
+    q = p['w_appeal'] * appeal + p['w_clarity'] * clarity + p['w_pres'] * pres + p['w_light'] * light
+    # ---- problems decide the label
+    replace, needs = [], []
     visible = r.get('content_top') in ('food', 'drink', 'product') or r.get('content_conf', 0) < 50
     if not visible:
-        caps.append(p['cap_not_visible']); fix.append('The photo shows only a logo, text or packaging art, not the product itself. Show the item.')
-    if blurry and pixelated:
-        # still recognisable and appetising (the owner's jalapeño-poppers rule): Needs work, not Replace
-        c = p['cap_soft_pixel_appetising'] if (want >= 70 and aes >= 45) else p['cap_soft_pixel']
-        caps.append(c); fix.append('Blurry and pixelated: the original photo is too small or out of focus. Replace it with a sharp, higher-resolution photo.')
-    elif blurry:
-        caps.append(p['cap_blur']); fix.append('Blurry: the subject is not in focus. Use a sharper photo.')
-    elif pixelated:
-        caps.append(p['cap_blur']); fix.append('Low resolution: the photo looks pixelated on large phones. Upload a larger original.')
-    if m['brightness'] < p['dark_bright'] or m['dark_share'] > 45:
-        caps.append(p['dark_cap']); fix.append('Very dark: the item is hard to see. Brighten it or reshoot in better light.')
-    elif m['brightness'] > p['washed_bright'] and not m['white_bg']:
-        caps.append(p['dark_cap']); fix.append('Very washed out: colours and detail are lost. Reduce the exposure.')
-    elif light < 60:
-        tip.append('Uneven light: dark shadows in one part and very bright areas in another.' if m['uneven'] > 25 else 'The light could be better; brighten or balance it.')
-    if m['white_bg'] or (m['neutral_bg'] and m['plain_bg']):
-        caps.append(p['cap_white'])
-    if y.get('real', 100) < 25:
-        tip.append('May look artificial or composited (lighting of product and background do not match).')
-    if y.get('overlay', 0) >= 85:
+        replace.append('The photo shows only a logo, text or packaging art, not the product itself. Show the item.')
+    severe = m['sharpness'] < p['severe_sharp'] and m['detail'] < p['severe_detail']
+    small = min(m.get('w', 512), m.get('h', 512)) < p['low_res']
+    if severe:
+        msg = 'Blurry and pixelated: the photo is out of focus and too low in resolution. Replace it with a sharp, higher-resolution photo.'
+        # still clearly recognisable and appetising (the owner's jalapeño-poppers rule): Needs work, not Replace
+        (needs if (want >= 70 and tech >= 55) else replace).append(msg)
+    elif tech < p['soft_quality'] or m['sharpness'] < p['soft_sharp']:
+        needs.append('Soft or slightly blurry: the subject is not crisp. Use a sharper, better-focused photo.')
+    if small and not severe:
+        needs.append(f"Low resolution ({m.get('w')}×{m.get('h')} px): it will look soft on large phones. Upload a bigger original.")
+    if m['dark_share'] > p['dark_share'] or m['brightness'] < p['dark_bright']:
+        needs.append('Too dark: much of the photo is in deep shadow. Brighten it or reshoot in better light.')
+    if m['brightness'] > p['washed_bright'] or m['blown_share'] > p['blown_share']:
+        needs.append('Washed out: bright areas have lost their detail. Reduce the exposure.')
+    if whiteish and styled < p['white_styled']:
+        needs.append('Plain white background with little styling: the photo looks flat next to other listings. Use a styled, coloured background or props.')
+    elif styled < p['unstyled']:
+        needs.append('No styling: a plain product shot. Add a background, surface or props that suit the item.')
+    if csep < p['blend']:
+        needs.append('The product blends into the background and plate (similar colours, little contrast). Use a contrasting background or plate.')
+    if m['plain_bg'] and m['fill'] < p['small_fill']:
+        needs.append('The product is small in the frame; crop tighter so it is the hero.')
+    pops = m['separation'] >= p['pop_sep'] and m.get('contrast', 0) >= p['pop_contrast'] and styled >= p['pop_styled']
+    # ---- notes that do not change the label
+    if whiteish and styled >= p['white_styled']:
+        tip.append('White background: it works here, but a styled, coloured background would make it Excellent.')
+    elif not pops and not replace and not needs:
+        tip.append('The product does not pop: a background or plate with more contrast and colour would make it Excellent.')
+    if m['busy_bg'] and styled < 50 and not pops:
+        tip.append('Busy, cluttered background competes with the product.')
+    if m['touches_edges'] >= 2 and m['bbox'] > 70:
+        tip.append('Tight crop: the product runs off the edges. Leave a little space around it.')
+    if m['uneven'] > 30 and not any('dark' in x.lower() or 'washed' in x.lower() for x in needs):
+        tip.append('Uneven light: dark shadow in one part and very bright areas in another.')
+    if y.get('real', 100) < 20 and y.get('lit', 100) < 30:
+        tip.append('May look artificial or composited (the light on the product and the background do not match).')
+    if y.get('overlay', 0) >= 85 and kind not in ('packaged', 'merch'):
         tip.append('Text or a logo is printed over the photo.')
-    if caps:
-        g = min(g, min(caps))
-    g = int(round(max(0, min(100, g))))
-    # --- what is working
-    if not blurry and not pixelated and clarity >= 65: good.append('Sharp and clear.')
+    label = 'replace' if replace else 'needs_work' if needs else 'good' if (whiteish or not pops) else 'excellent'
+    lo, hi = BANDS[label]
+    g = int(round(lo + (hi - lo) * lin(q, 45, 95) / 100))
+    # ---- what is working
+    if not severe and tech >= p['soft_quality'] and m['sharpness'] >= 60: good.append('Sharp and clear.')
     if want >= 70 and food: good.append('Looks appetising.')
-    if y.get('styled', 0) >= 60 and not m['white_bg']: good.append('Nicely styled.')
-    if light >= 80: good.append('Well lit.')
-    if sep >= p['sep_hi']: good.append('Stands out well from the background.')
-    return dict(grade=g, label=label_for(g, p), fix=fix, tip=tip, good=good,
+    if styled >= 60 and not whiteish: good.append('Nicely styled.')
+    if light >= 80 and not replace: good.append('Well lit.')
+    if pops: good.append('Stands out well from the background.')
+    return dict(grade=g, label=label, fix=replace + needs, tip=tip, good=good,
                 parts=dict(appeal=round(appeal), clarity=round(clarity), presentation=round(pres), light=round(light)))
 
 
