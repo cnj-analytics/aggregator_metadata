@@ -1,5 +1,5 @@
 """
-Menu image analysis. Three copies of this run side by side for one menu request (SHARD 0, 1, 2), started by
+Menu image analysis (scoring v3, calibrated to the owner's own grades of 30 real menu photos). Three copies of this run side by side for one menu request (SHARD 0, 1, 2), started by
 Supabase as soon as a restaurant is opened in the dashboard.
 
   1. load the models, then report 'ready'
@@ -9,7 +9,7 @@ Supabase as soon as a restaurant is opened in the dashboard.
   5. radar_img_finish(...)          -> this machine's per-item results (Supabase merges the three)
 
 Nothing is written anywhere except the request row, and logs only show counts (this repository is public).
-Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, TICKET, SHARD, SHARDS
+Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, TICKET, SHARD, SHARDS, MODE (menu | calib)
 """
 import io, os, re, sys, math, time, json, traceback
 import numpy as np, requests
@@ -22,7 +22,8 @@ SHARD = int(os.environ.get('SHARD', '0') or 0)
 SHARDS = int(os.environ.get('SHARDS', '3') or 3)
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
 SIZE = 512
-METHOD_VERSION = 'v2'
+METHOD_VERSION = 'v3'
+MODE = os.environ.get('MODE', 'menu') or 'menu'
 MENU_WAIT = 180   # seconds a warmed-up machine waits for the menu before giving up
 
 
@@ -55,70 +56,68 @@ def fetch(url):
 
 
 
-# ---------------------------------------------------------------- measured checks (plain maths)
+# ---------------------------------------------------------------- measured checks (plain maths on the pixels)
 def measured(im):
     import cv2
     w, h = im.size
     a = np.asarray(im).astype(np.float32)
-    g = cv2.cvtColor(a.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
-    lab = cv2.cvtColor(a.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    u8 = a.astype(np.uint8)
+    g = cv2.cvtColor(u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    lab = cv2.cvtColor(u8, cv2.COLOR_RGB2LAB).astype(np.float32)
     L = lab[..., 0] * 100 / 255
-    # sharpness: variance of the Laplacian, mapped to 0-100 on a log scale (~20 = soft, ~1000+ = crisp)
-    lv = float(cv2.Laplacian(g, cv2.CV_32F).var())
-    sharp = max(0.0, min(100.0, (math.log10(lv + 1) - 1.3) / (3.2 - 1.3) * 100))
-    # exposure
-    bright = float(L.mean())
-    clip_hi = float((L > 97).mean() * 100)
-    clip_lo = float((L < 3).mean() * 100)
-    contrast = float(L.std())
-    # colourfulness (Hasler & Süsstrunk 2003)
-    R, G, B = a[..., 0], a[..., 1], a[..., 2]
-    rg, yb = R - G, 0.5 * (R + G) - B
-    colourful = float(math.hypot(rg.std(), yb.std()) + 0.3 * math.hypot(rg.mean(), yb.mean()))
-    # warmth: mean b* (yellow-blue) in LAB, >0 warm
-    warmth = float(lab[..., 2].mean() - 128)
-    # noise: robust sigma of the fine-detail residual (median absolute deviation)
-    resid = g - cv2.GaussianBlur(g, (3, 3), 0)
-    noise = float(np.median(np.abs(resid - np.median(resid))) * 1.4826)
-    # background & subject: estimate background colour from the border, then how much of the frame differs from it
+    A_, B_ = lab[..., 1] - 128, lab[..., 2] - 128
+    # --- background (from the border) and the subject (what differs from it)
     bw = max(4, int(min(w, h) * 0.06))
     border = np.concatenate([a[:bw].reshape(-1, 3), a[-bw:].reshape(-1, 3), a[:, :bw].reshape(-1, 3), a[:, -bw:].reshape(-1, 3)])
     bg = np.median(border, axis=0)
     border_spread = float(np.median(np.abs(border - bg)))
+    edges = cv2.Canny(u8 if u8.ndim == 2 else g.astype(np.uint8), 80, 160) > 0
+    border_edges = float(np.concatenate([edges[:bw].ravel(), edges[-bw:].ravel(), edges[:, :bw].ravel(), edges[:, -bw:].ravel()]).mean() * 100)
+    plain_bg = border_spread < 10 and border_edges < 2
+    bg_lab = cv2.cvtColor(bg.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)[0, 0]
+    bg_L, bg_chroma = float(bg_lab[0] * 100 / 255), float(math.hypot(bg_lab[1] - 128, bg_lab[2] - 128))
+    white_bg = plain_bg and bg_L > 88 and bg_chroma < 12
+    neutral_bg = bg_chroma < 12            # white, grey, beige, black backdrops
     diff = np.abs(a - bg).mean(axis=2)
     mask = diff > 28
     fill = float(mask.mean() * 100)
+    if not plain_bg or mask.mean() < 0.03:     # in-scene photo: treat the centre of the frame as the subject
+        mask = np.zeros_like(mask); mask[int(h * .2):int(h * .8), int(w * .2):int(w * .8)] = True
     ys, xs = np.where(mask)
-    if len(xs) > 50:
-        cx, cy = xs.mean() / w, ys.mean() / h
-        bbox = ((xs.max() - xs.min()) * (ys.max() - ys.min())) / (w * h) * 100
-        touches = int(xs.min() <= 1) + int(ys.min() <= 1) + int(xs.max() >= w - 2) + int(ys.max() >= h - 2)
-    else:
-        cx = cy = 0.5; bbox = 0.0; touches = 0
-    edges = cv2.Canny(g.astype(np.uint8), 80, 160) > 0
-    border_edges = float(np.concatenate([edges[:bw].ravel(), edges[-bw:].ravel(), edges[:, :bw].ravel(), edges[:, -bw:].ravel()]).mean() * 100)
-    plain_bg = border_spread < 10 and border_edges < 2
-    white_bg = plain_bg and float(bg.mean()) > 225
-    # placeholder / near-blank: very little variation overall
-    q = (a // 32).astype(np.int32)
-    codes = q[..., 0] * 64 + q[..., 1] * 8 + q[..., 2]
+    touches = int(xs.min() <= 1) + int(ys.min() <= 1) + int(xs.max() >= w - 2) + int(ys.max() >= h - 2) if len(xs) else 0
+    bbox = float(((xs.max() - xs.min()) * (ys.max() - ys.min())) / (w * h) * 100) if len(xs) else 0.0
+    # --- sharpness on the subject itself (edge strength), and how much fine detail really exists
+    lap = cv2.Laplacian(g, cv2.CV_32F)
+    lv_all = float(lap.var()); lv_sub = float(lap[mask].var()) if mask.any() else lv_all
+    s100 = lambda v: max(0.0, min(100.0, (math.log10(v + 1) - 1.3) / (3.2 - 1.3) * 100))
+    # a photo stretched up from a small original loses almost nothing when shrunk and enlarged again
+    small = cv2.resize(g, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+    back = cv2.resize(small, (w, h), interpolation=cv2.INTER_CUBIC)
+    detail = float(np.abs(g - back)[mask].mean()) if mask.any() else float(np.abs(g - back).mean())
+    # --- exposure, including uneven light (a dark corner and a washed-out corner in the same photo)
+    Ls = L[mask] if mask.any() else L.ravel()
+    bright = float(Ls.mean()); contrast = float(Ls.std())
+    dark_share = float((Ls < 18).mean() * 100); blown_share = float((Ls > 96).mean() * 100)
+    qs = [float(L[:h // 2, :w // 2].mean()), float(L[:h // 2, w // 2:].mean()), float(L[h // 2:, :w // 2].mean()), float(L[h // 2:, w // 2:].mean())]
+    uneven = max(qs) - min(qs)
+    # --- colour: how lively the subject is, and how well it stands out from the background
+    R, G, B = a[..., 0][mask], a[..., 1][mask], a[..., 2][mask]
+    rg, yb = R - G, 0.5 * (R + G) - B
+    colourful = float(math.hypot(rg.std(), yb.std()) + 0.3 * math.hypot(rg.mean(), yb.mean())) if mask.any() else 0.0
+    sub_lab = np.array([L[mask].mean(), A_[mask].mean(), B_[mask].mean()]) if mask.any() else np.array([bright, 0, 0])
+    bg_vec = np.array([bg_L, bg_lab[1] - 128, bg_lab[2] - 128])
+    separation = float(np.linalg.norm(sub_lab - bg_vec))       # CIE76 colour distance subject vs background
+    sub_chroma = float(np.hypot(A_[mask], B_[mask]).mean()) if mask.any() else 0.0
+    # --- placeholder / near-blank
+    q = (u8 // 32).astype(np.int32); codes = q[..., 0] * 64 + q[..., 1] * 8 + q[..., 2]
     top_share = float(np.bincount(codes.ravel()).max() / codes.size * 100)
-    blank = contrast < 3.5 or (top_share > 88 and contrast < 12)
-    # blown highlights only count on the food itself: pure-white areas joined to the image edge are a
-    # deliberate white backdrop, not lost detail, so they are left out
-    hi = (L > 97).astype(np.uint8)
-    if hi.any():
-        n, lab_ = cv2.connectedComponents(hi, connectivity=8)
-        edge_ids = np.unique(np.concatenate([lab_[0], lab_[-1], lab_[:, 0], lab_[:, -1]]))
-        inner = hi.astype(bool) & ~np.isin(lab_, edge_ids[edge_ids > 0])
-        subject = ~(np.isin(lab_, edge_ids[edge_ids > 0]))
-        clip_hi = float(inner.sum() / max(1, subject.sum()) * 100)
-    return dict(w=w, h=h, sharpness=round(sharp, 1), laplacian_var=round(lv, 1), brightness=round(bright, 1), clip_hi=round(clip_hi, 2),
-                clip_lo=round(clip_lo, 2), contrast=round(contrast, 1), colourfulness=round(colourful, 1), warmth=round(warmth, 1),
-                noise=round(noise, 2), fill=round(fill, 1), bbox=round(bbox, 1), centre=[round(cx, 2), round(cy, 2)], touches_edges=touches,
-                plain_bg=bool(plain_bg), white_bg=bool(white_bg), busy_bg=bool(border_edges > 8), blank=bool(blank))
-
-
+    blank = float(L.std()) < 3.5 or (top_share > 88 and float(L.std()) < 12)
+    r1 = lambda v: round(float(v), 1)
+    return dict(w=w, h=h, sharp_all=r1(s100(lv_all)), sharpness=r1(s100(lv_sub)), detail=round(detail, 2),
+                brightness=r1(bright), contrast=r1(contrast), dark_share=r1(dark_share), blown_share=r1(blown_share), uneven=r1(uneven),
+                colourfulness=r1(colourful), sub_chroma=r1(sub_chroma), separation=r1(separation), bg_L=r1(bg_L), bg_chroma=r1(bg_chroma),
+                fill=r1(fill), bbox=r1(bbox), touches_edges=touches, plain_bg=bool(plain_bg), white_bg=bool(white_bg),
+                neutral_bg=bool(neutral_bg), busy_bg=bool(border_edges > 8), blank=bool(blank))
 
 
 # ---------------------------------------------------------------- learned models
@@ -164,22 +163,32 @@ class Models:
         p = (100.0 * (e @ t.T)[0]).softmax(dim=-1).tolist()
         return {k: round(v * 100, 1) for k, v in zip(prompts, p)}
 
+    def sim(self, e, prompts):
+        return [round(float(x), 4) for x in (e @ self.text(prompts).T)[0].tolist()]
+
 
 KIND = {'plated': 'a plated dish of food on a plate or in a bowl',
         'unplated': 'food served without a plate, such as a pizza, burger, sandwich or wrap',
         'glass': 'a drink served in a glass or cup',
         'can': 'a canned or bottled soft drink or bottle of water',
         'packaged': 'a packaged product in a jar, box or wrapper with a printed label',
-        'merch': 'merchandise such as a t-shirt, cap, mug or tote bag'}
-CONTENT = {'food': 'a photo of food', 'drink': 'a photo of a drink', 'logo': 'a logo or brand graphic',
-           'text': 'text, a menu or a price list', 'person': 'a photo of a person'}
-STYLE = ['a professional studio product photograph', 'an amateur smartphone snapshot']
-SHOT = {'overhead': 'an overhead top-down shot of food', '45-degree': 'a 45-degree angle shot of food on a table',
-        'close-up': 'a close-up shot of food', 'side-on': 'a side-on shot of food'}
-SCENE = {'plain': 'food on a plain seamless background', 'table': 'food on a restaurant table or kitchen counter',
-         'styled': 'food styled with props and ingredients around it'}
-OVERLAY = ['a photo with text or a logo printed over it', 'a clean photo with no text on it']
-PROMPT_SETS = [list(KIND.values()), list(CONTENT.values()), STYLE, list(SHOT.values()), list(SCENE.values()), OVERLAY]
+        'merch': 'merchandise or a non-food product such as candles, a t-shirt, cap, mug or tote bag'}
+CONTENT = {'food': 'a photo showing food', 'drink': 'a photo showing a drink', 'product': 'a photo showing a packaged product',
+           'logo': 'a logo or brand graphic only', 'text': 'text or a menu only', 'person': 'a photo of a person'}
+# yes/no pairs: the first prompt is the "yes"
+PAIRS = {
+    'sharp': ['a sharp, in-focus, crisp photo', 'a blurry, out-of-focus, soft photo'],
+    'hires': ['a high-resolution, detailed photo', 'a low-resolution, pixelated, heavily compressed photo'],
+    'appetising': ['an appetizing, delicious-looking, mouth-watering photo', 'an unappetizing, dull, unappealing photo'],
+    'pro': ['a professional, high-end commercial product photograph', 'a poor amateur snapshot'],
+    'styled': ['a beautifully styled photo with a designed, colourful background and props', 'a plain photo on an empty white or grey background'],
+    'separation': ['the subject stands out clearly from the background', 'the subject blends into a background of similar colour'],
+    'real': ['a real photograph', 'an AI-generated, fake-looking or badly photoshopped composite image'],
+    'lit': ['a well-lit, evenly exposed photo', 'a badly lit photo with dark shadows or blown-out bright areas'],
+    'whole': ['the whole product is visible in the frame', 'a cropped close-up where only part of the product is visible'],
+    'overlay': ['a photo with text or a logo printed over it', 'a clean photo with no text on it'],
+}
+PROMPT_SETS = [list(KIND.values()), list(CONTENT.values())] + list(PAIRS.values())
 
 
 def pick(model, e, d):
@@ -194,11 +203,11 @@ def rx(words):
     return re.compile(r'(?<![a-z])(' + '|'.join(words) + r')(?![a-z])')
 
 MERCH_RX = rx([r'merch', r'merchandise', r't-?shirts?', r'tee', r'hoodies?', r'sweatshirts?', r'tote', r'caps?', r'hats?', r'keychains?',
-               r'stickers?', r'gift ?cards?', r'vouchers?', r'aprons?', r'socks'])
+               r'stickers?', r'gift ?cards?', r'vouchers?', r'aprons?', r'socks', r'candles?', r'balloons?', r'cake toppers?', r'party hats?'])
 BRAND_RX = rx([r'coca[- ]?cola', r'coke', r'pepsi', r'7[- ]?up', r'sprite', r'fanta', r'mirinda', r'mountain dew', r'dr\.? pepper', r'schweppes',
                r'red ?bull', r'monster energy', r'vimto', r'perrier', r's\.? ?pellegrino', r'san pellegrino', r'evian', r'acqua panna', r'masafi',
                r'al ain', r'arwa', r'aquafina', r'voss', r'lipton', r'snapple', r'capri[- ]?sun', r'rubicon', r'barbican',
-               r'lays', r'pringles', r'doritos', r'kit ?kat', r'snickers', r'twix'])
+               r'lays', r'pringles', r'doritos', r'kit ?kat', r'snickers', r'twix', r'mogu ?mogu', r'alokozay', r'oreo', r'nutella', r'kinder'])
 GENERIC_PACKAGED_RX = rx([r'soft drinks?', r'fizzy drinks?', r'canned', r'cans?', r'bottled', r'mineral water', r'sparkling water', r'still water',
                           r'water', r'\d+(\.\d+)? ?(ml|l|cl)'])
 DRINK_RX = rx([r'smoothies?', r'juices?', r'coffee', r'lattes?', r'cappuccinos?', r'espresso', r'americano', r'flat white', r'cortado', r'macchiato',
@@ -235,97 +244,114 @@ def classify(it, e, model):
 KIND_LABEL = {'dish': 'Dish', 'drink': 'Drink made here', 'packaged': 'Packaged product', 'merch': 'Merchandise'}
 
 
-# ---------------------------------------------------------------- feedback rules (each photo judged on its own)
-def feedback(r):
+# ---------------------------------------------------------------- scoring (tuned on the owner's 30 graded photos)
+# Four parts, appeal first: appeal 45%, clarity 25%, presentation 20%, light 10%. Hard problems then cap the grade.
+P = dict(
+    # weights of the four parts (they set the number inside a label's band)
+    w_appeal=.45, w_clarity=.25, w_pres=.20, w_light=.10,
+    # Replace: blurry AND pixelated (subject sharpness and real fine detail both very low)
+    severe_sharp=40, severe_detail=1.6,
+    # Needs work: soft or low resolution
+    soft_quality=62, soft_sharp=45, low_res=400,
+    # Needs work: light
+    dark_share=45, dark_bright=30, washed_bright=85, blown_share=30,
+    # background: "white-ish" backdrop = very light and colourless
+    white_L=88, white_chroma=12, white_styled=50, unstyled=20,
+    # Needs work: product blends into the background, product tiny in the frame
+    blend=10, small_fill=12,
+    # Excellent needs the product to pop: colour separation and contrast
+    pop_sep=29, pop_contrast=25, pop_styled=35,
+    # bands
+    excellent=90, good=70, needs_work=45)
+
+BANDS = {'excellent': (90, 100), 'good': (70, 89), 'needs_work': (45, 69), 'replace': (5, 44)}
+LABELS = [('excellent', 'Excellent'), ('good', 'Good'), ('needs_work', 'Needs work'), ('replace', 'Replace')]
+
+
+def lin(v, lo, hi):
+    return max(0.0, min(100.0, (v - lo) / ((hi - lo) or 1) * 100))
+
+
+def label_for(g, p=P):
+    return 'excellent' if g >= p['excellent'] else 'good' if g >= p['good'] else 'needs_work' if g >= p['needs_work'] else 'replace'
+
+
+def assess(r, p=P):
+    """Grade one photo. The label comes from the problems found (the owner's rules); the number places the photo inside
+    that label's band using the four parts (appeal 45%, clarity 25%, presentation 20%, light 10%)."""
+    m, s, y, kind = r['measured'], r.get('scores') or {}, r.get('pairs') or {}, r['kind']
     fix, tip, good = [], [], []
-    m, s, kind = r['measured'], r.get('scores') or {}, r['kind']
+    if m['blank']:
+        return dict(grade=5, label='replace', fix=['Looks like a placeholder or blank image, not a real photo of the item. Add a real photo.'], tip=[], good=[], parts={})
     food = kind in ('dish', 'drink')
-    if m['blank']:
-        fix.append('Looks like a placeholder or near-blank image, not a real photo of the item.')
-        return dict(fix=fix, tip=tip, good=good)
-    # content: only food and drinks made here are expected to show the item itself (packaging, labels and logos are fine elsewhere)
-    if food and r.get('content_top') in ('logo', 'text', 'person') and r.get('content_conf', 0) >= 60:
-        what = {'logo': 'a logo or brand graphic', 'text': 'text or a menu', 'person': 'a person'}[r['content_top']]
-        fix.append(f'The photo mainly shows {what}, not the {"dish" if kind == "dish" else "drink"}.')
-    # sharpness
-    if m['sharpness'] < 25:
-        fix.append('Blurry: edges are not crisp. Use a sharper original or reshoot with the focus on the item.')
-    elif m['sharpness'] < 40:
-        tip.append('Slightly soft; a sharper original would help.')
-    elif m['sharpness'] > 70:
-        good.append('Crisp detail.')
-    # size
-    if m['w'] < 400 or m['h'] < 400:
-        fix.append(f'Low resolution ({m["w"]}×{m["h"]} px); it will look pixelated on large phones.')
-    # exposure (absolute thresholds, not compared with other photos)
-    if m['brightness'] < 28:
-        fix.append('Too dark: the item is hard to see. Brighten it or reshoot in more light.')
-    elif m['brightness'] < 38:
-        tip.append('A little dark; brightening would help.')
-    elif m['brightness'] > 90 and not m['white_bg']:
-        tip.append('Washed out / very bright overall.')
-    hi_limit = 12 if food else 25
-    if m['clip_hi'] > hi_limit:
-        (fix if food else tip).append(f'Blown-out highlights: {m["clip_hi"]:.0f}% of the {"food" if food else "product"} is pure white with no detail.')
-    if 45 <= m['brightness'] <= 85 and m['clip_hi'] <= 5 and m['clip_lo'] <= 5:
-        good.append('Well lit.')
-    if s and s.get('technical', 100) < 35:
-        tip.append('Low technical quality (heavy compression or a small original).')
-    if kind == 'dish':
-        if m['contrast'] < 10:
-            tip.append('Flat, low-contrast look; a little more contrast would make the dish pop.')
-        if m['colourfulness'] < 15:
-            tip.append('Muted colours; the dish looks dull.')
-        elif m['colourfulness'] > 45:
-            good.append('Vivid colour.')
-        if m['fill'] < 15:
-            tip.append(f'The dish is small in the frame (about {m["fill"]:.0f}%); crop tighter.')
-        elif r.get('plated') and m['touches_edges'] >= 3 and m['fill'] > 85:
-            tip.append('The plate is cut off on several sides; leave a little space around it.')
-        if m['busy_bg'] and r.get('scene') != 'styled':
-            tip.append('Busy background competes with the dish.')
-        if r.get('overlay', 0) >= 80:
-            tip.append('Text or a logo appears over the photo; a clean food photo usually works better.')
-    elif kind == 'drink':
-        if m['fill'] < 10:
-            tip.append('The drink is small in the frame; crop tighter.')
-    else:
-        if m['fill'] < 10:
-            tip.append('The product is small in the frame; crop tighter.')
-        if m['busy_bg']:
-            tip.append('The product would stand out more on a plain background.')
-    if m['plain_bg']:
-        good.append('Clean white background.' if m['white_bg'] else 'Clean, uncluttered background.')
-    if s and food:
-        if s['aesthetic'] >= 6:
-            good.append('Strong overall visual appeal.')
-        elif s['aesthetic'] < 4.3:
-            tip.append('Low visual appeal; styling, light or angle could be improved.')
-    return dict(fix=fix, tip=tip, good=good)
-
-
-def grade(r):
-    """0-100. A decent delivery-app photo lands around 65-80 (B). Weights are shown in the report's 'How we assess'."""
-    m, s = r['measured'], r.get('scores') or {}
-    if m['blank']:
-        return 5
-    aes = max(0, min(100, (s['aesthetic'] - 3.5) / 3 * 100)) if s else None
-    tech = max(0, min(100, s['technical'])) if s else None
-    expo = max(0, 100 - min(100, max(0, 40 - m['brightness']) * 3 + max(0, m['brightness'] - 88) * 3 + m['clip_hi'] * 2))
-    if r['kind'] in ('dish', 'drink'):
-        parts = [(0.40, tech), (0.35, aes), (0.15, m['sharpness']), (0.10, expo)]
-    else:
-        parts = [(0.50, tech), (0.15, aes), (0.20, m['sharpness']), (0.15, expo)]
-    parts = [(w, v) for w, v in parts if v is not None]
-    base = sum(w * v for w, v in parts) / sum(w for w, _ in parts)
-    g = 30 + 0.7 * base
-    if r['kind'] in ('dish', 'drink') and r.get('content_top') in ('logo', 'text', 'person') and r.get('content_conf', 0) >= 60:
-        g -= 20
-    if m['w'] < 400 or m['h'] < 400:
-        g -= 8
-    # blur, darkness and blown highlights are already in the score; each one that needs fixing costs a little more
-    g -= 6 * sum(1 for f in (r.get('feedback') or {}).get('fix', []) if f.startswith(('Blurry', 'Too dark', 'Blown')))
-    return int(round(max(0, min(100, g))))
+    tech, aes_raw = s.get('technical', 65), s.get('aesthetic', 5)
+    styled, csep = y.get('styled', 50), y.get('separation', 50)
+    want = y.get('appetising', 50) if food else y.get('pro', 50)
+    # ---- the four parts (0-100)
+    clarity = .35 * lin(m['sharpness'], 30, 90) + .25 * lin(m['detail'], 1, 5) + .40 * lin(tech, 40, 72)
+    appeal = .5 * lin(aes_raw, 4.2, 5.6) + .5 * want
+    whiteish = m.get('bg_L', 0) >= p['white_L'] and m.get('bg_chroma', 99) < p['white_chroma']
+    pop = .5 * lin(m['separation'], 12, 35) + .5 * lin(m.get('contrast', 20), 10, 30)
+    bg = 40 if whiteish else 70 if (m['neutral_bg'] and m['plain_bg']) else 100
+    pres = .4 * styled + .4 * pop + .2 * bg
+    light = 100 - max(0.0, 45 - m['brightness']) * 2 - max(0.0, m['brightness'] - 75) * 3 - max(0.0, m['dark_share'] - 30) * 1.5 \
+        - max(0.0, m['blown_share'] - 10) * 1.5 - max(0.0, m['uneven'] - 25) * 1.2 - (100 - y.get('lit', 60)) * .15
+    light = max(0.0, min(100.0, light))
+    q = p['w_appeal'] * appeal + p['w_clarity'] * clarity + p['w_pres'] * pres + p['w_light'] * light
+    # ---- problems decide the label
+    replace, needs = [], []
+    visible = r.get('content_top') in ('food', 'drink', 'product') or r.get('content_conf', 0) < 50
+    if not visible:
+        replace.append('The photo shows only a logo, text or packaging art, not the product itself. Show the item.')
+    severe = m['sharpness'] < p['severe_sharp'] and m['detail'] < p['severe_detail']
+    small = min(m.get('w', 512), m.get('h', 512)) < p['low_res']
+    if severe:
+        msg = 'Blurry and pixelated: the photo is out of focus and too low in resolution. Replace it with a sharp, higher-resolution photo.'
+        # still clearly recognisable and appetising (the owner's jalapeño-poppers rule): Needs work, not Replace
+        (needs if (want >= 70 and tech >= 55) else replace).append(msg)
+    elif tech < p['soft_quality'] or m['sharpness'] < p['soft_sharp']:
+        needs.append('Soft or slightly blurry: the subject is not crisp. Use a sharper, better-focused photo.')
+    if small and not severe:
+        needs.append(f"Low resolution ({m.get('w')}×{m.get('h')} px): it will look soft on large phones. Upload a bigger original.")
+    if m['dark_share'] > p['dark_share'] or m['brightness'] < p['dark_bright']:
+        needs.append('Too dark: much of the photo is in deep shadow. Brighten it or reshoot in better light.')
+    if m['brightness'] > p['washed_bright'] or m['blown_share'] > p['blown_share']:
+        needs.append('Washed out: bright areas have lost their detail. Reduce the exposure.')
+    if whiteish and styled < p['white_styled']:
+        needs.append('Plain white background with little styling: the photo looks flat next to other listings. Use a styled, coloured background or props.')
+    elif styled < p['unstyled']:
+        needs.append('No styling: a plain product shot. Add a background, surface or props that suit the item.')
+    if csep < p['blend']:
+        needs.append('The product blends into the background and plate (similar colours, little contrast). Use a contrasting background or plate.')
+    if m['plain_bg'] and m['fill'] < p['small_fill']:
+        needs.append('The product is small in the frame; crop tighter so it is the hero.')
+    pops = m['separation'] >= p['pop_sep'] and m.get('contrast', 0) >= p['pop_contrast'] and styled >= p['pop_styled']
+    # ---- notes that do not change the label
+    if whiteish and styled >= p['white_styled']:
+        tip.append('White background: it works here, but a styled, coloured background would make it Excellent.')
+    elif not pops and not replace and not needs:
+        tip.append('The product does not pop: a background or plate with more contrast and colour would make it Excellent.')
+    if m['busy_bg'] and styled < 50 and not pops:
+        tip.append('Busy, cluttered background competes with the product.')
+    if m['touches_edges'] >= 2 and m['bbox'] > 70:
+        tip.append('Tight crop: the product runs off the edges. Leave a little space around it.')
+    if m['uneven'] > 30 and not any('dark' in x.lower() or 'washed' in x.lower() for x in needs):
+        tip.append('Uneven light: dark shadow in one part and very bright areas in another.')
+    if y.get('real', 100) < 20 and y.get('lit', 100) < 30:
+        tip.append('May look artificial or composited (the light on the product and the background do not match).')
+    if y.get('overlay', 0) >= 85 and kind not in ('packaged', 'merch'):
+        tip.append('Text or a logo is printed over the photo.')
+    label = 'replace' if replace else 'needs_work' if needs else 'good' if (whiteish or not pops) else 'excellent'
+    lo, hi = BANDS[label]
+    g = int(round(lo + (hi - lo) * lin(q, 45, 95) / 100))
+    # ---- what is working
+    if not severe and tech >= p['soft_quality'] and m['sharpness'] >= 60: good.append('Sharp and clear.')
+    if want >= 70 and food: good.append('Looks appetising.')
+    if styled >= 60 and not whiteish: good.append('Nicely styled.')
+    if light >= 80 and not replace: good.append('Well lit.')
+    if pops: good.append('Stands out well from the background.')
+    return dict(grade=g, label=label, fix=replace + needs, tip=tip, good=good,
+                parts=dict(appeal=round(appeal), clarity=round(clarity), presentation=round(pres), light=round(light)))
 
 
 # ---------------------------------------------------------------- run
@@ -340,30 +366,48 @@ def finish(items, error=None):
     rpc('radar_img_finish', {'p_ticket': int(TICKET), 'p_shard': SHARD, 'p_items': items, 'p_error': error})
 
 
-def score_item(it, models):
+def measure_item(it, models):
+    """Everything the scoring needs for one photo (raw numbers; the calibration run stores exactly this)."""
     r = dict(id=it['id'], ord=it.get('ord'), name=it['name'], category=it.get('category'), price=it.get('price'), popular=it.get('popular'))
     im = fetch(it['img'])
-    m = measured(im)
-    r['measured'] = m
+    r['measured'] = measured(im)
     e = None
     if models:
         e, r['scores'] = models.score(im)
-        r['content_top'], r['content_conf'], _ = pick(models, e, CONTENT)
-        r['studio'] = list(models.probs(e, STYLE).values())[0]
-        r['overlay'] = list(models.probs(e, OVERLAY).values())[0]
+        r['content_top'], r['content_conf'], r['content'] = pick(models, e, CONTENT)
+        r['pairs'] = {k: list(models.probs(e, v).values())[0] for k, v in PAIRS.items()}
+        txt = ' '.join(x for x in [it.get('name'), it.get('description')] if x)[:200]
+        r['name_sim'] = models.sim(e, [f'a photo of {txt}', 'a logo or brand graphic', 'text or a price list'])
     r['kind'], kind_img = classify(it, e, models)
     r['kind_label'] = KIND_LABEL[r['kind']]
-    r['plated'] = kind_img == 'plated'
-    if models and r['kind'] == 'dish':
-        r['shot'] = pick(models, e, SHOT)[0]
-        r['scene'] = pick(models, e, SCENE)[0]
-    r['feedback'] = feedback(r)
-    r['grade'] = grade(r)
+    r['kind_img'] = kind_img
     return r
+
+
+def score_item(it, models):
+    r = measure_item(it, models)
+    a = assess(r)
+    r.update(grade=a['grade'], label=a['label'], parts=a['parts'], feedback=dict(fix=a['fix'], tip=a['tip'], good=a['good']))
+    return r
+
+
+def run_calibration(models):
+    job = rpc('radar_calib_job', {'p': {}})
+    items = job['items']
+    print(f'calibration: {len(items)} photos')
+    for it in items:
+        try:
+            r = measure_item(it, models)
+        except Exception as ex:
+            r = dict(error=type(ex).__name__)
+        rpc('radar_calib_result', {'p_id': int(it['id']), 'p_model': r})
+    print('calibration done')
 
 
 def main():
     t0 = time.time()
+    if MODE == 'calib':
+        run_calibration(Models()); return
     if progress(0, None, 'loading') in ('cancelled', 'gone'):
         print('stopped before start'); return
     try:
@@ -402,14 +446,15 @@ def main():
 
 
 if __name__ == '__main__':
-    if not (SUPABASE_URL and SUPABASE_KEY and TICKET):
+    if not (SUPABASE_URL and SUPABASE_KEY and (TICKET or MODE == 'calib')):
         sys.exit('missing env')
     try:
         main()
     except Exception as ex:
         traceback.print_exc(limit=2)
-        try:
-            finish(None, type(ex).__name__)
-        except Exception:
-            pass
+        if MODE != 'calib':
+            try:
+                finish(None, type(ex).__name__)
+            except Exception:
+                pass
         sys.exit(1)
