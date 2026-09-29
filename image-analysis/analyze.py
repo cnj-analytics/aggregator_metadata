@@ -120,6 +120,84 @@ def measured(im):
                 neutral_bg=bool(neutral_bg), busy_bg=bool(border_edges > 8), blank=bool(blank))
 
 
+def scene(im):
+    """Scene layout for tabletop photos: the object (plate/cup + food), the food itself (plate removed) and the background.
+    The food is what must stand out; the plate is ignored. A busy background only counts when it is in focus."""
+    import cv2
+    S = 256
+    a = np.asarray(im.resize((S, S))).astype(np.uint8)
+    lab = cv2.cvtColor(a, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab[..., 0] *= 100 / 255; lab[..., 1] -= 128; lab[..., 2] -= 128
+    L = lab[..., 0]
+    # object: GrabCut started from a box a little inside the frame
+    gm = np.zeros((S, S), np.uint8); bgd = np.zeros((1, 65), np.float64); fgd = np.zeros((1, 65), np.float64)
+    m = int(S * .06)
+    try:
+        cv2.grabCut(a, gm, (m, m, S - 2 * m, S - 2 * m), bgd, fgd, 4, cv2.GC_INIT_WITH_RECT)
+        obj = (gm == cv2.GC_FGD) | (gm == cv2.GC_PR_FGD)
+    except Exception:
+        obj = np.zeros((S, S), bool)
+    if obj.mean() < .05 or obj.mean() > .97:
+        obj = np.zeros((S, S), bool); obj[int(S * .15):int(S * .85), int(S * .15):int(S * .85)] = True
+    k = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    # plate / cup / container: light, colourless, fairly smooth areas inside the object (white or grey ceramic, enamel,
+    # paper, a saucer), plus the object's outer ring colour when one colour dominates it. The food is the rest.
+    # The plate itself is never judged: only whether the food stands out from whatever is right next to it.
+    mu = cv2.blur(L, (5, 5)); sd = np.sqrt(np.maximum(cv2.blur(L * L, (5, 5)) - mu * mu, 0))
+    chroma = np.hypot(lab[..., 1], lab[..., 2])
+    plate = obj & (chroma < 12) & (L > 62) & (sd < 6)
+    ring_o = (cv2.erode(obj.astype(np.uint8), k(3)) > 0) & ~(cv2.erode(obj.astype(np.uint8), k(12)) > 0)
+    if ring_o.sum() > 80:
+        Z = lab[ring_o].astype(np.float32)
+        _, lbl, cen = cv2.kmeans(Z, 3, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1), 3, cv2.KMEANS_PP_CENTERS)
+        cnt = np.bincount(lbl.ravel(), minlength=3) / len(lbl); i = int(cnt.argmax())
+        if cnt[i] >= .55:
+            plate |= obj & (np.linalg.norm(lab - cen[i], axis=2) < 10) & (sd < 6)
+    plate = cv2.morphologyEx(plate.astype(np.uint8), cv2.MORPH_OPEN, k(1)) > 0
+    food = obj & ~plate
+    food = cv2.morphologyEx(food.astype(np.uint8), cv2.MORPH_OPEN, k(1)) > 0
+    food = cv2.morphologyEx(food.astype(np.uint8), cv2.MORPH_CLOSE, k(3)) > 0
+    plate_found = plate.sum() > obj.sum() * .08
+    food_diff_share = float(food.sum() / max(1, obj.sum()) * 100)
+    plate_lab = lab[plate].mean(axis=0) if plate.any() else None
+    if food.mean() < .02:
+        food = obj
+    inner = food & ~(cv2.erode(food.astype(np.uint8), k(5)) > 0)
+    outer = (cv2.dilate(food.astype(np.uint8), k(8)) > 0) & ~food
+    de = lambda x, y: float(np.linalg.norm(x - y))
+    mean = lambda msk: lab[msk].mean(axis=0) if msk.any() else np.zeros(3)
+    food_sep = de(mean(inner), mean(outer)) if inner.any() and outer.any() else 0.0
+    food_sep_all = de(mean(food), mean(outer)) if outer.any() else 0.0
+    # per-pixel: how much of the food edge is clearly different from what is right next to it
+    near = cv2.dilate(food.astype(np.uint8), k(3)) > 0
+    ring = near & ~food
+    edge_contrast = 0.0
+    if ring.any() and inner.any():
+        o_mean = mean(outer)
+        edge_contrast = float((np.linalg.norm(lab[inner] - o_mean, axis=1) > 15).mean() * 100)
+    # background: everything clearly outside the object
+    bgm = ~(cv2.dilate(obj.astype(np.uint8), k(6)) > 0)
+    g = cv2.GaussianBlur(L, (0, 0), 0.8)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0); gy = cv2.Sobel(g, cv2.CV_32F, 0, 1)
+    mag = np.hypot(gx, gy)
+    lap = cv2.Laplacian(g, cv2.CV_32F)
+    bg_share = float(bgm.mean() * 100)
+    if bgm.mean() > .03:
+        bg_edge = float(mag[bgm].mean()); bg_lap = float(lap[bgm].var()); bg_tex = float(sd[bgm].mean())
+        bl = lab[bgm]; bg_colvar = float(np.linalg.norm(bl - bl.mean(axis=0), axis=1).mean())
+        bg_strong = float((mag[bgm] > 20).mean() * 100)
+    else:
+        bg_edge = bg_lap = bg_tex = bg_colvar = bg_strong = 0.0
+    obj_lap = float(lap[food].var()) if food.any() else 1.0
+    focus_ratio = bg_lap / (obj_lap + 1e-6)
+    r1 = lambda v: round(float(v), 2)
+    return dict(obj_share=r1(obj.mean() * 100), food_share=r1(food.mean() * 100), plate_found=bool(plate_found), food_diff_share=r1(food_diff_share),
+                plate_L=r1(plate_lab[0]) if plate_found else None,
+                food_sep=r1(food_sep), food_sep_all=r1(food_sep_all), edge_contrast=r1(edge_contrast),
+                bg_share=r1(bg_share), bg_edge=r1(bg_edge), bg_strong=r1(bg_strong), bg_tex=r1(bg_tex), bg_colvar=r1(bg_colvar),
+                bg_lap=r1(bg_lap), food_lap=r1(obj_lap), focus_ratio=r1(focus_ratio))
+
+
 # ---------------------------------------------------------------- learned models
 class Models:
     def __init__(self):
@@ -371,6 +449,10 @@ def measure_item(it, models):
     r = dict(id=it['id'], ord=it.get('ord'), name=it['name'], category=it.get('category'), price=it.get('price'), popular=it.get('popular'))
     im = fetch(it['img'])
     r['measured'] = measured(im)
+    try:
+        r['scene'] = scene(im)
+    except Exception as ex:
+        r['scene'] = dict(error=type(ex).__name__)
     e = None
     if models:
         e, r['scores'] = models.score(im)
