@@ -1,0 +1,47 @@
+name: Talabat UAE – Scrape Restaurant Details (TEST)
+
+# Hits the menu endpoint for every bid in talabat_restaurant_queue whose
+# chain_name or name matches a brand filter, extracts the restaurant block
+# (NOT the menu items) and upserts into talabat_restaurant_detail_test.
+#
+# Default filter: starbucks|ldc kitchen|sugargram|sushi do|box it
+# → ~234 branches, ~6 min at 1.5s pacing.
+#
+# Manual dispatch only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      brand_pattern:
+        description: 'Alternation pattern (pipe-separated). Each clause is wrapped as %clause% and OR-matched against chain_name and name.'
+        required: true
+        type: string
+        default: 'starbucks|ldc kitchen|sugargram|sushi do|box it'
+      call_delay_ms:
+        description: 'Delay between menu-endpoint calls (ms)'
+        required: false
+        type: string
+        default: '1500'
+
+concurrency:
+  group: talabat-uae-scrape-restaurant-details-test
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Scrape restaurant details (test)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          BRAND_PATTERN: ${{ inputs.brand_pattern }}
+          CALL_DELAY_MS: ${{ inputs.call_delay_ms }}
+        run: node talabat/uae/scrape-restaurant-details-test.js
