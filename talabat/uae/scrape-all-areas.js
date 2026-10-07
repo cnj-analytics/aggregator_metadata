@@ -26,8 +26,6 @@
 //   PAGE_DELAY_MS       intra-area page pacing (default 1100)
 //   AREA_DELAY_MS       between-area pacing (default 2000)
 //   MAX_PAGES_PER_AREA  safety cap (default 50)
-//   WORKER_INDEX        parallel worker id, 0..WORKER_COUNT-1 (default 0)
-//   WORKER_COUNT        total parallel workers (default 1)
 
 const START_FROM = parseInt(process.env.START_FROM || '0', 10);
 const LIMIT_AREAS = process.env.LIMIT_AREAS ? parseInt(process.env.LIMIT_AREAS, 10) : null;
@@ -36,10 +34,6 @@ const AREA_DELAY_MS = parseInt(process.env.AREA_DELAY_MS || '2000', 10);
 const MAX_PAGES_PER_AREA = parseInt(process.env.MAX_PAGES_PER_AREA || '50', 10);
 const PAGE_SIZE = 1000;
 
-// Parallel worker partitioning. Set WORKER_COUNT=3 and WORKER_INDEX=0/1/2
-// across three separate GitHub Actions jobs (matrix strategy) to split the
-// 497 areas three ways. Each job runs on its own fresh VM = its own IP, so
-// combined request rate still looks like 3 independent clients to Talabat.
 const WORKER_COUNT = parseInt(process.env.WORKER_COUNT || '1', 10);
 const WORKER_INDEX = parseInt(process.env.WORKER_INDEX || '0', 10);
 if (WORKER_INDEX < 0 || WORKER_INDEX >= WORKER_COUNT) {
@@ -193,11 +187,13 @@ function flattenVendor(v, areaId) {
   };
 }
 
-async function upsertBatch(rows, areaId) {
-  if (rows.length === 0) return 0;
+const UPSERT_CHUNK = 250;
+const UPSERT_MAX_RETRIES = 5;
+
+async function upsertChunk(chunk, areaId) {
   const payload = {
     p_area_id: areaId,
-    p_rows: rows.map((r) => ({
+    p_rows: chunk.map((r) => ({
       bid: r.bid,
       chain_id: r.chain_id,
       chain_name: r.chain_name,
@@ -212,8 +208,30 @@ async function upsertBatch(rows, areaId) {
       raw_json: r.raw_json,
     })),
   };
-  await supabaseRpc('talabat_queue_upsert', payload);
-  return rows.length;
+  for (let attempt = 1; attempt <= UPSERT_MAX_RETRIES; attempt++) {
+    try {
+      await supabaseRpc('talabat_queue_upsert', payload);
+      return chunk.length;
+    } catch (e) {
+      const retriable = /40P01|deadlock|57014|statement timeout|timeout|503|504/i.test(e.message);
+      if (!retriable || attempt === UPSERT_MAX_RETRIES) throw e;
+      const backoff = 300 * attempt + Math.floor(Math.random() * 500);
+      console.error(`    upsert attempt ${attempt} failed (${e.message.slice(0, 80)}), retry in ${backoff}ms`);
+      await sleep(backoff);
+    }
+  }
+  return 0;
+}
+
+async function upsertBatch(rows, areaId) {
+  if (rows.length === 0) return 0;
+  const sorted = [...rows].sort((a, b) => (a.bid < b.bid ? -1 : a.bid > b.bid ? 1 : 0));
+  let total = 0;
+  for (let i = 0; i < sorted.length; i += UPSERT_CHUNK) {
+    const chunk = sorted.slice(i, i + UPSERT_CHUNK);
+    total += await upsertChunk(chunk, areaId);
+  }
+  return total;
 }
 
 async function scrapeArea(area) {
@@ -221,18 +239,21 @@ async function scrapeArea(area) {
   let vendors_total = 0;
   let upserted_total = 0;
   let pages_fetched = 0;
+  let page_upsert_failures = 0;
+  let page_fetch_failures = 0;
 
   for (let page = 1; page <= MAX_PAGES_PER_AREA; page++) {
     let resp;
     try {
       resp = await fetchListingPage(lat, lng, areaId, page);
     } catch (e) {
-      console.error(`    page ${page} failed: ${e.message} — retrying in 5s`);
+      console.error(`    page ${page} fetch failed: ${e.message} — retrying in 5s`);
       await sleep(5000);
       try {
         resp = await fetchListingPage(lat, lng, areaId, page);
       } catch (e2) {
-        console.error(`    page ${page} retry failed: ${e2.message} — giving up on this area`);
+        console.error(`    page ${page} fetch retry failed: ${e2.message} — giving up on this area`);
+        page_fetch_failures++;
         break;
       }
     }
@@ -246,7 +267,8 @@ async function scrapeArea(area) {
       try {
         upserted_total += await upsertBatch(flatRows, areaId);
       } catch (e) {
-        console.error(`    upsert failed for page ${page}: ${e.message}`);
+        console.error(`    upsert FINAL failure (after retries) for page ${page}: ${e.message}`);
+        page_upsert_failures++;
       }
     }
 
@@ -254,7 +276,7 @@ async function scrapeArea(area) {
     await sleep(PAGE_DELAY_MS);
   }
 
-  return { pages_fetched, vendors_total, upserted_total };
+  return { pages_fetched, vendors_total, upserted_total, page_upsert_failures, page_fetch_failures };
 }
 
 async function main() {
@@ -277,21 +299,16 @@ async function main() {
     .filter((a) => a.area_id >= START_FROM)
     .slice(0, LIMIT_AREAS ?? areas.length);
 
-  // Round-robin partition: worker i handles the i-th, (i+N)-th, (i+2N)-th
-  // elements of the filtered list. Spreads dense Dubai areas evenly across
-  // workers so one job doesn't carry all the heavy lifts.
   const toProcess =
     WORKER_COUNT > 1
       ? filtered.filter((_, i) => i % WORKER_COUNT === WORKER_INDEX)
       : filtered;
 
-  console.log(
-    `Will process ${toProcess.length} areas (worker ${WORKER_INDEX + 1}/${WORKER_COUNT}, ` +
-      `first=${toProcess[0]?.area_id} last=${toProcess[toProcess.length - 1]?.area_id})`,
-  );
+  console.log(`Will process ${toProcess.length} areas (worker ${WORKER_INDEX + 1}/${WORKER_COUNT}, first=${toProcess[0]?.area_id} last=${toProcess[toProcess.length - 1]?.area_id})`);
   console.log('');
 
   let totals = { pages_fetched: 0, vendors_total: 0, upserted_total: 0 };
+  const dirtyAreas = [];
 
   for (let i = 0; i < toProcess.length; i++) {
     const area = toProcess[i];
@@ -304,22 +321,48 @@ async function main() {
       totals.upserted_total += r.upserted_total;
       const elapsed = ((Date.now() - t1) / 1000).toFixed(1);
       const totalMin = ((Date.now() - t0) / 1000 / 60).toFixed(1);
-      console.log(
-        `[${i + 1}/${toProcess.length}] area_id=${area.area_id} (${area.area_name}): ` +
-          `${r.pages_fetched}p ${r.vendors_total}v upserted=${r.upserted_total} ${elapsed}s | ` +
-          `totals: ${totals.vendors_total}v ${totalMin}min elapsed`,
-      );
+      const dirty = (r.page_upsert_failures || 0) + (r.page_fetch_failures || 0);
+      const dirtyNote = dirty ? ` [FAIL u=${r.page_upsert_failures} f=${r.page_fetch_failures}]` : '';
+      if (dirty > 0) dirtyAreas.push(area);
+      console.log(`[${i + 1}/${toProcess.length}] area_id=${area.area_id} (${area.area_name}): ${r.pages_fetched}p ${r.vendors_total}v upserted=${r.upserted_total} ${elapsed}s${dirtyNote} | totals: ${totals.vendors_total}v ${totalMin}min elapsed`);
     } catch (e) {
       console.error(`[${i + 1}/${toProcess.length}] area_id=${area.area_id} FATAL: ${e.message}`);
+      dirtyAreas.push(area);
     }
 
     if (i < toProcess.length - 1) await sleep(AREA_DELAY_MS);
   }
 
+  if (dirtyAreas.length > 0) {
+    console.log('');
+    console.log(`=== RETRY PASS: ${dirtyAreas.length} areas had failures, re-running ===`);
+    const stillDirty = [];
+    for (let i = 0; i < dirtyAreas.length; i++) {
+      const area = dirtyAreas[i];
+      try {
+        const r = await scrapeArea(area);
+        const d = (r.page_upsert_failures || 0) + (r.page_fetch_failures || 0);
+        const note = d ? ` STILL FAIL u=${r.page_upsert_failures} f=${r.page_fetch_failures}` : ' clean';
+        if (d > 0) stillDirty.push(area);
+        console.log(`  retry [${i + 1}/${dirtyAreas.length}] area_id=${area.area_id} (${area.area_name}): ${r.pages_fetched}p ${r.vendors_total}v upserted=${r.upserted_total}${note}`);
+      } catch (e) {
+        console.error(`  retry [${i + 1}/${dirtyAreas.length}] area_id=${area.area_id} FATAL: ${e.message}`);
+        stillDirty.push(area);
+      }
+      await sleep(AREA_DELAY_MS);
+    }
+    if (stillDirty.length > 0) {
+      console.log('');
+      console.log(`${stillDirty.length} areas STILL have failures after retry:`);
+      for (const a of stillDirty) console.log(`     area_id=${a.area_id} (${a.area_name})`);
+    } else {
+      console.log('All dirty areas recovered on retry.');
+    }
+  }
+
   const totalMin = ((Date.now() - t0) / 1000 / 60).toFixed(1);
   console.log('');
-  console.log('=== WORKER DONE ===');
-  console.log(`Worker:          ${WORKER_INDEX + 1}/${WORKER_COUNT}`);
+  console.log('=== SWEEP COMPLETE ===');
   console.log(`Areas processed: ${toProcess.length}`);
   console.log(`Pages fetched:   ${totals.pages_fetched}`);
   console.log(`Vendors seen:    ${totals.vendors_total}`);
@@ -327,7 +370,4 @@ async function main() {
   console.log(`Elapsed:         ${totalMin} min`);
 }
 
-main().catch((e) => {
-  console.error('FATAL:', e);
-  process.exit(1);
-});
+main().catch((e) => { console.error('FATAL:', e); process.exit(1); });
