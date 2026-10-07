@@ -92,6 +92,27 @@ function cdnUrl(filename) {
   return TALABAT_CDN_PREFIX + filename;
 }
 
+// Coerce to integer, or null. Talabat sometimes returns things like
+// "10-20 mins" in fields the schema expects as ints (e.g. dtim), which
+// otherwise 400s the whole batch at the RPC.
+function toInt(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? Math.trunc(v) : null;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : null;
+}
+function toNum(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function toBool(v) {
+  if (v === true || v === 1 || v === '1' || v === 'true') return true;
+  if (v === false || v === 0 || v === '0' || v === 'false') return false;
+  return null;
+}
+
 function pickFirst(obj, paths) {
   for (const p of paths) {
     let cur = obj;
@@ -149,37 +170,43 @@ function buildRow(bid, menuApiUrl, result) {
   const offers = result.parsed?.offers || result.parsed?.vendor?.result?.offers || [];
   const config = result.parsed?.config || result.parsed?.vendor?.result?.config || null;
 
+  // Talabat's `dtim` is often a text range like "10-20 mins", so stash the
+  // raw string on delivery_time_text if we didn't get a numeric minutes.
+  const dtimRaw = r.dtim;
+  const dtimInt = toInt(dtimRaw);
+  const dtxt = r.dtxt || r.delivery_text || (typeof dtimRaw === 'string' ? dtimRaw : null);
+
   return {
     ...base,
-    chain_id: r.id || r.chainId || r.chain_id || null,
+    chain_id: toInt(r.id || r.chainId || r.chain_id),
     name: r.na || r.name || null,
     branch_name: r.bna || r.branch_name || null,
     brand_legal_name: r.brandLegalName || null,
-    latitude: r.lat || r.latitude || null,
-    longitude: r.lon || r.longitude || r.lng || null,
+    latitude: toNum(r.lat || r.latitude),
+    longitude: toNum(r.lon || r.longitude || r.lng),
     address: r.addr || r.address || null,
     area_name: r.an || r.area_name || null,
-    rating: r.rat || r.rating || null,
-    ratings_count_text: r.trt || null,
-    unified_rating_count: r.unified_rating?.count || null,
-    delivery_charge: r.dch != null ? r.dch : null,
-    service_fees: r.serviceFees != null ? r.serviceFees : null,
-    service_fees_cap_min: r.serviceFeesCapMin,
-    service_fees_cap_max: r.serviceFeesCapMax,
-    service_fees_type: r.serviceFeesType || null,
-    service_fees_setup_val: r.serviceFeesSetupValue,
-    minimum_order: r.mna != null ? r.mna : null,
+    rating: toNum(r.rat || r.rating),
+    ratings_count_text: r.trt == null ? null : String(r.trt),
+    unified_rating_count: r.unified_rating?.count == null ? null : String(r.unified_rating.count),
+    delivery_charge: toNum(r.dch),
+    service_fees: toNum(r.serviceFees),
+    service_fees_cap_min: toNum(r.serviceFeesCapMin),
+    service_fees_cap_max: toNum(r.serviceFeesCapMax),
+    service_fees_type: r.serviceFeesType == null ? null : String(r.serviceFeesType),
+    service_fees_setup_val: toNum(r.serviceFeesSetupValue),
+    minimum_order: toNum(r.mna),
     cuisines: Array.isArray(r.cus) ? r.cus : null,
     logo_url: cdnUrl(r.lg || r.images?.logo || r.logoUrl),
     banner_url: cdnUrl(r.gtl || r.images?.heroBanner || r.coverPhoto),
     slug: r.sl || r.slug || null,
     status_description: r.status_description || null,
-    status_int: r.stt != null ? r.stt : null,
-    is_talabat_pro: r.isTalabatPro != null ? r.isTalabatPro : r.is_tpro,
-    delivery_time_minutes: r.dtim != null ? r.dtim : null,
-    delivery_time_text: r.dtxt || r.delivery_text || null,
-    time_estimation: r.time_estimation || null,
-    vertical_type: r.verticalType || null,
+    status_int: toInt(r.stt),
+    is_talabat_pro: toBool(r.isTalabatPro != null ? r.isTalabatPro : r.is_tpro),
+    delivery_time_minutes: dtimInt,
+    delivery_time_text: dtxt,
+    time_estimation: r.time_estimation == null ? null : (typeof r.time_estimation === 'string' ? r.time_estimation : String(r.time_estimation)),
+    vertical_type: r.verticalType == null ? null : String(r.verticalType),
     menu_sections_count: sections,
     menu_items_total: items,
     offers_count: Array.isArray(offers) ? offers.length : null,
