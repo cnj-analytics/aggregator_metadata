@@ -72,47 +72,35 @@ async function supabaseRpc(fn, body) {
 }
 
 // --- Talabat listing fetch --------------------------------------------------
+// Headers per the verified mobile-API scraping brief. Do NOT add extra
+// headers (Perseus, X-FP-API-KEY, Latitude, Longitude, Origin, Referer) —
+// doing so triggers DEVICE_BLOCKED. The server validates on the specific
+// Flutter-app header set below.
 
-const { randomUUID } = require('crypto');
-
-// One Perseus client id per process; session id is derived from it.
-const PERSEUS_CLIENT_ID = randomUUID();
-const PERSEUS_SESSION_ID = `${randomUUID()}.1`;
-
-function talabatHeaders(lat, lng) {
-  // Delivery Hero / Talabat APIs reject requests whose claimed location
-  // (URL path lat/lng) doesn't match the Latitude/Longitude request headers,
-  // and also require a Perseus client/session fingerprint. Without these,
-  // the API returns 403 DEVICE_BLOCKED even with the right User-Agent.
-  return {
-    'User-Agent':
-      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) ' +
-      'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1',
-    'Accept': 'application/json',
-    'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-    'Origin': 'https://www.talabat.com',
-    'Referer': 'https://www.talabat.com/',
-    'appbrand': '1',
-    'x-country': 'ae',
-    'tokentypekey': 'guest',
-    'http2-enabled': 'true',
-    'Content-Length': '0',
-    // Location-match headers
-    'Latitude': String(lat),
-    'Longitude': String(lng),
-    // Delivery Hero common
-    'X-FP-API-KEY': 'volo',
-    'Perseus-Client-Id': PERSEUS_CLIENT_ID,
-    'Perseus-Session-Id': PERSEUS_SESSION_ID,
-  };
-}
+const TALABAT_HEADERS = {
+  'User-Agent': 'talabat/8701 CFNetwork/3896.100.1.2.1 Darwin/27.0.0',
+  'Accept': '*/*',
+  'Accept-Language': 'en-US',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'appbrand': '1',
+  'x-country': 'ae',
+  'x-app-version': '13.93.0',
+  'x-device-version': '13.93.0',
+  'x-device-source': '4',
+  'x-device-framework': 'flutter',
+  'x-marshmallow-version': 'mm3',
+  'http2-enabled': 'true',
+  'tokentypekey': 'jwt',
+  'Content-Length': '0',
+};
 
 async function fetchListingPage(lat, lng, areaId, page) {
   const url =
     `https://api.talabat.com/vendor-list/v1/composite-list/${lat}/${lng}` +
-    `?countrycode=4&areaid=${areaId}&vertical_id=0&page=${page}&size=${PAGE_SIZE}`;
+    `?countrycode=4&areaid=${areaId}&vertical_id=0&isCustomerPro=false` +
+    `&page=${page}&size=${PAGE_SIZE}`;
 
-  const resp = await fetch(url, { method: 'GET', headers: talabatHeaders(lat, lng) });
+  const resp = await fetch(url, { method: 'GET', headers: TALABAT_HEADERS });
   const text = await resp.text();
   if (!resp.ok) {
     throw new Error(`Talabat ${resp.status}: ${text.slice(0, 500)}`);
@@ -130,11 +118,6 @@ async function fetchListingPage(lat, lng, areaId, page) {
 
 function extractVendors(resp) {
   if (!resp) return [];
-  // Known shapes observed on composite-list:
-  //   resp.vendors
-  //   resp.data.vendors
-  //   resp.result.vendors
-  //   resp.data (array of vendors)
   const candidates = [
     resp.vendors,
     resp?.data?.vendors,
@@ -154,10 +137,7 @@ function pickFirst(obj, paths) {
     let cur = obj;
     let ok = true;
     for (const k of p.split('.')) {
-      if (cur == null) {
-        ok = false;
-        break;
-      }
+      if (cur == null) { ok = false; break; }
       cur = cur[k];
     }
     if (ok && cur !== undefined && cur !== null && cur !== '') return cur;
@@ -184,6 +164,8 @@ function flattenVendor(v, areaId) {
   const latitude = pickFirst(v, ['latitude', 'lat', 'location.latitude']);
   const longitude = pickFirst(v, ['longitude', 'lng', 'lon', 'location.longitude']);
   const imageUrl = pickFirst(v, [
+    'images.logo',
+    'images.heroBanner',
     'logo',
     'image',
     'image_url',
