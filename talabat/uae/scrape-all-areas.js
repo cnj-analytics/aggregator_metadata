@@ -26,6 +26,8 @@
 //   PAGE_DELAY_MS       intra-area page pacing (default 1100)
 //   AREA_DELAY_MS       between-area pacing (default 2000)
 //   MAX_PAGES_PER_AREA  safety cap (default 50)
+//   WORKER_INDEX        parallel worker id, 0..WORKER_COUNT-1 (default 0)
+//   WORKER_COUNT        total parallel workers (default 1)
 
 const START_FROM = parseInt(process.env.START_FROM || '0', 10);
 const LIMIT_AREAS = process.env.LIMIT_AREAS ? parseInt(process.env.LIMIT_AREAS, 10) : null;
@@ -33,6 +35,17 @@ const PAGE_DELAY_MS = parseInt(process.env.PAGE_DELAY_MS || '1100', 10);
 const AREA_DELAY_MS = parseInt(process.env.AREA_DELAY_MS || '2000', 10);
 const MAX_PAGES_PER_AREA = parseInt(process.env.MAX_PAGES_PER_AREA || '50', 10);
 const PAGE_SIZE = 1000;
+
+// Parallel worker partitioning. Set WORKER_COUNT=3 and WORKER_INDEX=0/1/2
+// across three separate GitHub Actions jobs (matrix strategy) to split the
+// 497 areas three ways. Each job runs on its own fresh VM = its own IP, so
+// combined request rate still looks like 3 independent clients to Talabat.
+const WORKER_COUNT = parseInt(process.env.WORKER_COUNT || '1', 10);
+const WORKER_INDEX = parseInt(process.env.WORKER_INDEX || '0', 10);
+if (WORKER_INDEX < 0 || WORKER_INDEX >= WORKER_COUNT) {
+  console.error(`Invalid WORKER_INDEX=${WORKER_INDEX} for WORKER_COUNT=${WORKER_COUNT}`);
+  process.exit(1);
+}
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -43,8 +56,6 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// --- Supabase REST helpers --------------------------------------------------
 
 async function supabase(path, method, body = null, extraHeaders = {}) {
   const resp = await fetch(`${SUPABASE_URL}/rest/v1${path}`, {
@@ -67,8 +78,6 @@ async function supabase(path, method, body = null, extraHeaders = {}) {
 async function supabaseRpc(fn, body) {
   return supabase(`/rpc/${fn}`, 'POST', body);
 }
-
-// --- Talabat listing fetch --------------------------------------------------
 
 const TALABAT_HEADERS = {
   'User-Agent': 'talabat/8701 CFNetwork/3896.100.1.2.1 Darwin/27.0.0',
@@ -99,8 +108,6 @@ async function fetchListingPage(lat, lng, areaId, page) {
   }
   return JSON.parse(text);
 }
-
-// --- Vendor extraction ------------------------------------------------------
 
 function extractVendors(resp) {
   if (!resp) return [];
@@ -209,8 +216,6 @@ async function upsertBatch(rows, areaId) {
   return rows.length;
 }
 
-// --- Scrape one area --------------------------------------------------------
-
 async function scrapeArea(area) {
   const { area_id: areaId, latitude: lat, longitude: lng } = area;
   let vendors_total = 0;
@@ -252,11 +257,10 @@ async function scrapeArea(area) {
   return { pages_fetched, vendors_total, upserted_total };
 }
 
-// --- Main orchestrator ------------------------------------------------------
-
 async function main() {
   const t0 = Date.now();
   console.log('Talabat UAE — full-sweep orchestrator');
+  console.log(`WORKER_INDEX=${WORKER_INDEX}  WORKER_COUNT=${WORKER_COUNT}`);
   console.log(`START_FROM=${START_FROM}  LIMIT_AREAS=${LIMIT_AREAS ?? 'all'}`);
   console.log(`PAGE_DELAY_MS=${PAGE_DELAY_MS}  AREA_DELAY_MS=${AREA_DELAY_MS}`);
   console.log('');
@@ -269,10 +273,22 @@ async function main() {
   );
   console.log(`Loaded ${areas.length} areas from talabat_area.`);
 
-  const toProcess = areas
+  const filtered = areas
     .filter((a) => a.area_id >= START_FROM)
     .slice(0, LIMIT_AREAS ?? areas.length);
-  console.log(`Will process ${toProcess.length} areas (first=${toProcess[0]?.area_id} last=${toProcess[toProcess.length - 1]?.area_id})`);
+
+  // Round-robin partition: worker i handles the i-th, (i+N)-th, (i+2N)-th
+  // elements of the filtered list. Spreads dense Dubai areas evenly across
+  // workers so one job doesn't carry all the heavy lifts.
+  const toProcess =
+    WORKER_COUNT > 1
+      ? filtered.filter((_, i) => i % WORKER_COUNT === WORKER_INDEX)
+      : filtered;
+
+  console.log(
+    `Will process ${toProcess.length} areas (worker ${WORKER_INDEX + 1}/${WORKER_COUNT}, ` +
+      `first=${toProcess[0]?.area_id} last=${toProcess[toProcess.length - 1]?.area_id})`,
+  );
   console.log('');
 
   let totals = { pages_fetched: 0, vendors_total: 0, upserted_total: 0 };
@@ -302,7 +318,8 @@ async function main() {
 
   const totalMin = ((Date.now() - t0) / 1000 / 60).toFixed(1);
   console.log('');
-  console.log('=== SWEEP COMPLETE ===');
+  console.log('=== WORKER DONE ===');
+  console.log(`Worker:          ${WORKER_INDEX + 1}/${WORKER_COUNT}`);
   console.log(`Areas processed: ${toProcess.length}`);
   console.log(`Pages fetched:   ${totals.pages_fetched}`);
   console.log(`Vendors seen:    ${totals.vendors_total}`);
