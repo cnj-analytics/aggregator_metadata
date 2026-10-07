@@ -1,0 +1,57 @@
+name: Talabat UAE – Test Menu Endpoint
+
+# One-off smoke test for api.talabat.com/menubff/v4/branches/{bid}/menu.
+# Writes nothing to Supabase. Dumps the raw JSON as a workflow artifact so
+# you can inspect what fields the menu endpoint actually returns.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bid:
+        description: "Talabat branch id (default: 690394 = McDonald's Box park)"
+        required: true
+        type: string
+        default: '690394'
+      area_id:
+        description: 'Delivery area id (default: 1252 Business Bay)'
+        required: false
+        type: string
+        default: '1252'
+      lat:
+        description: 'Delivery latitude (default: Business Bay centroid)'
+        required: false
+        type: string
+        default: '25.184'
+      lng:
+        description: 'Delivery longitude (default: Business Bay centroid)'
+        required: false
+        type: string
+        default: '55.2676'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Hit menu endpoint for bid ${{ inputs.bid }}
+        env:
+          BID: ${{ inputs.bid }}
+          AREA_ID: ${{ inputs.area_id }}
+          LAT: ${{ inputs.lat }}
+          LNG: ${{ inputs.lng }}
+          OUT_DIR: ./out
+        run: node talabat/uae/test-menu-fetch.js
+
+      - name: Upload raw menu JSON as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: talabat-menu-${{ inputs.bid }}-raw
+          path: out/
+          retention-days: 7
