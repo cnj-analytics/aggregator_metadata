@@ -1,0 +1,58 @@
+name: Talabat UAE – Scrape All Areas (Full Sweep)
+
+# Iterates every area in talabat_area serially and upserts every vendor into
+# talabat_restaurant_queue with dedup/area_ids append via the RPC.
+#
+# Timing: ~1.1s/page intra-area + 2s between areas. Expect ~60-120 min for the
+# full 497-area UAE sweep.
+#
+# Manual dispatch only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_from:
+        description: 'Skip areas with area_id < this (for resuming a failed run)'
+        required: false
+        type: string
+        default: '0'
+      limit_areas:
+        description: 'Stop after N areas (blank = all)'
+        required: false
+        type: string
+        default: ''
+      page_delay_ms:
+        description: 'Delay between pages inside an area (ms)'
+        required: false
+        type: string
+        default: '1100'
+      area_delay_ms:
+        description: 'Delay between areas (ms)'
+        required: false
+        type: string
+        default: '2000'
+
+concurrency:
+  group: talabat-uae-scrape-all-areas
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Full UAE sweep
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          START_FROM: ${{ inputs.start_from }}
+          LIMIT_AREAS: ${{ inputs.limit_areas }}
+          PAGE_DELAY_MS: ${{ inputs.page_delay_ms }}
+          AREA_DELAY_MS: ${{ inputs.area_delay_ms }}
+        run: node talabat/uae/scrape-all-areas.js
