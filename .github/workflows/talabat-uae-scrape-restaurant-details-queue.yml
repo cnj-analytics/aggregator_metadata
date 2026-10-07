@@ -1,0 +1,57 @@
+name: Talabat UAE – Scrape Restaurant Details (QUEUE)
+
+# Queue-driven detail scraper. N workers each claim batches from the
+# talabat_restaurant_detail_queue (via FOR UPDATE SKIP LOCKED), scrape, and
+# write back. Supabase manages traffic; GitHub provides the IPs.
+#
+# Default pace: 3 workers x 1.5s/call = 3 fetches/sec total across 3 IPs
+# (~1 req/sec per IP, safely under any 429 threshold).
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_count:
+        description: 'Number of parallel workers (1-6). 3 is the usual pick.'
+        required: true
+        type: string
+        default: '3'
+      batch_size:
+        description: 'How many branches each worker claims per round'
+        required: false
+        type: string
+        default: '25'
+      call_delay_ms:
+        description: 'Delay per worker between menu-endpoint calls (ms)'
+        required: false
+        type: string
+        default: '1500'
+
+concurrency:
+  group: talabat-uae-scrape-restaurant-details-queue
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_index: [0, 1, 2]
+    name: worker ${{ matrix.worker_index }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run worker ${{ matrix.worker_index }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          WORKER_INDEX: ${{ matrix.worker_index }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          CALL_DELAY_MS: ${{ inputs.call_delay_ms }}
+          WALL_LIMIT_SEC: '5100'
+        run: node talabat/uae/scrape-restaurant-details-queue.js
