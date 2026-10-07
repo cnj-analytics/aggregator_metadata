@@ -4,17 +4,13 @@ name: Talabat UAE – Scrape Restaurant Details (QUEUE)
 # talabat_restaurant_detail_queue (via FOR UPDATE SKIP LOCKED), scrape, and
 # write back. Supabase manages traffic; GitHub provides the IPs.
 #
-# Default pace: 3 workers x 1.5s/call = 3 fetches/sec total across 3 IPs
-# (~1 req/sec per IP, safely under any 429 threshold).
+# 6 workers x 1.5s/call = 4 fetches/sec total across 6 IPs
+# (~0.67 req/sec per IP, safely under any 429 threshold).
+# GitHub's 6-hour job limit is the only natural cap.
 
 on:
   workflow_dispatch:
     inputs:
-      worker_count:
-        description: 'Number of parallel workers (1-6). 3 is the usual pick.'
-        required: true
-        type: string
-        default: '3'
       batch_size:
         description: 'How many branches each worker claims per round'
         required: false
@@ -33,11 +29,11 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 95
+    timeout-minutes: 360   # GitHub's hard max; no artificial internal cap
     strategy:
       fail-fast: false
       matrix:
-        worker_index: [0, 1, 2]
+        worker_index: [0, 1, 2, 3, 4, 5]
     name: worker ${{ matrix.worker_index }}
 
     steps:
@@ -53,5 +49,6 @@ jobs:
           WORKER_INDEX: ${{ matrix.worker_index }}
           BATCH_SIZE: ${{ inputs.batch_size }}
           CALL_DELAY_MS: ${{ inputs.call_delay_ms }}
-          WALL_LIMIT_SEC: '5100'
+          # Effectively unlimited; GitHub's 6h job cap is the real stop signal.
+          WALL_LIMIT_SEC: '86400'
         run: node talabat/uae/scrape-restaurant-details-queue.js
