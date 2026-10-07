@@ -145,6 +145,17 @@ function pickFirst(obj, paths) {
   return null;
 }
 
+// Talabat serves logos + hero banners from this Delivery Hero CDN. The raw
+// payload holds just filenames in images.logo / images.heroBanner — we prefix
+// to produce usable URLs. Verified Oct 7 against real talabat.com page.
+const TALABAT_CDN_PREFIX = 'https://images.deliveryhero.io/image/talabat/restaurants/';
+
+function cdnUrl(filename) {
+  if (!filename || typeof filename !== 'string' || filename.trim() === '') return null;
+  if (/^https?:\/\//i.test(filename)) return filename;
+  return TALABAT_CDN_PREFIX + filename;
+}
+
 function flattenVendor(v, areaId) {
   const bid = pickFirst(v, ['bid', 'id', 'branch_id', 'branchId']);
   const chainId = pickFirst(v, [
@@ -163,18 +174,8 @@ function flattenVendor(v, areaId) {
   const branchName = pickFirst(v, ['bna', 'branch_name', 'branchName']);
   const latitude = pickFirst(v, ['latitude', 'lat', 'location.latitude']);
   const longitude = pickFirst(v, ['longitude', 'lng', 'lon', 'location.longitude']);
-  const imageUrl = pickFirst(v, [
-    'images.logo',
-    'images.heroBanner',
-    'logo',
-    'image',
-    'image_url',
-    'imageUrl',
-    'imgs.logo',
-    'imgs.image',
-    'logoUrl',
-    'coverPhoto',
-  ]);
+  const logoFile = pickFirst(v, ['images.logo', 'lg', 'logo']);
+  const bannerFile = pickFirst(v, ['images.heroBanner', 'gtl', 'coverPhoto']);
   const slug = pickFirst(v, ['sl', 'slug', 'uname', 'uri']);
 
   const menuApiUrl =
@@ -197,7 +198,8 @@ function flattenVendor(v, areaId) {
     branch_name: branchName,
     latitude: latitude != null ? Number(latitude) : null,
     longitude: longitude != null ? Number(longitude) : null,
-    image_url: imageUrl,
+    image_url: cdnUrl(logoFile),
+    banner_url: cdnUrl(bannerFile),
     menu_api_url: menuApiUrl,
     web_url: webUrl,
     raw_json: v,
@@ -220,6 +222,7 @@ async function upsertBatch(rows, areaId) {
         latitude: r.latitude,
         longitude: r.longitude,
         image_url: r.image_url,
+        banner_url: r.banner_url,
         menu_api_url: r.menu_api_url,
         web_url: r.web_url,
         raw_json: r.raw_json,
