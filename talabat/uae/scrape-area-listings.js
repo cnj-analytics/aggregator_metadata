@@ -73,22 +73,46 @@ async function supabaseRpc(fn, body) {
 
 // --- Talabat listing fetch --------------------------------------------------
 
-const TALABAT_HEADERS = {
-  'User-Agent': 'talabat/8701 CFNetwork/1498.700.2 Darwin/23.6.0',
-  'appbrand': '1',
-  'x-country': 'ae',
-  'tokentypekey': 'jwt',
-  'http2-enabled': 'true',
-  'Content-Length': '0',
-  'Accept': 'application/json',
-};
+const { randomUUID } = require('crypto');
+
+// One Perseus client id per process; session id is derived from it.
+const PERSEUS_CLIENT_ID = randomUUID();
+const PERSEUS_SESSION_ID = `${randomUUID()}.1`;
+
+function talabatHeaders(lat, lng) {
+  // Delivery Hero / Talabat APIs reject requests whose claimed location
+  // (URL path lat/lng) doesn't match the Latitude/Longitude request headers,
+  // and also require a Perseus client/session fingerprint. Without these,
+  // the API returns 403 DEVICE_BLOCKED even with the right User-Agent.
+  return {
+    'User-Agent':
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) ' +
+      'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1',
+    'Accept': 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+    'Origin': 'https://www.talabat.com',
+    'Referer': 'https://www.talabat.com/',
+    'appbrand': '1',
+    'x-country': 'ae',
+    'tokentypekey': 'guest',
+    'http2-enabled': 'true',
+    'Content-Length': '0',
+    // Location-match headers
+    'Latitude': String(lat),
+    'Longitude': String(lng),
+    // Delivery Hero common
+    'X-FP-API-KEY': 'volo',
+    'Perseus-Client-Id': PERSEUS_CLIENT_ID,
+    'Perseus-Session-Id': PERSEUS_SESSION_ID,
+  };
+}
 
 async function fetchListingPage(lat, lng, areaId, page) {
   const url =
     `https://api.talabat.com/vendor-list/v1/composite-list/${lat}/${lng}` +
     `?countrycode=4&areaid=${areaId}&vertical_id=0&page=${page}&size=${PAGE_SIZE}`;
 
-  const resp = await fetch(url, { method: 'GET', headers: TALABAT_HEADERS });
+  const resp = await fetch(url, { method: 'GET', headers: talabatHeaders(lat, lng) });
   const text = await resp.text();
   if (!resp.ok) {
     throw new Error(`Talabat ${resp.status}: ${text.slice(0, 500)}`);
