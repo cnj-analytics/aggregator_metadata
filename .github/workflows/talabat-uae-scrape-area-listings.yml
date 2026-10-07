@@ -1,0 +1,60 @@
+name: Talabat UAE – Scrape Area Listings (Trial)
+
+# Hits Talabat's vendor-list endpoint for a single area and upserts every vendor
+# into talabat_restaurant_queue. Dedup by bid, area_ids appended on re-sighting.
+# Full raw JSON per page uploaded as a workflow artifact for inspection.
+#
+# Manual dispatch only — no cron.
+
+on:
+  workflow_dispatch:
+    inputs:
+      area_id:
+        description: 'Talabat area_id to scrape (default: 1252 Business Bay)'
+        required: true
+        type: string
+        default: '1252'
+      max_pages:
+        description: 'Safety cap on pages fetched'
+        required: false
+        type: string
+        default: '50'
+      page_delay_ms:
+        description: 'Delay between pages (ms)'
+        required: false
+        type: string
+        default: '1100'
+
+concurrency:
+  group: talabat-uae-scrape-area-listings
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Scrape area ${{ inputs.area_id }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          AREA_ID: ${{ inputs.area_id }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+          PAGE_DELAY_MS: ${{ inputs.page_delay_ms }}
+          OUT_DIR: ./out
+        run: node talabat/uae/scrape-area-listings.js
+
+      - name: Upload raw JSON + stats as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: talabat-area-${{ inputs.area_id }}-raw
+          path: out/
+          retention-days: 7
