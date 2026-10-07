@@ -1,26 +1,25 @@
 name: Talabat UAE – Scrape All Areas (Full Sweep)
 
-# Iterates every area in talabat_area serially and upserts every vendor into
+# Iterates every area in talabat_area and upserts every vendor into
 # talabat_restaurant_queue with dedup/area_ids append via the RPC.
 #
-# Timing: ~1.1s/page intra-area + 2s between areas. Expect ~60-120 min for the
-# full 497-area UAE sweep.
+# Uses a matrix strategy to split the 497 areas across 3 parallel workers,
+# each running on its own fresh ubuntu-latest VM (= its own IP). Talabat
+# rate-limits per IP, so 3 workers at 1 req/sec each look like 3 independent
+# clients from Talabat's perspective — no 429 risk.
+#
+# Expected runtime with 3 workers: ~35-45 min (vs 180+ min single-worker).
 #
 # Manual dispatch only.
 
 on:
   workflow_dispatch:
     inputs:
-      start_from:
-        description: 'Skip areas with area_id < this (for resuming a failed run)'
-        required: false
+      worker_count:
+        description: 'Number of parallel workers (match the matrix size below)'
+        required: true
         type: string
-        default: '0'
-      limit_areas:
-        description: 'Stop after N areas (blank = all)'
-        required: false
-        type: string
-        default: ''
+        default: '3'
       page_delay_ms:
         description: 'Delay between pages inside an area (ms)'
         required: false
@@ -40,6 +39,11 @@ jobs:
   sweep:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_index: [0, 1, 2]
+    name: sweep-${{ matrix.worker_index }}
 
     steps:
       - uses: actions/checkout@v4
@@ -47,12 +51,12 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Full UAE sweep
+      - name: Full UAE sweep (worker ${{ matrix.worker_index }}/${{ inputs.worker_count }})
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          START_FROM: ${{ inputs.start_from }}
-          LIMIT_AREAS: ${{ inputs.limit_areas }}
+          WORKER_INDEX: ${{ matrix.worker_index }}
+          WORKER_COUNT: ${{ inputs.worker_count }}
           PAGE_DELAY_MS: ${{ inputs.page_delay_ms }}
           AREA_DELAY_MS: ${{ inputs.area_delay_ms }}
         run: node talabat/uae/scrape-all-areas.js
