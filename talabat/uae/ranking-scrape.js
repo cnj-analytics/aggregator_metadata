@@ -206,7 +206,8 @@ async function processArea({ area, scrape_date, scrape_hour, dry_run }) {
   let httpStatus = null;
   let rank = 0;
 
-  for (let page = 0; page < 50; page++) {   // safety: 50 pages * 1000 = 50k cards
+  // Talabat composite-list is 1-indexed. page=0 silently returns an empty page.
+  for (let page = 1; page <= 50; page++) {   // safety: 50 pages * 1000 = 50k cards
     let fp;
     try {
       fp = await fetchPage(area, page);
@@ -243,12 +244,19 @@ async function processArea({ area, scrape_date, scrape_hour, dry_run }) {
                bytes: totalBytes, fetch_ms: totalFetchMs };
     }
 
-    const cards = parsed?.vendors || parsed?.restaurants || parsed?.vendor_cards ||
-                  parsed?.result?.vendors || parsed?.result?.restaurants || [];
-    const hasMore = parsed?.has_more === true || parsed?.result?.has_more === true;
+    // Vetting found Talabat shuffles the shape across versions; probe the
+    // known paths in priority order (matches scrape-area-full-raw.js).
+    const cards =
+      (Array.isArray(parsed?.vendors)           && parsed.vendors.length           ? parsed.vendors           : null) ||
+      (Array.isArray(parsed?.data?.vendors)     && parsed.data.vendors.length      ? parsed.data.vendors      : null) ||
+      (Array.isArray(parsed?.result?.vendors)   && parsed.result.vendors.length    ? parsed.result.vendors    : null) ||
+      (Array.isArray(parsed?.restaurants)       && parsed.restaurants.length       ? parsed.restaurants       : null) ||
+      (Array.isArray(parsed?.data?.restaurants) && parsed.data.restaurants.length  ? parsed.data.restaurants  : null) ||
+      [];
+    const hasMore = parsed?.has_more === true || parsed?.result?.has_more === true || parsed?.data?.has_more === true;
 
     if (!Array.isArray(cards) || cards.length === 0) {
-      if (page === 0) {
+      if (page === 1) {
         // Area has no vendors at all
         return { status: 'not_found', http_status: fp.status, error: null,
                  cards: 0, ranking_rows: 0, pending_rows: 0,
