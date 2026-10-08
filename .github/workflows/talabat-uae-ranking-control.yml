@@ -9,8 +9,9 @@ name: Talabat UAE – Ranking Control
 # Supabase settings control whether the schedule is honored.
 
 on:
-  schedule:
-    - cron: '0 * * * *'   # every hour at :00 UTC
+  # Hourly schedule is driven by pg_cron (talabat-ranking-hourly), not GitHub.
+  # Supabase calls talabat_ranking_run_begin() directly at :15 UTC, which then
+  # dispatches workers via pg_net. This file is kept only for manual kicks.
   workflow_dispatch:
     inputs:
       trigger:
