@@ -1,0 +1,72 @@
+name: Talabat UAE – Scrape Area Full-Raw (TEST)
+
+# One-off vetting scrape. Pulls every page of the Talabat composite-list for a
+# single area and captures every vendor card + every top-level non-vendor
+# section into talabat_test_bb_* tables for inspection.
+# Default area = Business Bay (1252).
+
+on:
+  workflow_dispatch:
+    inputs:
+      area_id:
+        description: 'talabat_area.area_id (default 1252 = Business Bay)'
+        required: false
+        type: string
+        default: '1252'
+      lat:
+        description: 'Latitude'
+        required: false
+        type: string
+        default: '25.184'
+      lng:
+        description: 'Longitude'
+        required: false
+        type: string
+        default: '55.2676'
+      vertical_id:
+        description: '0 = restaurants (default), 2 = grocery, etc.'
+        required: false
+        type: string
+        default: '0'
+      page_size:
+        description: 'Page size for composite-list'
+        required: false
+        type: string
+        default: '1000'
+      call_delay_ms:
+        description: 'Delay between page fetches (ms)'
+        required: false
+        type: string
+        default: '1500'
+      max_pages:
+        description: 'Safety cap on page count'
+        required: false
+        type: string
+        default: '50'
+
+concurrency:
+  group: talabat-uae-scrape-area-full-raw
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Scrape area full-raw
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          AREA_ID: ${{ inputs.area_id }}
+          LAT: ${{ inputs.lat }}
+          LNG: ${{ inputs.lng }}
+          VERTICAL_ID: ${{ inputs.vertical_id }}
+          PAGE_SIZE: ${{ inputs.page_size }}
+          CALL_DELAY_MS: ${{ inputs.call_delay_ms }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+        run: node talabat/uae/scrape-area-full-raw.js
