@@ -1,0 +1,45 @@
+name: Talabat UAE – Ranking Export (daily)
+
+# Copies finished hours of talabat_ranking_analysis to the Analytics Bucket
+# (talabat-ranking-archive, Iceberg table talabat.ranking_analysis) and records each
+# verified hour in talabat_ranking_export_log. The ranking-control's housekeeping step
+# then drops hour partitions older than 24h that have a verified export.
+#
+# Schedule: 02:00 Dubai = 22:00 UTC (prior day). Talabat has no scrape pause, so this
+# just picks a low-traffic hour.
+on:
+  schedule:
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (list the hours that would be exported; write nothing)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: talabat-uae-ranking-export
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --quiet "pyiceberg[pyarrow]==0.12.0" "psycopg[binary]==3.3.6"
+      - name: Export finished hours
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_S3_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          SUPABASE_S3_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          SUPABASE_S3_REGION: ap-southeast-2
+          ANALYTICS_BUCKET: talabat-ranking-archive
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: python talabat/uae/ranking-export.py
