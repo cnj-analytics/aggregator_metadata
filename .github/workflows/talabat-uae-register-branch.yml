@@ -1,0 +1,54 @@
+name: Talabat UAE – Register Branch
+
+# Drains talabat_partner_registration_queue. Fired by Supabase trigger
+# (talabat_dispatch_registration) whenever rows land in the queue, throttled
+# to one dispatch per 60s. May also be dispatched manually to catch up.
+#
+# A small matrix (3 workers) gives us three IPs across the batch. The RPC
+# claim uses FOR UPDATE SKIP LOCKED, so no two workers get the same row.
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_count:
+        description: 'parallel workers (1-6, usually 3)'
+        required: false
+        type: string
+        default: '3'
+      batch_size:
+        description: 'rows claimed per round per worker'
+        required: false
+        type: string
+        default: '25'
+      call_delay_ms:
+        description: 'delay per worker between menu fetches (ms)'
+        required: false
+        type: string
+        default: '1500'
+
+concurrency:
+  group: talabat-uae-register-branch
+  cancel-in-progress: false
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_index: [0, 1, 2]
+    name: register worker ${{ matrix.worker_index }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Register-branch worker ${{ matrix.worker_index }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          BATCH_SIZE:    ${{ inputs.batch_size || '25' }}
+          CALL_DELAY_MS: ${{ inputs.call_delay_ms || '1500' }}
+          WALL_LIMIT_SEC: '5100'
+        run: node talabat/uae/register-branch.js

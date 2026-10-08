@@ -1,0 +1,52 @@
+name: Talabat UAE – Ranking Control
+
+# One hourly job that asks Supabase to start a ranking run. The RPC
+# (talabat_ranking_run_begin) does everything else: creates the hour
+# partition, housekeeping, dispatches concurrent_machines workers via
+# the ranking-scrape workflow.
+#
+# Dubai is UTC+4; this schedule stays simple at every hour top-of-hour.
+# Supabase settings control whether the schedule is honored.
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # every hour at :00 UTC
+  workflow_dispatch:
+    inputs:
+      trigger:
+        description: 'trigger label (schedule|manual|catchup|test)'
+        required: false
+        type: string
+        default: 'manual'
+      area_ids:
+        description: 'comma-separated area_ids (empty = all active)'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'true = workers skip the save (fetch+parse only)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: talabat-uae-ranking-control
+  cancel-in-progress: false
+
+jobs:
+  begin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run control
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TRIGGER:  ${{ inputs.trigger || 'schedule' }}
+          AREA_IDS: ${{ inputs.area_ids || '' }}
+          DRY_RUN:  ${{ inputs.dry_run && 'true' || 'false' }}
+        run: node talabat/uae/ranking-control.js
