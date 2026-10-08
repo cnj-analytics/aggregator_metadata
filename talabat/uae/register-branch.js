@@ -148,7 +148,10 @@ async function processOne(row) {
   }
 
   try {
-    const r = await rpc('talabat_register_branch', payload);
+    // RPC signature is talabat_register_branch(p jsonb) — must wrap the
+    // payload as {p: ...} so PostgREST passes it as a single parameter
+    // rather than treating every top-level key as a separate function arg.
+    const r = await rpc('talabat_register_branch', { p: payload });
     return { bid, ok: true, info: r };
   } catch (e) {
     await rpc('talabat_registration_fail', { p_branch_id: bid, p_error: `register: ${e.message}` });
