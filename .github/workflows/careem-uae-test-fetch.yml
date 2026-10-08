@@ -1,0 +1,90 @@
+name: Careem UAE – Test Fetch (one area + N restaurants)
+run-name: Careem test fetch – ${{ inputs.area_name }} (${{ inputs.max_restaurants }} restaurants)
+
+# One-off test workflow that verifies the Proxyman → Supabase token pipeline
+# can be used by GitHub Actions to call Careem's live API end-to-end.
+#
+# Steps the job runs:
+#   1. Pulls the latest Careem guest token from Supabase (careem_token_latest() RPC)
+#   2. Fetches one area's food-discovery-home listing from appengine.careemapis.com
+#   3. Walks the response and fetches up to N restaurant pages
+#   4. Uploads the raw JSON responses as a workflow artifact so you can inspect them
+#
+# If this run succeeds, the token mined on your Mac is fully usable in CI and
+# the real scrapers can be built on the same pattern.
+
+on:
+  workflow_dispatch:
+    inputs:
+      area_name:
+        description: 'Area label (just for the run name)'
+        type: string
+        default: 'Dubai Marina / JBR'
+      lat:
+        description: 'Latitude'
+        type: string
+        default: '25.078033653862'
+      lng:
+        description: 'Longitude'
+        type: string
+        default: '55.153380854808'
+      max_restaurants:
+        description: 'How many restaurant pages to fetch'
+        type: string
+        default: '10'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Careem test fetch
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CAREEM_AREA_NAME: ${{ inputs.area_name }}
+          CAREEM_LAT: ${{ inputs.lat }}
+          CAREEM_LNG: ${{ inputs.lng }}
+          CAREEM_MAX_RESTAURANTS: ${{ inputs.max_restaurants }}
+        run: |
+          set -euo pipefail
+          node careem/uae/test-fetch.js | tee run.log
+
+      - name: Build job summary
+        if: always()
+        run: |
+          set +e
+          out_dir="$(ls -dt careem/uae/out/* 2>/dev/null | head -1)"
+          {
+            echo "## Careem test fetch – ${{ inputs.area_name }}"
+            echo
+            if [ -f "$out_dir/00-summary.json" ]; then
+              echo "### Summary"
+              echo '```json'
+              cat "$out_dir/00-summary.json"
+              echo '```'
+            else
+              echo "### No summary written — check logs below"
+            fi
+            echo
+            echo "### Run log (tail)"
+            echo '```'
+            tail -80 run.log 2>/dev/null || echo '(no log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload raw responses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: careem-test-fetch-${{ github.run_id }}
+          path: careem/uae/out/
+          if-no-files-found: warn
+          retention-days: 7
