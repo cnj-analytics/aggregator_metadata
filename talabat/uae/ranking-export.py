@@ -73,8 +73,19 @@ COLUMNS = [
 ARROW_SCHEMA = pa.schema([pa.field(n, t, nullable=nl) for n, t, nl in COLUMNS])
 
 # Enums exported as text (operating_status, sponsored_category).
+# talabat_rating has mixed precision in Postgres (scale 0 to 14 — server-side
+# averaged ratings) which breaks Arrow decimal(3,1) rescaling. Round to 1
+# decimal in SQL so Arrow sees clean values.
 ENUM_COLS = {"talabat_operating_status", "talabat_sponsored_category"}
-SELECT_LIST = ", ".join(f"{n}::text" if n in ENUM_COLS else n for n, _, _ in COLUMNS)
+
+def _project(name):
+    if name in ENUM_COLS:
+        return f"{name}::text"
+    if name == "talabat_rating":
+        return "round(talabat_rating, 1)::numeric(3,1) as talabat_rating"
+    return name
+
+SELECT_LIST = ", ".join(_project(n) for n, _, _ in COLUMNS)
 
 summary_lines = []
 
