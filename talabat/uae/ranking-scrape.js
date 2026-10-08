@@ -271,6 +271,11 @@ async function processArea({ area, scrape_date, scrape_hour, dry_run }) {
       if (row) rows.push(row);
       collectCuisines(c, cuisinesByName);
     }
+    // The composite-list places sponsored (CPC) copies alongside the organic
+    // listing, so one bid can appear twice. Dedupe keeping the first (lowest
+    // rank, which is the sponsored copy — that's where the user actually sees
+    // the vendor first). Done AFTER rank numbering so ranks reflect the full
+    // visible list before collapse.
 
     if (!hasMore && cards.length < PAGE_SIZE) break;
     await sleep(PAGE_DELAY_MS);
@@ -308,6 +313,20 @@ async function processArea({ area, scrape_date, scrape_hour, dry_run }) {
     return result;
   }
 
+  // Dedupe by bid, keeping first-seen (lowest rank).
+  const seenBid = new Set();
+  const dedupedRows = [];
+  let duplicates = 0;
+  for (const row of rows) {
+    const bid = row[0];
+    if (seenBid.has(bid)) { duplicates++; continue; }
+    seenBid.add(bid);
+    dedupedRows.push(row);
+  }
+  if (duplicates > 0) {
+    console.log(`  dedupe: ${duplicates} duplicate bids collapsed (sponsored + organic)`);
+  }
+
   const cuisines = Array.from(cuisinesByName.values());
   let saved;
   try {
@@ -316,7 +335,7 @@ async function processArea({ area, scrape_date, scrape_hour, dry_run }) {
       p_date:     scrape_date,
       p_hour:     scrape_hour,
       p_rows:     [],              // we pass everything through pending; see note above
-      p_pending:  rows,
+      p_pending:  dedupedRows,
       p_cuisines: cuisines,
     });
   } catch (e) {
