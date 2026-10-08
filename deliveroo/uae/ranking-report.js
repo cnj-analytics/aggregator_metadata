@@ -24,16 +24,18 @@ const total429 = areas.reduce((t, a) => t + (Number(a.rate_limits) || 0), 0);
 areas.splice(0, areas.length, ...areas.filter(a => !/^requeued_/.test(a.status || '')));
 const ok = areas.filter(a => /^ok/.test(a.status || ''));
 const failed = areas.filter(a => !/^ok/.test(a.status || ''));
+const htmlFallback = areas.filter(a => a.html_fallback_used);
 const mb = b => (b / 1048576).toFixed(1);
 
 let md = `## Ranking run ${process.env.RUN_ID || ''} · machine ${process.env.MACHINE_NO || ''}\n\n`;
 md += `Full run log (all machines): Supabase table deliveroo_ranking_run_event / view deliveroo_ranking_run_overview.\n\n`;
-md += `Source: Deliveroo mobile FeedV2 GraphQL (anonymous). card_urls for new partners are constructed from area + name slugs (no HTML fallback needed).\n\n`;
+md += `Source: Deliveroo mobile FeedV2 GraphQL (anonymous). HTML fallback used on ${htmlFallback.length} / ${areas.length} areas (card_url lookup for new partners).\n\n`;
 md += `Areas: ${areas.length} (ok ${ok.length} · failed ${failed.length})\n\n`;
 md += `| Total | Value |\n|---|---|\n`;
 md += `| Cards read | ${sum('cards')} |\n| Ranking rows | ${sum('ranking_rows')} |\n| Pending rows (unknown partners) | ${sum('pending_rows')} |\n`;
 md += `| Rows replaced (same hour re-run) | ${sum('replaced_rows')} |\n`;
 md += `| Partners queued for registration | ${sum('queued_partners')} |\n| Delivery-area pairs added | ${sum('delivery_pairs_added')} |\n`;
+md += `| HTML fallback – card_urls resolved | ${sum('html_fallback_filled')} |\n`;
 md += `| Branch images updated | ${sum('images_updated')} |\n| Rank gaps | ${sum('rank_gaps')} |\n| Duplicate cards dropped | ${sum('duplicate_partners')} |\n`;
 md += `| Downloaded | ${mb(sum('bytes'))} MB |\n| 429s | ${total429} |\n\n`;
 
@@ -58,8 +60,9 @@ md += imgs.length
     imgs.map(x => `| ${x.area} | ${x.name || x.partner} | ${x.stored || '(none)'} | ${x.card} |`).join('\n') + '\n\n'
   : 'None.\n\n';
 
-md += `### Per area\n\n| Machine | Area | Status | Cards / declared | Ranking | Pending | Sponsored | Pairs + | Images | MB | Fetch s | Total s |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n`;
+md += `### Per area\n\n| Machine | Area | Status | Cards / declared | Ranking | Pending | Sponsored | Pairs + | HTML fb | Images | MB | Fetch s | Total s |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n`;
 for (const a of areas) {
-  md += `| ${a.machine ?? ''} | ${a.area_name || ''} (${a.area_id || ''}) | ${a.status}${a.error ? ` – ${a.error}` : ''} | ${a.cards ?? ''} / ${a.declared_count ?? ''} | ${a.ranking_rows ?? ''} | ${a.pending_rows ?? ''} | ${a.sponsored ?? ''} | ${a.delivery_pairs_added ?? ''} | ${a.images_updated ?? ''} | ${a.bytes ? mb(a.bytes) : ''} | ${a.fetch_ms ? (a.fetch_ms / 1000).toFixed(1) : ''} | ${a.total_ms ? (a.total_ms / 1000).toFixed(1) : ''} |\n`;
+  const htmlFb = a.html_fallback_used ? `${a.html_fallback_filled}/${a.queued_partners}` : '–';
+  md += `| ${a.machine ?? ''} | ${a.area_name || ''} (${a.area_id || ''}) | ${a.status}${a.error ? ` – ${a.error}` : ''} | ${a.cards ?? ''} / ${a.declared_count ?? ''} | ${a.ranking_rows ?? ''} | ${a.pending_rows ?? ''} | ${a.sponsored ?? ''} | ${a.delivery_pairs_added ?? ''} | ${htmlFb} | ${a.images_updated ?? ''} | ${a.bytes ? mb(a.bytes) : ''} | ${a.fetch_ms ? (a.fetch_ms / 1000).toFixed(1) : ''} | ${a.total_ms ? (a.total_ms / 1000).toFixed(1) : ''} |\n`;
 }
 process.stdout.write(md);

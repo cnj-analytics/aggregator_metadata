@@ -35,6 +35,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { parseListing, imageBase } = require('./ranking-parse-mobile');
+const htmlParse = require('./ranking-parse'); // used for card_url lookup on areas with new partners
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -88,35 +89,25 @@ function buildMobileBody(lat, lng) {
   return body;
 }
 
-// Construct the restaurant-page URL from the area URL and the restaurant name.
-// Deliveroo's URL pattern (verified from 15 existing branches, no exceptions):
-//   https://deliveroo.ae/en/menu/{city-slug}/{area-slug}/{name-slug}
-// — no random hash suffix. The city/area slugs come from the stored area URL
-//   (/en/restaurants/{city}/{area}), the name slug from the restaurant name.
-// register-branch.js then fetches that URL to pull brand + branch details.
-function slugifyName(name) {
-  return String(name || '')
-    .toLowerCase()
-    .replace(/&/g, 'and')
-    .replace(/[^\w\s-]/g, '')        // strip punctuation except underscore/dash
-    .replace(/_/g, '-')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
-function parseAreaUrl(areaUrl) {
-  // returns {city, area} slugs, or null on malformed URL
-  try {
-    const u = new URL(String(areaUrl).trim());
-    const m = u.pathname.match(/^\/en\/restaurants\/([^/]+)\/([^/]+)\/?$/);
-    return m ? { city: decodeURIComponent(m[1]).toLowerCase(), area: decodeURIComponent(m[2]).toLowerCase() } : null;
-  } catch (_) { return null; }
-}
-function constructCardUrl(areaCityArea, restaurantName) {
-  if (!areaCityArea || !restaurantName) return '';
-  const slug = slugifyName(restaurantName);
-  if (!slug) return '';
-  return `https://deliveroo.ae/en/menu/${areaCityArea.city}/${areaCityArea.area}/${slug}`;
+// HTML fallback for card_url resolution.
+//
+// Mobile FeedV2 does not include the restaurant-page URL (only the brand name),
+// so the canonical URL slug — which uses the BRANCH name, not the brand — can't
+// be constructed. We get it from the HTML listing, which carries
+// `restaurant_href` directly for every card. One HTML fetch per area that has
+// at least one unknown partner (typically well under 50 per run).
+const HTML_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.5',
+};
+const LISTING_COLLECTIONS = ['restaurants', 'all-restaurants'];
+function toListingUrl(stored) {
+  const u = new URL(String(stored).trim());
+  u.searchParams.delete('collection');
+  for (const c of LISTING_COLLECTIONS) u.searchParams.append('collection', c);
+  return u.toString();
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -225,6 +216,21 @@ async function fetchMobileListing(lat, lng) {
   return { status: null, body: null, error: lastErr };
 }
 
+// Fetch the HTML listing for one area. Used only when the mobile listing has
+// unknown partners (so register-branch has their canonical card_url).
+// Failure is tolerable — unknown partners stay queued with empty card_url
+// and the next hour's probe may fill it in; mobile ranking data for KNOWN
+// partners is already saved either way.
+async function fetchHtmlListing(url) {
+  try {
+    const resp = await fetch(url, { headers: HTML_HEADERS, redirect: 'follow' });
+    if (resp.status !== 200) return { status: resp.status, html: null };
+    return { status: 200, html: await resp.text() };
+  } catch (e) {
+    return { status: null, html: null, error: e.message };
+  }
+}
+
 const rpc = (name, body) => supabase(`/rpc/${name}`, 'POST', body);
 
 // --- Main -------------------------------------------------------------------------
@@ -277,7 +283,7 @@ async function main() {
       delivery_pairs_added: 0, images_updated: 0, rank_gaps: 0, duplicate_partners: 0,
       rated: 0, not_rated: 0, new: 0, open: 0, closed: 0, fast: 0, with_promo: 0, sponsored: 0,
       scope: {}, unknown_promos: {}, anomalies: {}, image_examples: [],
-      source: 'mobile_graphql',
+      source: 'mobile_graphql', html_fallback_used: false, html_fallback_http: null, html_fallback_filled: 0,
       error: null,
     };
 
@@ -316,11 +322,29 @@ async function main() {
       }
       s.rank_gaps = parsed.cards.filter((c, i) => c.row.deliveroo_listing_rank !== i + 1).length;
 
-      // Resolve {city, area} slugs from the stored area URL once per area, so
-      // we can construct the restaurant-page URL for each unknown partner.
-      // See constructCardUrl() for the URL pattern (no random hash suffix).
-      const areaSlugs = parseAreaUrl(area.deliveroo_area_url);
-      if (!areaSlugs) s.anomalies['area_url_unparseable'] = (s.anomalies['area_url_unparseable'] || 0) + 1;
+      // Hybrid HTML fallback: if any card is from an UNKNOWN partner, fetch
+      // the HTML listing once and map partnerId -> canonical card_url
+      // (restaurant_href on each card). HTML covers all partners mobile
+      // sees (and more). Known partners don't need this (they're already
+      // registered). One extra request per area with new discovery.
+      const unknownIds = new Set();
+      for (const c of cards) if (!known.has(c.partnerId)) unknownIds.add(c.partnerId);
+      let urlByPartner = null;
+      if (unknownIds.size > 0 && area.deliveroo_area_url) {
+        const htmlUrl = toListingUrl(area.deliveroo_area_url);
+        const htmlResp = await fetchHtmlListing(htmlUrl);
+        s.html_fallback_used = true;
+        s.html_fallback_http = htmlResp.status;
+        if (htmlResp.html) {
+          try {
+            const h = htmlParse.parseListing(htmlResp.html);
+            if (h.cards) {
+              urlByPartner = new Map(h.cards.filter(x => x.cardUrl).map(x => [x.partnerId, x.cardUrl]));
+              for (const id of unknownIds) if (urlByPartner.has(id)) s.html_fallback_filled++;
+            }
+          } catch (_) { /* non-fatal — register_branch will retry next hour */ }
+        }
+      }
 
       const base = {
         deliveroo_area_id: area.deliveroo_area_id,
@@ -354,11 +378,11 @@ async function main() {
           }
         } else {
           pendingRows.push(row);
-          // Construct the card URL — Deliveroo's URL pattern is deterministic
-          // from (city-slug, area-slug, name-slug), no random hash. If an area
-          // URL couldn't be parsed, we fall back to '' (register-branch will
-          // mark the partner failed; a later retry can use another area).
-          const cardUrl = constructCardUrl(areaSlugs, c.name);
+          // Prefer HTML's canonical href. Empty when HTML didn't have this
+          // partner (mobile-only) or HTML fetch failed; register-branch will
+          // mark those partners failed and a later hour's probe may fill
+          // the URL in once Deliveroo publishes a web page for them.
+          const cardUrl = urlByPartner?.get(c.partnerId) || '';
           queueRows.push({
             deliveroo_branch_partner_id: c.partnerId,
             deliveroo_branch_id: c.branchId,
@@ -436,6 +460,7 @@ async function main() {
         `cards=${s.cards}/${s.declared_count ?? '?'} rank=${s.ranking_rows} pend=${s.pending_rows} ` +
         `spons=${s.sponsored} pairs+${s.delivery_pairs_added} img~${s.images_updated} ` +
         `${(s.bytes / 1048576).toFixed(1)}MB ${s.total_ms}ms` +
+        (s.html_fallback_used ? ` +html(${s.html_fallback_filled}/${s.queued_partners})` : '') +
         (s.error ? `  ERROR ${s.error}` : ''));
     // Keep the summary on disk after every area so a cancelled machine still reports.
     fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries, null, 1));
