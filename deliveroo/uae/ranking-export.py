@@ -61,6 +61,12 @@ COLUMNS = [
     ("deliveroo_partner_has_non_delivery_promo_badge", pa.bool_(), False),
     ("deliveroo_partner_promo_badge_text", pa.string(), True),
     ("deliveroo_partner_promo_scope", pa.string(), True),
+    # Added Oct 2026 — mobile-GraphQL scraper exposes sponsored (promoted) slots
+    # that HTML cannot see. Marked nullable here so Iceberg schema evolution can
+    # add it to the existing table without touching historical rows (which carry
+    # no value for it); the Postgres column is NOT NULL DEFAULT false so new
+    # exports always carry a concrete true/false.
+    ("deliveroo_partner_is_sponsored", pa.bool_(), True),
     ("deliveroo_scraped_at", pa.timestamp("us", tz="UTC"), False),
 ]
 ARROW_SCHEMA = pa.schema([pa.field(n, t, nullable=nl) for n, t, nl in COLUMNS])
@@ -108,9 +114,37 @@ def load_table(name=TABLE, sort_col="deliveroo_branch_partner_id"):
     )
     catalog.create_namespace_if_not_exists(NAMESPACE)
     try:
-        return catalog.load_table((NAMESPACE, name))
+        table = catalog.load_table((NAMESPACE, name))
     except Exception:
-        pass
+        table = None
+    if table is not None:
+        # Schema evolution: add any columns in ARROW_SCHEMA that the Iceberg table doesn't
+        # have yet (idempotent; safe on every call). Columns are added as optional —
+        # Iceberg requires that for additions against existing data, and the overwrite
+        # that follows always carries a concrete value anyway.
+        existing_names = {f.name for f in table.schema().fields}
+        missing = [(n, t) for n, t, _ in COLUMNS if n not in existing_names]
+        if missing:
+            from pyiceberg.types import (
+                BooleanType, StringType, LongType, IntegerType, DateType,
+                TimeType, TimestamptzType, DecimalType,
+            )
+            def pa_to_iceberg(pat):
+                if pa.types.is_boolean(pat):   return BooleanType()
+                if pa.types.is_string(pat):    return StringType()
+                if pa.types.is_int64(pat):     return LongType()
+                if pa.types.is_int32(pat):     return IntegerType()
+                if pa.types.is_date32(pat):    return DateType()
+                if pa.types.is_time(pat):      return TimeType()
+                if pa.types.is_timestamp(pat): return TimestamptzType()
+                if pa.types.is_decimal(pat):   return DecimalType(precision=pat.precision, scale=pat.scale)
+                raise ValueError(f"unmapped pyarrow type: {pat}")
+            with table.update_schema() as upd:
+                for n, pat in missing:
+                    upd.add_column(n, pa_to_iceberg(pat))
+            table = catalog.load_table((NAMESPACE, name))  # reload with new schema
+            print(f"Iceberg schema evolved — added: {', '.join(n for n, _ in missing)}", flush=True)
+        return table
     table = catalog.create_table(
         (NAMESPACE, name),
         schema=ARROW_SCHEMA,
