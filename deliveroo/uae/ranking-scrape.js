@@ -18,18 +18,24 @@
 //   6. deliveroo_ranking_machine_end   – always, when the machine stops for any reason
 //
 // For each area:
-//   1. Fetch the area's full listing page (deliveroo_area.deliveroo_area_url).
-//   2. Read every restaurant card in order -> rank 1..N plus rating, open/closed,
-//      fast tag and promo badge.
+//   1. Fetch Deliveroo's mobile FeedV2 GraphQL endpoint anonymously (lat/lng from
+//      deliveroo_area). ~22% more partners than the HTML path, ~3× faster, and
+//      the response carries sponsored-slot flags that HTML strips out.
+//   2. Read every UICard in order -> rank 1..N plus rating, open/closed, fast tag,
+//      promo badge, and the new is_sponsored flag.
 //   3. Known partners  -> deliveroo_ranking_analysis. Unknown partners -> deliveroo_ranking_pending
-//      + deliveroo_partner_registration_queue. The save call also adds new (partner, area) links.
+//      + deliveroo_partner_registration_queue (with card_url resolved via a single
+//      HTML fallback fetch per area — only when there is at least one unknown).
 //   4. Update deliveroo_branch.deliveroo_branch_image_url when the card image changed.
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, RUN_ID, MACHINE_NO, GITHUB_RUN_ID,
 //      UPDATE_IMAGES ("true" default), SUMMARY_FILE (default summary.json)
 
 const fs = require('fs');
-const { parseListing, imageBase } = require('./ranking-parse');
+const path = require('path');
+const crypto = require('crypto');
+const { parseListing, imageBase } = require('./ranking-parse-mobile');
+const htmlParse = require('./ranking-parse'); // only for the card_url fallback
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -44,12 +50,61 @@ const MAX_RETRIES = 3;          // network errors / 5xx only (429/403 go to Supa
 const RETRY_DELAY_MS = 5000;
 const WRITE_CHUNK = 1000;
 
-const HEADERS = {
+// --- Mobile GraphQL endpoint ------------------------------------------------
+
+const GRAPHQL_URL = 'https://co-m.ae.deliveroo.com/consumer/graphql/';
+const BODY_TEMPLATE_PATH = path.join(__dirname, 'mobile-feedv2-body.json');
+const BODY_TEMPLATE = JSON.parse(fs.readFileSync(BODY_TEMPLATE_PATH, 'utf-8'));
+
+function uuid() { return crypto.randomUUID().toUpperCase(); }
+
+function mobileHeaders() {
+  const guid = uuid();
+  return {
+    'User-Agent': 'Deliveroo-OrderApp/3.342.0 (iPhone18,2; iOS27.0.1; Release; en_US; 697347)',
+    'X-Roo-App-Version': '3.342.0',
+    'X-Roo-Sticky-Guid': guid,
+    'X-Roo-Guid': guid,
+    'X-Roo-Country': 'ae',
+    'X-Roo-Platform': 'iOS',
+    'X-Roo-External-Device-Id': uuid(),
+    'X-Roo-Rooblocks-Version': '5.3.0',
+    'apollographql-client-name': 'com.deliveroo.orderapp-apollo-ios',
+    'apollographql-client-version': '3.342.0-697347',
+    'X-APOLLO-OPERATION-NAME': 'FeedV2',
+    'X-APOLLO-OPERATION-TYPE': 'query',
+    'Accept': 'multipart/mixed;deferSpec=20220824,application/json',
+    'Content-Type': 'application/json',
+    'Accept-Language': 'en-US',
+  };
+}
+
+function buildMobileBody(lat, lng) {
+  const body = JSON.parse(JSON.stringify(BODY_TEMPLATE));
+  if (body.variables?.location) {
+    body.variables.location.lat = lat;
+    body.variables.location.lon = lng;
+  }
+  if (body.variables) body.variables.uuid = uuid();
+  return body;
+}
+
+// HTML fallback for card_url (used only when a listing has unknown partners —
+// register-branch.js needs the restaurant-page URL to register them). One
+// extra fetch per area at most, and only when needed.
+const HTML_HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
   Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.5',
 };
+const LISTING_COLLECTIONS = ['restaurants', 'all-restaurants'];
+function toListingUrl(stored) {
+  const u = new URL(String(stored).trim());
+  u.searchParams.delete('collection');
+  for (const c of LISTING_COLLECTIONS) u.searchParams.append('collection', c);
+  return u.toString();
+}
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log = (...a) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...a);
@@ -105,7 +160,8 @@ async function writeChunks(path, rows, prefer) {
 // --- Compact rows ---------------------------------------------------------------
 // Order must match deliveroo_ranking_save_area_hour:
 // [partner_id, rank, rating_status, rating, rating_count, operating_status, fast_tag,
-//  has_promo, has_free_delivery_promo, has_non_delivery_promo, promo_text, promo_scope]
+//  has_promo, has_free_delivery_promo, has_non_delivery_promo, promo_text, promo_scope,
+//  is_sponsored]                                              ^-- new on mobile path
 function toCompact(r) {
   return [
     r.deliveroo_branch_partner_id,
@@ -120,36 +176,24 @@ function toCompact(r) {
     !!r.deliveroo_partner_has_non_delivery_promo_badge,
     r.deliveroo_partner_promo_badge_text ?? null,
     r.deliveroo_partner_promo_scope ?? null,
+    !!r.deliveroo_partner_is_sponsored,
   ];
 }
 
-// --- Area URL ---------------------------------------------------------------------
-// The full listing needs ?collection=restaurants&collection=all-restaurants. Whatever
-// is stored in deliveroo_area_url, rebuild it to that form: keep the path and any other
-// query parameters, drop any existing collection values, then add the two required ones.
-// Returns { url, fixed } – fixed=true when the stored URL was not already correct.
-const LISTING_COLLECTIONS = ['restaurants', 'all-restaurants'];
-
-function toListingUrl(stored) {
-  const u = new URL(String(stored).trim());
-  const current = u.searchParams.getAll('collection');
-  u.searchParams.delete('collection');
-  for (const c of LISTING_COLLECTIONS) u.searchParams.append('collection', c);
-  const fixed = current.join(',') !== LISTING_COLLECTIONS.join(',');
-  return { url: u.toString(), fixed };
-}
-
-// --- Page fetch -----------------------------------------------------------------
-
+// --- Mobile GraphQL fetch ---------------------------------------------------
 // 429 and 403 are returned straight away (no retry here): Supabase decides what happens next.
-async function fetchPage(url) {
+async function fetchMobileListing(lat, lng) {
   let errors = 0, lastErr = null;
   while (errors <= MAX_RETRIES) {
     try {
-      const resp = await fetch(url, { headers: HEADERS, redirect: 'follow' });
+      const resp = await fetch(GRAPHQL_URL, {
+        method: 'POST',
+        headers: mobileHeaders(),
+        body: JSON.stringify(buildMobileBody(lat, lng)),
+      });
       if (resp.status === 429 || resp.status === 403) {
         await resp.text().catch(() => {});
-        return { status: resp.status, html: null, error: `http_${resp.status}` };
+        return { status: resp.status, body: null, error: `http_${resp.status}` };
       }
       if (resp.status >= 500) {
         errors++; lastErr = `http_${resp.status}`;
@@ -157,15 +201,29 @@ async function fetchPage(url) {
         await sleep(RETRY_DELAY_MS * errors);
         continue;
       }
-      const html = await resp.text();
-      return { status: resp.status, html };
+      const text = await resp.text();
+      return { status: resp.status, body: text };
     } catch (e) {
       errors++; lastErr = e.message;
       if (errors > MAX_RETRIES) break;
       await sleep(RETRY_DELAY_MS * errors);
     }
   }
-  return { status: null, html: null, error: lastErr };
+  return { status: null, body: null, error: lastErr };
+}
+
+// Hybrid HTML fallback: fetched only when unknown partners appear in a listing,
+// so register-branch.js has the card_url it needs. Failure is tolerable — the
+// unknown partner is still queued (without a URL), and the next hour's HTML
+// probe will fill it in.
+async function fetchHtmlListing(url) {
+  try {
+    const resp = await fetch(url, { headers: HTML_HEADERS, redirect: 'follow' });
+    if (resp.status !== 200) return { status: resp.status, html: null };
+    return { status: 200, html: await resp.text() };
+  } catch (e) {
+    return { status: null, html: null, error: e.message };
+  }
 }
 
 const rpc = (name, body) => supabase(`/rpc/${name}`, 'POST', body);
@@ -192,7 +250,7 @@ async function main() {
   const known = new Map(branches.map(b => [b.deliveroo_branch_partner_id, b.deliveroo_branch_image_url]));
   log(`Known partners: ${known.size}`);
 
-  let lastFetchAt = 0, gapSeconds = 20, endReason = 'finished';
+  let gapSeconds = 20, endReason = 'finished';
   for (;;) {
     const c = await rpc('deliveroo_ranking_claim', { p_run_id: RUN_ID, p_machine_no: MACHINE_NO });
     if (c.done) { log(`No more areas for this machine: ${c.reason}`); endReason = c.reason; break; }
@@ -218,54 +276,38 @@ async function main() {
       status: null, http_status: null, bytes: 0, fetch_ms: 0, total_ms: 0, rate_limits: 0,
       declared_count: null, cards: 0, ranking_rows: 0, pending_rows: 0, queued_partners: 0, replaced_rows: 0,
       delivery_pairs_added: 0, images_updated: 0, rank_gaps: 0, duplicate_partners: 0,
-      rated: 0, not_rated: 0, new: 0, open: 0, closed: 0, fast: 0, with_promo: 0,
-      scope: {}, unknown_promos: {}, anomalies: {}, image_examples: [], error: null,
+      rated: 0, not_rated: 0, new: 0, open: 0, closed: 0, fast: 0, with_promo: 0, sponsored: 0,
+      scope: {}, unknown_promos: {}, anomalies: {}, image_examples: [],
+      source: 'mobile_graphql', html_fallback_used: false, html_fallback_filled: 0,
+      error: null,
     };
 
     try {
+      const lat = Number(area.deliveroo_area_latitude);
+      const lng = Number(area.deliveroo_area_longitude);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        throw Object.assign(new Error('area has no latitude/longitude'), { code: 'no_coords' });
+      }
+
       const tf = Date.now();
-      const listing = toListingUrl(area.deliveroo_area_url);
-      s.url_fixed = listing.fixed;
-      if (listing.fixed) log(`  stored URL not in listing format – using ${listing.url}`);
-      let page = await fetchPage(listing.url);
-      lastFetchAt = Date.now();
+      const page = await fetchMobileListing(lat, lng);
       s.fetch_ms = Date.now() - tf;
       s.http_status = page.status;
       if (page.status === 429) { s.rate_limits = 1; throw Object.assign(new Error('http_429'), { code: 'rate_limited' }); }
       if (page.status === 403) throw Object.assign(new Error('http_403'), { code: 'blocked' });
-      if (!page.html) throw Object.assign(new Error(page.error || 'fetch_failed'), { code: 'fetch_failed' });
-      s.bytes = Buffer.byteLength(page.html);
-      // 404 = Deliveroo has no public listing for this area. Not an error: no data this hour.
-      if (page.status === 404) throw Object.assign(new Error('no public listing page (404)'), { code: 'not_found' });
+      if (!page.body) throw Object.assign(new Error(page.error || 'fetch_failed'), { code: 'fetch_failed' });
+      s.bytes = Buffer.byteLength(page.body);
       if (page.status !== 200) throw Object.assign(new Error(`http_${page.status}`), { code: `http_${page.status}` });
 
-      let parsed = parseListing(page.html);
+      const parsed = parseListing(page.body);
       if (parsed.error) throw Object.assign(new Error(parsed.error), { code: parsed.error });
-
-      // Some areas (e.g. JBR) show 0 restaurants at Deliveroo's default point for the area
-      // but a full list at a real address. Retry once at the area's stored geohash.
-      if (parsed.cards.length === 0 && area.deliveroo_area_geohash && !/[?&]geohash=/.test(listing.url)) {
-        const wait = lastFetchAt + gapSeconds * 1000 - Date.now();
-        if (wait > 0) await sleep(wait);
-        const geoUrl = `${listing.url}&geohash=${encodeURIComponent(area.deliveroo_area_geohash)}`;
-        const retry = await fetchPage(geoUrl);
-        lastFetchAt = Date.now();
-        s.geohash_retry = retry.status;
-        if (retry.html && retry.status === 200) {
-          const p2 = parseListing(retry.html);
-          if (!p2.error && p2.cards.length > 0) {
-            page = retry; parsed = p2; s.bytes = Buffer.byteLength(retry.html); s.used_geohash = true;
-            log(`  0 cards at default point – ${p2.cards.length} at stored geohash`);
-          }
-        }
-      }
 
       s.declared_count = parsed.declaredCount;
       s.cards = parsed.cards.length;
       s.unknown_promos = parsed.unknownPromos;
       for (const a of parsed.anomalies) s.anomalies[a] = (s.anomalies[a] || 0) + 1;
 
-      // Duplicates / rank checks
+      // Duplicates / rank checks (ranking-parse-mobile.js already dedupes, but keep the counters)
       const seen = new Set();
       const cards = [];
       for (const c of parsed.cards) {
@@ -273,8 +315,29 @@ async function main() {
         seen.add(c.partnerId);
         cards.push(c);
       }
-      // Ranks come straight from card order, so this should always be 0.
       s.rank_gaps = parsed.cards.filter((c, i) => c.row.deliveroo_listing_rank !== i + 1).length;
+
+      // Hybrid HTML fallback: if any card is from an UNKNOWN partner, fetch the
+      // HTML listing once and map partnerId -> card_url. Known partners don't
+      // need this (they're already registered). This single extra request only
+      // runs on areas with new discovery.
+      const unknownIds = new Set();
+      for (const c of cards) if (!known.has(c.partnerId)) unknownIds.add(c.partnerId);
+      let urlByPartner = null;
+      if (unknownIds.size > 0 && area.deliveroo_area_url) {
+        const htmlUrl = toListingUrl(area.deliveroo_area_url);
+        const htmlResp = await fetchHtmlListing(htmlUrl);
+        s.html_fallback_used = true;
+        if (htmlResp.html) {
+          try {
+            const h = htmlParse.parseListing(htmlResp.html);
+            if (h.cards) {
+              urlByPartner = new Map(h.cards.filter(x => x.cardUrl).map(x => [x.partnerId, x.cardUrl]));
+              for (const id of unknownIds) if (urlByPartner.has(id)) s.html_fallback_filled++;
+            }
+          } catch (_) { /* non-fatal — register_branch will retry next hour */ }
+        }
+      }
 
       const base = {
         deliveroo_area_id: area.deliveroo_area_id,
@@ -292,6 +355,7 @@ async function main() {
         s[r.deliveroo_partner_operating_status]++;
         if (r.deliveroo_partner_fast_tag_visible) s.fast++;
         if (r.deliveroo_partner_has_promo_badge) s.with_promo++;
+        if (r.deliveroo_partner_is_sponsored) s.sponsored++;
         const sc = r.deliveroo_partner_promo_scope || (r.deliveroo_partner_has_promo_badge ? 'unrecognised' : 'no_badge');
         s.scope[sc] = (s.scope[sc] || 0) + 1;
 
@@ -307,11 +371,12 @@ async function main() {
           }
         } else {
           pendingRows.push(row);
+          const cardUrl = urlByPartner?.get(c.partnerId) || '';
           queueRows.push({
             deliveroo_branch_partner_id: c.partnerId,
             deliveroo_branch_id: c.branchId,
             deliveroo_partner_card_name: c.name,
-            deliveroo_partner_card_url: c.cardUrl || '',
+            deliveroo_partner_card_url: cardUrl, // '' when HTML fallback couldn't resolve it
             deliveroo_partner_card_image_url: c.imageUrl,
             deliveroo_area_id: area.deliveroo_area_id,
           });
@@ -360,30 +425,31 @@ async function main() {
         }
       }
       s.status = DRY_RUN ? 'ok_dry_run' : 'ok';
-      if (s.used_geohash) s.status += '_geohash';
     } catch (e) {
       s.status = e.code || 'error';
       s.error = e.message.slice(0, 300);
-      if (s.status === 'not_found') s.error = null;
     }
 
     s.total_ms = Date.now() - t0;
 
     // Report to Supabase: it records the area and decides what this machine does next.
     const outcome = /^ok/.test(s.status) ? s.status.replace('_dry_run', '')
-      : ['not_found', 'rate_limited', 'blocked'].includes(s.status) ? s.status : 'failed';
+      : ['rate_limited', 'blocked', 'no_coords'].includes(s.status) ? s.status : 'failed';
     const rep = await rpc('deliveroo_ranking_report', {
       p_run_id: RUN_ID, p_area_id: area.deliveroo_area_id, p_machine_no: MACHINE_NO,
       p_result: { status: outcome, http_status: s.http_status, cards: s.cards, ranking_rows: s.ranking_rows,
-                  pending_rows: s.pending_rows, bytes: s.bytes, fetch_ms: s.fetch_ms, error: s.error },
+                  pending_rows: s.pending_rows, bytes: s.bytes, fetch_ms: s.fetch_ms,
+                  sponsored: s.sponsored, source: s.source, error: s.error },
     });
     // On 429: Supabase stops this machine and dispatches a replacement from the pool.
     if (s.status === 'rate_limited' && rep.action === 'stop_job') s.status = 'requeued_429';
     if (s.status === 'blocked' && rep.action === 'stop_job') s.status = 'requeued_403';
     summaries.push(s);
     log(`${String(area.deliveroo_area_id).padStart(6)} ${area.deliveroo_area_name.padEnd(28)} ${s.status.padEnd(11)} ` +
-        `cards=${s.cards}/${s.declared_count ?? '?'} rank=${s.ranking_rows} pending=${s.pending_rows} ` +
-        `pairs+${s.delivery_pairs_added} img~${s.images_updated} ${(s.bytes / 1048576).toFixed(1)}MB ${s.total_ms}ms` +
+        `cards=${s.cards}/${s.declared_count ?? '?'} rank=${s.ranking_rows} pend=${s.pending_rows} ` +
+        `spons=${s.sponsored} pairs+${s.delivery_pairs_added} img~${s.images_updated} ` +
+        `${(s.bytes / 1048576).toFixed(1)}MB ${s.total_ms}ms` +
+        (s.html_fallback_used ? ` +html(${s.html_fallback_filled}/${s.queued_partners})` : '') +
         (s.error ? `  ERROR ${s.error}` : ''));
     // Keep the summary on disk after every area so a cancelled machine still reports.
     fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries, null, 1));
