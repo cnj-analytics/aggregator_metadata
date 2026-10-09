@@ -1,17 +1,19 @@
 name: Careem UAE – Sync Areas (active-status probe)
-run-name: Careem sync-areas – ${{ inputs.test_city_id == '' && 'all UAE' || format('talabat city_id={0}', inputs.test_city_id) }}
+run-name: Careem sync-areas – ${{ inputs.test_city_id == '' && (inputs.only_errored == 'true' && 'retry errored' || 'all UAE') || format('talabat city_id={0}', inputs.test_city_id) }}
 
 # Probes every Talabat UAE area against Careem's listings endpoint and marks
 # careem_area.is_active (and rolls up careem_city.is_active) from whether the
 # response contains any restaurants.
 #
-# Steps the job runs:
-#   1. Pulls the latest Careem guest token from Supabase (careem_token_latest() RPC)
-#   2. Seeds careem_city from the hard-coded Talabat->Careem city map
-#   3. Reads every talabat_area row (497 UAE areas)
-#   4. Fires one listings request per area centroid at concurrency `max_concurrent`
-#   5. Upserts careem_area with is_active + restaurant_count + last_probed_at
-#   6. Recomputes careem_city.is_active from the fresh area rows
+# Clean-run guarantees in sync-areas.js:
+#   * Serial by default (concurrency 1, 400ms delay) so Careem's rate limiter
+#     is never hit.
+#   * On HTTP 429, pauses globally 30s then retries up to 4 attempts.
+#   * A failed probe NEVER demotes a previously-active area to inactive.
+#     The probe_error column is set so operators can see which rows need
+#     re-probing; is_active and restaurant_count are left untouched.
+#   * If any probe still fails after retries, the job exits non-zero (red).
+#     Re-run with only_errored=true to retry just those areas idempotently.
 #
 # Depends on the token in public.careem_auth_token being valid at run time —
 # a Careem guest token is 16-24h, so launch this manually inside that window.
@@ -23,14 +25,27 @@ on:
         description: 'Optional: Talabat city_id to probe only (empty = all UAE). 35 Dubai, 43 Abu Dhabi, 44 Sharjah, 48 RAK, 49 Al Ain, 50 Ajman, 96 Fujairah, 125 UAQ.'
         type: string
         default: ''
+      only_errored:
+        description: 'Retry only areas with probe_error set or restaurant_count NULL'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
       max_concurrent:
-        description: 'Parallel Careem requests'
+        description: 'Parallel Careem requests (keep at 1 for a clean run)'
         type: string
-        default: '5'
+        default: '1'
       batch_delay_ms:
-        description: 'Delay (ms) between batches'
+        description: 'Delay (ms) between probes'
         type: string
-        default: '150'
+        default: '400'
+      probe_retries:
+        description: 'Attempts per probe before giving up'
+        type: string
+        default: '4'
+      rate_limit_pause_ms:
+        description: 'Global pause (ms) after a 429'
+        type: string
+        default: '30000'
       min_restaurants:
         description: 'Restaurants required for an area to be active'
         type: string
@@ -39,7 +54,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -55,11 +70,15 @@ jobs:
           CAREEM_MAX_CONCURRENT: ${{ inputs.max_concurrent }}
           CAREEM_BATCH_DELAY_MS: ${{ inputs.batch_delay_ms }}
           CAREEM_MIN_RESTAURANTS: ${{ inputs.min_restaurants }}
+          CAREEM_PROBE_RETRIES: ${{ inputs.probe_retries }}
+          CAREEM_RATE_LIMIT_PAUSE_MS: ${{ inputs.rate_limit_pause_ms }}
+          CAREEM_ONLY_ERRORED: ${{ inputs.only_errored }}
           TEST_MODE: ${{ inputs.test_city_id != '' }}
           TEST_CITY_ID: ${{ inputs.test_city_id }}
         run: |
           set -euo pipefail
-          node careem/uae/sync-areas.js | tee run.log
+          # Capture stderr too so the job summary tail shows real errors.
+          node careem/uae/sync-areas.js 2>&1 | tee run.log
 
       - name: Build job summary
         if: always()
@@ -70,13 +89,15 @@ jobs:
             echo
             if [ -n "${{ inputs.test_city_id }}" ]; then
               echo "Scope: Talabat city_id=${{ inputs.test_city_id }}"
+            elif [ "${{ inputs.only_errored }}" = "true" ]; then
+              echo "Scope: only previously-errored areas"
             else
               echo "Scope: all UAE (every talabat_area row)"
             fi
             echo
             echo "### Run log (tail)"
             echo '```'
-            tail -120 run.log 2>/dev/null || echo '(no log)'
+            tail -200 run.log 2>/dev/null || echo '(no log)'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
