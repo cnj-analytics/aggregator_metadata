@@ -36,7 +36,8 @@
 //   SUPABASE_URL                — required
 //   SUPABASE_SERVICE_ROLE_KEY   — required (service_role bypasses RLS)
 //   CAREEM_MAX_CONCURRENT       — optional, default 1 (serial, safest)
-//   CAREEM_BATCH_DELAY_MS       — optional, default 400 (ms between probes)
+//   CAREEM_BATCH_DELAY_MS       — optional, default 1500 (ms between probes;
+//                                 enforces a per-area minimum spacing)
 //   CAREEM_MIN_RESTAURANTS      — optional, default 1 (active cutoff)
 //   CAREEM_PROBE_RETRIES        — optional, default 4 (per-probe attempts)
 //   CAREEM_RATE_LIMIT_PAUSE_MS  — optional, default 30000 (sleep after 429)
@@ -55,7 +56,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 const UAE_COUNTRY_ID = '27780a1f-e345-4ff8-939a-ef5d879186b1';
 
 const MAX_CONCURRENT = Number(process.env.CAREEM_MAX_CONCURRENT || 1);
-const BATCH_DELAY_MS = Number(process.env.CAREEM_BATCH_DELAY_MS || 400);
+const BATCH_DELAY_MS = Number(process.env.CAREEM_BATCH_DELAY_MS || 1500);
 const MIN_RESTAURANTS_FOR_ACTIVE = Number(process.env.CAREEM_MIN_RESTAURANTS || 1);
 const PROBE_RETRIES = Number(process.env.CAREEM_PROBE_RETRIES || 4);
 const RATE_LIMIT_PAUSE_MS = Number(process.env.CAREEM_RATE_LIMIT_PAUSE_MS || 30000);
@@ -300,12 +301,18 @@ async function fetchOnce(token, sub, area) {
   try {
     const resp = await fetch(LISTINGS_URL, { headers, redirect: 'follow' });
     const text = await resp.text();
-    if (resp.status === 200) {
+    if (resp.status >= 200 && resp.status < 300) {
+      // 204 No Content, or any 2xx with an empty body, means Careem answered
+      // cleanly with "nothing here" — that's a legitimate inactive signal, not
+      // a failure to retry.
+      if (resp.status === 204 || !text || text.trim().length === 0) {
+        return { ok: true, count: 0, status: resp.status, ms: Date.now() - t0 };
+      }
       try {
         const json = JSON.parse(text);
-        return { ok: true, count: countRestaurants(json), status: 200, ms: Date.now() - t0 };
+        return { ok: true, count: countRestaurants(json), status: resp.status, ms: Date.now() - t0 };
       } catch (e) {
-        return { ok: false, status: 200, error: 'JSON parse: ' + e.message, ms: Date.now() - t0 };
+        return { ok: false, status: resp.status, error: 'JSON parse: ' + e.message, ms: Date.now() - t0 };
       }
     }
     return {
