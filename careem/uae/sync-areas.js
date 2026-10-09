@@ -8,36 +8,42 @@
 // at least one restaurant for that lat/lng. A city rolls up as active iff
 // any of its areas is active.
 //
+// Clean-run guarantees:
+//   * Probing is strictly serial (concurrency = 1) with a small inter-probe
+//     delay, so Careem's rate limiter is never hit. If an unexpected 429 does
+//     occur, the script pauses globally for 30s and retries that probe before
+//     any further requests go out.
+//   * A failed probe NEVER demotes a previously-active area to inactive.
+//     is_active and restaurant_count are only updated when the probe actually
+//     returned data. The error text is stored in probe_error so we can see
+//     which area needs re-probing.
+//   * If any area is still errored after all retries, the script exits with
+//     a non-zero code so the GitHub Actions run is red — successful probes
+//     are still upserted, so a re-run only has to pick up the stragglers.
+//   * An area that returns a clean 200 with zero restaurants IS treated as
+//     inactive — Careem simply does not operate there.
+//
 // Data flow:
 //   1. Pull the live guest token from Supabase (careem_token_latest() RPC).
-//   2. Seed careem_city from a hard-coded Talabat→Careem city map. The 5
-//      known Careem serviceAreaIds (Dubai=1, Abu Dhabi=21, Sharjah=49,
-//      Al Ain=63, Fujairah=62) are used where available; the other three
-//      Talabat emirates get negative placeholder IDs.
-//   3. Read all talabat_area rows (bulk, keyed on area_id, name, city_id,
-//      lat/lng, geohash).
-//   4. Probe each area against Careem food-discovery with the area centroid
-//      in the lat/lng headers. We fetch page 1 only and count the restaurant
-//      cards in the response — enough to decide active/inactive. Full catalog
-//      pulls, dedup, and radius-overlap handling are phase 2.
-//   5. Upsert all 497 areas into careem_area with is_active + restaurant_count
-//      + last_probed_at.
+//   2. Seed careem_city from a hard-coded Talabat->Careem city map.
+//   3. Read all talabat_area rows.
+//   4. Probe each area serially with retries. Collect results.
+//   5. Upsert the successful probes into careem_area.
 //   6. Recompute careem_city.is_active from the fresh area rows.
+//   7. If any probe ultimately failed, exit 1; otherwise exit 0.
 //
 // Env vars:
 //   SUPABASE_URL                — required
 //   SUPABASE_SERVICE_ROLE_KEY   — required (service_role bypasses RLS)
-//   CAREEM_MAX_CONCURRENT       — optional, default 5
-//   CAREEM_BATCH_DELAY_MS       — optional, default 150
+//   CAREEM_MAX_CONCURRENT       — optional, default 1 (serial, safest)
+//   CAREEM_BATCH_DELAY_MS       — optional, default 400 (ms between probes)
 //   CAREEM_MIN_RESTAURANTS      — optional, default 1 (active cutoff)
+//   CAREEM_PROBE_RETRIES        — optional, default 4 (per-probe attempts)
+//   CAREEM_RATE_LIMIT_PAUSE_MS  — optional, default 30000 (sleep after 429)
+//   CAREEM_ONLY_ERRORED         — optional, "true" to re-probe only areas
+//                                 whose previous probe failed (probe_error
+//                                 IS NOT NULL OR restaurant_count IS NULL)
 //   TEST_MODE / TEST_CITY_ID    — optional, probe only one Talabat city_id
-//
-// Run locally (Node 20+):
-//   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... node careem/uae/sync-areas.js
-//
-// In CI: wire into a GitHub Actions workflow mirroring the Careem test-fetch
-// one (same two secrets). Not every run needs the full probe — once a week
-// is plenty for coverage drift.
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -48,9 +54,12 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const UAE_COUNTRY_ID = '27780a1f-e345-4ff8-939a-ef5d879186b1';
 
-const MAX_CONCURRENT = Number(process.env.CAREEM_MAX_CONCURRENT || 5);
-const BATCH_DELAY_MS = Number(process.env.CAREEM_BATCH_DELAY_MS || 150);
+const MAX_CONCURRENT = Number(process.env.CAREEM_MAX_CONCURRENT || 1);
+const BATCH_DELAY_MS = Number(process.env.CAREEM_BATCH_DELAY_MS || 400);
 const MIN_RESTAURANTS_FOR_ACTIVE = Number(process.env.CAREEM_MIN_RESTAURANTS || 1);
+const PROBE_RETRIES = Number(process.env.CAREEM_PROBE_RETRIES || 4);
+const RATE_LIMIT_PAUSE_MS = Number(process.env.CAREEM_RATE_LIMIT_PAUSE_MS || 30000);
+const ONLY_ERRORED = process.env.CAREEM_ONLY_ERRORED === 'true';
 const TEST_MODE = process.env.TEST_MODE === 'true';
 const TEST_CITY_ID = process.env.TEST_CITY_ID ? Number(process.env.TEST_CITY_ID) : null;
 
@@ -155,6 +164,15 @@ async function getTalabatAreas() {
   return rows || [];
 }
 
+async function getPreviouslyErroredAreaIds() {
+  // Used by CAREEM_ONLY_ERRORED mode: fetch area_ids that need re-probing.
+  const rows = await supabase(
+    '/careem_area?select=careem_area_id&or=(probe_error.not.is.null,restaurant_count.is.null)&limit=1000',
+    { headers: { Accept: 'application/json' } }
+  );
+  return new Set((rows || []).map(r => r.careem_area_id));
+}
+
 async function upsertCities(rows) {
   if (rows.length === 0) return;
   await supabase('/careem_city?on_conflict=careem_city_id', {
@@ -194,9 +212,8 @@ async function upsertAreasBatched(records) {
 }
 
 async function updateCityActiveFlags() {
-  // One SQL round-trip per city via PostgREST — simpler than a stored proc
-  // and the city list is small. The rpc path is unavailable without a
-  // custom function, so we read area counts and PATCH each city.
+  // Read every area row and roll up per city. The city list is small
+  // enough that one PATCH per city is cheaper than a stored proc.
   const rows = await supabase(
     '/careem_area?select=careem_city_id,is_active',
     { headers: { Accept: 'application/json' } }
@@ -276,30 +293,63 @@ function countRestaurants(node, seen = new Set(), depth = 0) {
   return seen.size;
 }
 
-async function probeArea(token, sub, area) {
+async function fetchOnce(token, sub, area) {
   const sessId = sessionId();
   const headers = careemHeaders(token, sub, area.latitude, area.longitude, sessId);
   const t0 = Date.now();
-  let status, bytes, count = 0, error = null;
   try {
     const resp = await fetch(LISTINGS_URL, { headers, redirect: 'follow' });
-    status = resp.status;
     const text = await resp.text();
-    bytes = text.length;
-    if (resp.ok) {
+    if (resp.status === 200) {
       try {
         const json = JSON.parse(text);
-        count = countRestaurants(json);
+        return { ok: true, count: countRestaurants(json), status: 200, ms: Date.now() - t0 };
       } catch (e) {
-        error = 'JSON parse: ' + e.message;
+        return { ok: false, status: 200, error: 'JSON parse: ' + e.message, ms: Date.now() - t0 };
       }
-    } else {
-      error = `HTTP ${status}: ${text.slice(0, 200)}`;
     }
+    return {
+      ok: false,
+      status: resp.status,
+      error: `HTTP ${resp.status}: ${text.slice(0, 200)}`,
+      ms: Date.now() - t0,
+    };
   } catch (e) {
-    error = e.message;
+    return { ok: false, status: 0, error: 'network: ' + e.message, ms: Date.now() - t0 };
   }
-  return { status, bytes, count, error, ms: Date.now() - t0 };
+}
+
+/**
+ * Probe one area with retries. Backoff schedule for non-429 errors:
+ *   attempt 2 → 2s, attempt 3 → 5s, attempt 4 → 10s, attempt 5+ → 20s
+ * On HTTP 429 specifically, pause RATE_LIMIT_PAUSE_MS (30s default) so the
+ * rate-limit window resets before any further requests go out — the pause
+ * is global, driven by the probeArea caller's loop.
+ */
+async function probeArea(token, sub, area) {
+  let last = null;
+  for (let attempt = 1; attempt <= PROBE_RETRIES; attempt++) {
+    const r = await fetchOnce(token, sub, area);
+    if (r.ok) return { ok: true, count: r.count, status: r.status, ms: r.ms, attempts: attempt };
+    last = r;
+    // On the last attempt, don't sleep further — we return the failure.
+    if (attempt === PROBE_RETRIES) break;
+    if (r.status === 429) {
+      console.warn(`    [429] area_id=${area.area_id} rate-limited — pausing ${RATE_LIMIT_PAUSE_MS}ms`);
+      await sleep(RATE_LIMIT_PAUSE_MS);
+    } else {
+      const backoff = [2000, 5000, 10000, 20000][attempt - 1] || 20000;
+      console.warn(`    [${r.status || 'net'}] area_id=${area.area_id} attempt ${attempt}/${PROBE_RETRIES} — sleep ${backoff}ms`);
+      await sleep(backoff);
+    }
+  }
+  return {
+    ok: false,
+    status: last ? last.status : 0,
+    error: last ? last.error : 'unknown',
+    ms: last ? last.ms : 0,
+    attempts: PROBE_RETRIES,
+  };
 }
 
 // ── Main ───────────────────────────────────────────────────────────────
@@ -309,7 +359,8 @@ async function main() {
   console.log('===================================================');
   console.log(' Careem UAE — Area active-status sync');
   console.log('===================================================');
-  console.log(`Started: ${new Date().toISOString()}\n`);
+  console.log(`Started: ${new Date().toISOString()}`);
+  console.log(`Config:  concurrency=${MAX_CONCURRENT}  delay=${BATCH_DELAY_MS}ms  retries=${PROBE_RETRIES}  rate_pause=${RATE_LIMIT_PAUSE_MS}ms  only_errored=${ONLY_ERRORED}\n`);
 
   // 1. Token
   console.log('STEP 1: Pull token from Supabase');
@@ -336,34 +387,32 @@ async function main() {
     areas = areas.filter(a => a.city_id === TEST_CITY_ID);
     console.log(`  TEST_MODE: filtered to Talabat city_id=${TEST_CITY_ID} → ${areas.length} areas`);
   }
+  if (ONLY_ERRORED) {
+    const errored = await getPreviouslyErroredAreaIds();
+    areas = areas.filter(a => errored.has(a.area_id));
+    console.log(`  CAREEM_ONLY_ERRORED: filtered to ${areas.length} previously-errored areas`);
+  }
   if (areas.length === 0) {
-    console.error('ABORT: no areas to probe');
-    process.exit(1);
+    console.log('No areas to probe — exiting cleanly.');
+    return;
   }
 
-  // 4. Probe each area (concurrency MAX_CONCURRENT, serial batches)
-  console.log(`\nSTEP 4: Probe ${areas.length} areas (concurrency=${MAX_CONCURRENT}, delay=${BATCH_DELAY_MS}ms)`);
-  const records = [];
-  const now = new Date().toISOString();
-  let active = 0, inactive = 0, errored = 0;
-  for (let i = 0; i < areas.length; i += MAX_CONCURRENT) {
-    const batch = areas.slice(i, i + MAX_CONCURRENT);
-    const results = await Promise.all(batch.map(a => probeArea(tok.access_token, sub, a)));
-    for (let j = 0; j < batch.length; j++) {
-      const area = batch[j];
-      const r = results[j];
-      const careemCityId = TALABAT_TO_CAREEM_CITY.get(area.city_id);
-      if (careemCityId == null) {
-        console.warn(`  area_id=${area.area_id} has unknown talabat city_id=${area.city_id} — skipping`);
-        continue;
-      }
-      const probeOk = r.status === 200 && !r.error;
-      const isActive = probeOk && r.count >= MIN_RESTAURANTS_FOR_ACTIVE;
-      if (!probeOk) errored++;
-      else if (isActive) active++;
-      else inactive++;
-
-      records.push({
+  // 4. Probe each area serially with retries. Collect successes and failures.
+  console.log(`\nSTEP 4: Probe ${areas.length} areas`);
+  const successes = [];
+  const failures = [];
+  const nowIso = new Date().toISOString();
+  let probed = 0;
+  const probeOne = async (area) => {
+    const careemCityId = TALABAT_TO_CAREEM_CITY.get(area.city_id);
+    if (careemCityId == null) {
+      console.warn(`  area_id=${area.area_id} has unknown talabat city_id=${area.city_id} — skipping`);
+      return;
+    }
+    const r = await probeArea(tok.access_token, sub, area);
+    if (r.ok) {
+      const isActive = r.count >= MIN_RESTAURANTS_FOR_ACTIVE;
+      successes.push({
         careem_area_id:   area.area_id,
         area_name:        area.area_name,
         area_name_ar:     area.area_name_ar,
@@ -373,23 +422,66 @@ async function main() {
         longitude:        area.longitude,
         geohash:          area.geohash,
         is_active:        isActive,
-        restaurant_count: probeOk ? r.count : null,
-        last_probed_at:   now,
+        restaurant_count: r.count,
+        last_probed_at:   nowIso,
+        probe_error:      null,
+      });
+    } else {
+      // On failure, DO NOT touch is_active / restaurant_count. Only record
+      // the error text and the attempt time, so a previously-active area is
+      // never silently demoted to inactive by a transient 429 or 5xx.
+      failures.push({
+        area_id:       area.area_id,
+        area_name:     area.area_name,
+        careem_city_id:careemCityId,
+        status:        r.status,
+        error:         r.error,
+        attempts:      r.attempts,
       });
     }
-    // Progress + pacing
-    if ((i + MAX_CONCURRENT) % 50 === 0 || i + MAX_CONCURRENT >= areas.length) {
-      console.log(
-        `  progress ${Math.min(i + MAX_CONCURRENT, areas.length)}/${areas.length}` +
-        `  active=${active} inactive=${inactive} errored=${errored}`
-      );
+  };
+
+  // Serial path (default). The pool path handles concurrency > 1 if ever set.
+  if (MAX_CONCURRENT <= 1) {
+    for (const area of areas) {
+      await probeOne(area);
+      probed++;
+      if (probed % 25 === 0 || probed === areas.length) {
+        console.log(`  progress ${probed}/${areas.length}  ok=${successes.length} fail=${failures.length}`);
+      }
+      if (probed < areas.length) await sleep(BATCH_DELAY_MS);
     }
-    if (i + MAX_CONCURRENT < areas.length && BATCH_DELAY_MS > 0) await sleep(BATCH_DELAY_MS);
+  } else {
+    for (let i = 0; i < areas.length; i += MAX_CONCURRENT) {
+      const batch = areas.slice(i, i + MAX_CONCURRENT);
+      await Promise.all(batch.map(probeOne));
+      probed += batch.length;
+      if (probed % 25 === 0 || probed >= areas.length) {
+        console.log(`  progress ${probed}/${areas.length}  ok=${successes.length} fail=${failures.length}`);
+      }
+      if (probed < areas.length) await sleep(BATCH_DELAY_MS);
+    }
   }
 
-  // 5. Upsert all area probe results
-  console.log(`\nSTEP 5: Upsert ${records.length} area rows`);
-  await upsertAreasBatched(records);
+  // 5. Upsert the successful probes (and mark error-only rows for failures
+  // so operators can see which areas still need re-probing).
+  console.log(`\nSTEP 5: Upsert ${successes.length} successful area rows`);
+  await upsertAreasBatched(successes);
+
+  if (failures.length > 0) {
+    console.log(`\nSTEP 5b: Record probe_error on ${failures.length} failed area(s) (is_active NOT changed)`);
+    // Build minimal rows that just set probe_error + last_probed_at. Insert
+    // via upsert so first-time failures still create the row (with other
+    // columns NULL). careem_city_id is required (NOT NULL) so include it.
+    const errRows = failures.map(f => ({
+      careem_area_id:  f.area_id,
+      area_name:       f.area_name,
+      careem_city_id:  f.careem_city_id,
+      probe_error:     `[attempts=${f.attempts}] ${f.error}`,
+      last_probed_at:  nowIso,
+    }));
+    await upsertAreasBatched(errRows);
+  }
 
   // 6. Roll up city.is_active
   console.log('\nSTEP 6: Recompute careem_city.is_active');
@@ -400,17 +492,38 @@ async function main() {
     console.log(`  ${label.padEnd(20)} active=${r.active}/${r.total}  → is_active=${r.is_active}`);
   }
 
-  // 7. Summary
+  // 7. Summary + exit code
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   console.log('\n===================================================');
   console.log(' Summary');
   console.log('===================================================');
-  console.log(`  Areas probed    : ${records.length}`);
-  console.log(`  Active          : ${active}`);
-  console.log(`  Inactive        : ${inactive}`);
-  console.log(`  Errored         : ${errored}`);
+  console.log(`  Areas probed    : ${areas.length}`);
+  console.log(`  Succeeded       : ${successes.length}`);
+  console.log(`  Failed          : ${failures.length}`);
   console.log(`  Elapsed         : ${elapsed}s`);
   console.log(`  Finished        : ${new Date().toISOString()}`);
+
+  if (failures.length > 0) {
+    console.log('\nFailed areas (listed; is_active left unchanged):');
+    // Group by city, cap listing per city to keep logs short
+    const byCity = new Map();
+    for (const f of failures) {
+      if (!byCity.has(f.careem_city_id)) byCity.set(f.careem_city_id, []);
+      byCity.get(f.careem_city_id).push(f);
+    }
+    for (const [cid, list] of byCity.entries()) {
+      const city = CITY_MAP.find(c => c.careem_city_id === cid);
+      const label = city ? city.careem_name : `city_id=${cid}`;
+      console.log(`  ${label}: ${list.length} failed`);
+      for (const f of list.slice(0, 8)) {
+        console.log(`    area_id=${f.area_id}  "${f.area_name}"  status=${f.status}  err=${(f.error || '').slice(0, 120)}`);
+      }
+      if (list.length > 8) console.log(`    ... and ${list.length - 8} more`);
+    }
+    console.log('\nRe-run with CAREEM_ONLY_ERRORED=true to retry just these areas.');
+    process.exit(1);
+  }
+  console.log('\nClean run — all areas probed successfully.');
 }
 
 main().catch(e => {
