@@ -83,9 +83,11 @@ def sb_rpc(name, payload):
         f"{SUPABASE_URL}/rest/v1/rpc/{name}",
         headers=_sb_headers(),
         json=payload,
-        timeout=30,
+        timeout=60,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # Surface the PostgREST body so we can see the real reason
+        raise RuntimeError(f"PostgREST {r.status_code}: {r.text[:600]}")
     try:
         return r.json()
     except Exception:
