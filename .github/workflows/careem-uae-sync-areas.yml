@@ -6,8 +6,8 @@ run-name: Careem sync-areas – ${{ inputs.test_city_id == '' && (inputs.only_er
 # response contains any restaurants.
 #
 # Clean-run guarantees in sync-areas.js:
-#   * Serial by default (concurrency 1, 400ms delay) so Careem's rate limiter
-#     is never hit.
+#   * Serial by default (concurrency 1, 1500ms delay) so Careem's rate limiter
+#     is never hit — each probe is spaced at least 1.5s from the next.
 #   * On HTTP 429, pauses globally 30s then retries up to 4 attempts.
 #   * A failed probe NEVER demotes a previously-active area to inactive.
 #     The probe_error column is set so operators can see which rows need
@@ -35,9 +35,9 @@ on:
         type: string
         default: '1'
       batch_delay_ms:
-        description: 'Delay (ms) between probes'
+        description: 'Delay (ms) between probes (minimum per-area spacing)'
         type: string
-        default: '400'
+        default: '1500'
       probe_retries:
         description: 'Attempts per probe before giving up'
         type: string
