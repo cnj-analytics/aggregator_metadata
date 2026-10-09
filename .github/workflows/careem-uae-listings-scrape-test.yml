@@ -1,0 +1,127 @@
+name: Careem UAE – Listings Scrape (TEST)
+run-name: Careem listings-test – areas=${{ inputs.area_ids }}
+
+# Test-only workflow for Phase 2 Careem listings harvest.
+#
+# What it does:
+#   - Dispatches 5 parallel matrix jobs (five distinct GitHub-hosted runner IPs).
+#   - Each matrix job (machine_no 1..5) picks the Nth area from the comma-
+#     separated area_ids input. If an index has no area (e.g. only 2 areas
+#     given), that machine runs the script with no AREA_ID set — the script
+#     then logs "nothing to do" and exits 0.
+#   - All five machines share the single guest token in careem_auth_token.
+#     Each machine is strictly serial (1500 ms between its own pages). No
+#     per-fleet coordination because each machine is on its own area.
+#
+# Outputs:
+#   - careem_restaurant_list_test rows (one per restaurant, with
+#     careem_area_ids accumulating every area it was seen in).
+#   - run.log uploaded as a workflow artifact per machine.
+
+on:
+  workflow_dispatch:
+    inputs:
+      area_ids:
+        description: 'CSV of careem_area_ids to probe (one per matrix machine, max 5). Default: Business Bay + Downtown Dubai.'
+        type: string
+        default: '1252,1258'
+      batch_delay_ms:
+        description: 'Delay (ms) between page fetches within a single area'
+        type: string
+        default: '1500'
+      max_pages:
+        description: 'Safety cap on pages per area (Careem lists up to ~110 per area)'
+        type: string
+        default: '150'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        machine_no: [1, 2, 3, 4, 5]
+
+    name: machine ${{ matrix.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Resolve area for this machine
+        id: pick
+        env:
+          AREA_IDS_CSV: ${{ inputs.area_ids }}
+          MACHINE_NO:   ${{ matrix.machine_no }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra IDS <<< "${AREA_IDS_CSV}"
+          IDX=$((MACHINE_NO - 1))
+          AREA_ID="${IDS[$IDX]:-}"
+          AREA_ID="${AREA_ID// /}"
+          echo "area_id=${AREA_ID}" >> "$GITHUB_OUTPUT"
+          if [ -n "${AREA_ID}" ]; then
+            RESP=$(curl -sS -G "${{ secrets.SUPABASE_URL }}/rest/v1/careem_area" \
+              --data-urlencode "select=latitude,longitude,area_name" \
+              --data-urlencode "careem_area_id=eq.${AREA_ID}" \
+              -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+              -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}")
+            LAT=$(printf '%s' "$RESP" | node -e "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const a=JSON.parse(s);process.stdout.write(a[0]?.latitude!=null?String(a[0].latitude):'');});")
+            LNG=$(printf '%s' "$RESP" | node -e "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const a=JSON.parse(s);process.stdout.write(a[0]?.longitude!=null?String(a[0].longitude):'');});")
+            NAME=$(printf '%s' "$RESP" | node -e "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const a=JSON.parse(s);process.stdout.write(a[0]?.area_name||'');});")
+            if [ -z "${LAT}" ] || [ -z "${LNG}" ]; then
+              echo "ERROR: careem_area has no lat/lng for area_id=${AREA_ID}"
+              exit 1
+            fi
+            echo "lat=${LAT}"   >> "$GITHUB_OUTPUT"
+            echo "lng=${LNG}"   >> "$GITHUB_OUTPUT"
+            echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+            echo "Machine ${MACHINE_NO} assigned area_id=${AREA_ID} (${NAME}) at ${LAT},${LNG}"
+          else
+            echo "lat=" >> "$GITHUB_OUTPUT"
+            echo "lng=" >> "$GITHUB_OUTPUT"
+            echo "name=" >> "$GITHUB_OUTPUT"
+            echo "Machine ${MACHINE_NO} has no assigned area — will exit cleanly as no-op."
+          fi
+
+      - name: Run Careem listings-test
+        env:
+          SUPABASE_URL:                  ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY:     ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          AREA_ID:                       ${{ steps.pick.outputs.area_id }}
+          LAT:                           ${{ steps.pick.outputs.lat }}
+          LNG:                           ${{ steps.pick.outputs.lng }}
+          AREA_NAME:                     ${{ steps.pick.outputs.name }}
+          MACHINE_NO:                    ${{ matrix.machine_no }}
+          CAREEM_BATCH_DELAY_MS:         ${{ inputs.batch_delay_ms }}
+          CAREEM_MAX_PAGES:              ${{ inputs.max_pages }}
+        run: |
+          set -euo pipefail
+          node careem/uae/listings-scrape-test.js 2>&1 | tee run.log
+
+      - name: Build job summary
+        if: always()
+        run: |
+          set +e
+          {
+            echo "## Careem listings-test — machine ${{ matrix.machine_no }}"
+            echo
+            echo "area_id=${{ steps.pick.outputs.area_id }} area=${{ steps.pick.outputs.name }}"
+            echo
+            echo "### Run log (tail)"
+            echo '```'
+            tail -200 run.log 2>/dev/null || echo '(no log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: careem-listings-test-${{ github.run_id }}-m${{ matrix.machine_no }}
+          path: run.log
+          if-no-files-found: warn
+          retention-days: 7
