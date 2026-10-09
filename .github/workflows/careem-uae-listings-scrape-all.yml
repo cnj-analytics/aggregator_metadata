@@ -1,0 +1,109 @@
+name: Careem UAE – Listings Scrape (ALL areas)
+run-name: Careem listings-all – ${{ inputs.num_machines }} machine(s)
+
+# Full-UAE listings harvest. Each matrix machine pulls every active
+# careem_area row from Supabase, slices it round-robin by machine_no, and
+# processes its slice serially (1500 ms between pages per machine). All
+# machines share the single guest token in careem_auth_token.
+#
+# Writes into careem_restaurant_list_test — the same test table + RPC we
+# proved on the 2-area smoke test. Dedup across machines is handled by
+# careem_test_upsert_batch which merges careem_area_ids on conflict, so a
+# restaurant seen by machine 1 (in Dubai) and machine 3 (in Abu Dhabi) ends
+# up as one row with both area_ids in the array.
+#
+# Expected scale: ~426 active careem_area rows ÷ 5 machines ≈ 85 per
+# machine × ~2 min per area ≈ 3 hours per machine (well under the 6h cap).
+# All machines run in parallel so wall-time is also ~3 hours.
+#
+# Depends on a valid token in careem_auth_token at run time (16-24h life).
+
+on:
+  workflow_dispatch:
+    inputs:
+      num_machines:
+        description: 'How many parallel machines (1–5). Lower during busy ranking hours.'
+        type: choice
+        options: ['1', '2', '3', '4', '5']
+        default: '5'
+      batch_delay_ms:
+        description: 'ms between page fetches within a single area'
+        type: string
+        default: '1500'
+      max_pages:
+        description: 'Safety cap on pages per area'
+        type: string
+        default: '150'
+      area_limit:
+        description: 'Cap on areas per machine (0 = no cap; set e.g. 5 for a smoke test)'
+        type: string
+        default: '0'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # 5h50m, below GitHub's 6h cap
+    strategy:
+      fail-fast: false
+      matrix:
+        machine_no: [1, 2, 3, 4, 5]
+
+    name: machine ${{ matrix.machine_no }}
+
+    steps:
+      - name: Skip if machine_no > num_machines
+        id: gate
+        env:
+          M: ${{ matrix.machine_no }}
+          N: ${{ inputs.num_machines }}
+        run: |
+          if [ "$M" -le "$N" ]; then
+            echo "active=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            echo "Machine $M not needed (num_machines=$N) — exiting cleanly."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.active == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.active == 'true'
+        with:
+          node-version: '20'
+
+      - name: Run Careem listings-scrape-all
+        if: steps.gate.outputs.active == 'true'
+        env:
+          SUPABASE_URL:                  ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY:     ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MACHINE_NO:                    ${{ matrix.machine_no }}
+          NUM_MACHINES:                  ${{ inputs.num_machines }}
+          CAREEM_BATCH_DELAY_MS:         ${{ inputs.batch_delay_ms }}
+          CAREEM_MAX_PAGES:              ${{ inputs.max_pages }}
+          CAREEM_AREA_LIMIT:             ${{ inputs.area_limit }}
+        run: |
+          set -euo pipefail
+          node careem/uae/listings-scrape-all.js 2>&1 | tee run.log
+
+      - name: Build job summary
+        if: always() && steps.gate.outputs.active == 'true'
+        run: |
+          set +e
+          {
+            echo "## Careem listings-scrape-all — machine ${{ matrix.machine_no }}/${{ inputs.num_machines }}"
+            echo
+            echo "### Run log (tail)"
+            echo '```'
+            tail -300 run.log 2>/dev/null || echo '(no log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run log
+        if: always() && steps.gate.outputs.active == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: careem-listings-all-${{ github.run_id }}-m${{ matrix.machine_no }}
+          path: run.log
+          if-no-files-found: warn
+          retention-days: 14
