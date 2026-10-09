@@ -1,0 +1,89 @@
+name: Careem UAE – Restaurant Fields Probe (follow-up)
+run-name: Careem restaurant-fields probe – ${{ inputs.merchant_ids == '' && 'operator + sub-shapes' || inputs.merchant_ids }}
+
+# Follow-up to the first restaurant-page probe. This one answers:
+#   * Is `contract_id` really an operator identifier? (fetches multiple
+#     same-brand branches and groups by brand)
+#   * What is the sub-shape of promotions, tags, rating, price, menu,
+#     delivery_zones, link, superapp_link, brand? (dumps all of them to
+#     the job summary so no artifact download is needed)
+#
+# Same Cloudflare bypass as the first probe (curl_cffi + safari18_0).
+#
+# Default sample: 8 merchants = 2 branches each of McDonald's, Krispy Kreme,
+# Bikanervala, Luca (picked from the Business Bay + Downtown Dubai harvest).
+
+on:
+  workflow_dispatch:
+    inputs:
+      merchant_ids:
+        description: 'Optional CSV of merchant_ids to probe. Empty = built-in 8-sample across 4 chains.'
+        type: string
+        default: ''
+      lat:
+        description: 'Latitude for the Careem lat/lng header'
+        type: string
+        default: '25.1972'
+      lng:
+        description: 'Longitude for the Careem lat/lng header'
+        type: string
+        default: '55.2744'
+      delay_ms:
+        description: 'Delay (ms) between probes'
+        type: string
+        default: '1500'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install curl_cffi
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'curl_cffi>=0.7,<1.0'
+
+      - name: Run Careem restaurant-fields probe
+        env:
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CAREEM_PROBE_IDS:          ${{ inputs.merchant_ids }}
+          CAREEM_PROBE_LAT:          ${{ inputs.lat }}
+          CAREEM_PROBE_LNG:          ${{ inputs.lng }}
+          CAREEM_PROBE_DELAY_MS:     ${{ inputs.delay_ms }}
+          OUT_DIR:                   out
+        run: |
+          set -euo pipefail
+          python careem/uae/restaurant-fields-probe.py 2>&1 | tee run.log
+
+      - name: Build job summary
+        if: always()
+        run: |
+          set +e
+          {
+            echo "## Careem restaurant-fields probe"
+            echo
+            echo "### Run log"
+            echo '```'
+            cat run.log 2>/dev/null || echo '(no log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload raw responses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: careem-restaurant-fields-probe-${{ github.run_id }}
+          path: |
+            out/
+            run.log
+          if-no-files-found: warn
+          retention-days: 14
