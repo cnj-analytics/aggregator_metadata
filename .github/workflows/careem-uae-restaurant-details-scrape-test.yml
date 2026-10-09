@@ -1,0 +1,96 @@
+name: Careem UAE – Restaurant Details Scrape (TEST / ~100 sample)
+run-name: Careem details-test – diversified ${{ inputs.big_brands }}+${{ inputs.medium_brands }}+${{ inputs.small_brands }}+${{ inputs.single_brands }}
+
+# Pulls per-restaurant JSON for a diversified ~100-merchant sample from
+# careem_restaurant_list_test, strips the menu, and writes into
+# careem_restaurant_details_test via careem_test_details_upsert.
+#
+# One machine, serial, 1500 ms between calls — ~100 calls → under 5 minutes.
+# Uses curl_cffi + safari18_0 to clear Cloudflare on apigateway.careemdash.com
+# (same bypass the two earlier probes used).
+#
+# Rows come from careem_restaurant_list_test, which is being populated by the
+# listings-scrape-all run. Safe to run while that's still writing — this one
+# only reads from list_test and writes to details_test.
+
+on:
+  workflow_dispatch:
+    inputs:
+      big_brands:
+        description: 'Top chains to sample (>=10 branches). 2 branches each.'
+        type: string
+        default: '10'
+      medium_brands:
+        description: 'Random 5-9 branch brands, 1 branch each.'
+        type: string
+        default: '30'
+      small_brands:
+        description: 'Random 2-4 branch brands, 1 branch each.'
+        type: string
+        default: '25'
+      single_brands:
+        description: 'Random single-branch brands.'
+        type: string
+        default: '25'
+      delay_ms:
+        description: 'Delay (ms) between calls.'
+        type: string
+        default: '1500'
+      retries:
+        description: 'Retries per merchant on transient failure.'
+        type: string
+        default: '3'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install curl_cffi
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'curl_cffi>=0.7,<1.0'
+
+      - name: Run Careem restaurant-details scrape (test)
+        env:
+          SUPABASE_URL:                 ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY:    ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CAREEM_SAMPLE_BIG_BRANDS:     ${{ inputs.big_brands }}
+          CAREEM_SAMPLE_MEDIUM_BRANDS:  ${{ inputs.medium_brands }}
+          CAREEM_SAMPLE_SMALL_BRANDS:   ${{ inputs.small_brands }}
+          CAREEM_SAMPLE_SINGLE_BRANDS:  ${{ inputs.single_brands }}
+          CAREEM_DELAY_MS:              ${{ inputs.delay_ms }}
+          CAREEM_RETRIES:               ${{ inputs.retries }}
+        run: |
+          set -euo pipefail
+          python careem/uae/restaurant-details-scrape-test.py 2>&1 | tee run.log
+
+      - name: Build job summary
+        if: always()
+        run: |
+          set +e
+          {
+            echo "## Careem restaurant-details scrape (TEST)"
+            echo
+            echo "### Run log (tail)"
+            echo '```'
+            tail -200 run.log 2>/dev/null || echo '(no log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: careem-restaurant-details-test-${{ github.run_id }}
+          path: run.log
+          if-no-files-found: warn
+          retention-days: 14
