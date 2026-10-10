@@ -64,9 +64,16 @@ function decodeJwtSub(token) {
 }
 
 async function getToken() {
-  const rows = await rpc('careem_token_latest', {});
+  // 10-token pool test: each machine picks a slot by machine_no.
+  // m1→slot1, m2→slot2, ..., m10→slot10, m11→slot1, m12→slot2, ..., m20→slot10.
+  // Two machines share each access_token.
+  const slot = ((MACHINE_NO - 1) % 10) + 1;
+  const rows = await rpc('careem_scraper_token_by_slot', { p_slot: slot });
   const row = Array.isArray(rows) ? rows[0] : rows;
-  if (!row?.access_token) throw new Error('careem_token_latest returned no token');
+  if (!row?.access_token) {
+    throw new Error(`careem_scraper_token_by_slot slot=${slot} returned nothing`);
+  }
+  console.log(`[m${MACHINE_NO}] using token slot ${slot} (jti=${row.jwt_jti})`);
   return row.access_token;
 }
 
