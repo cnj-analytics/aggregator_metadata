@@ -222,6 +222,7 @@ async function processArea({ token, sub, area, scrape_date, scrape_hour, dry_run
     }
 
     const pageCards = collectCards(parsed, [], 0);
+    console.log(`[m${MACHINE_NO}]   area ${area.careem_area_id} page ${page} → ${pageCards.length} cards, ${fp.bytes}B, ${fp.elapsed}ms (status ${fp.status})`);
     if (pageCards.length === 0) break;
     for (const c of pageCards) cards.push(c);
 
