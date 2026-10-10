@@ -103,23 +103,24 @@ function pageUrl(page) {
   return `${LISTINGS_URL_BASE}?sp_page=${page}&sp_offset=0&sp_category=food_disc_all_restaurants`;
 }
 
-// Walk the response and collect every object that looks like a restaurant card
-function collectCards(node, out, seen, depth) {
-  out = out || []; seen = seen || new Set(); depth = depth || 0;
+// Walk the response and collect every restaurant card. We DO NOT dedup here —
+// parseCards keeps the first sighting as the rank and counts repeats as
+// appearances (needed to measure sponsored exposure across pages).
+function collectCards(node, out, depth) {
+  out = out || []; depth = depth || 0;
   if (!node || depth > 20) return out;
   if (Array.isArray(node)) {
-    for (const n of node) collectCards(n, out, seen, depth + 1);
+    for (const n of node) collectCards(n, out, depth + 1);
     return out;
   }
   if (typeof node !== 'object') return out;
   const mid = node.merchant_id || node.outlet_id || node.restaurant_id;
   const bid = node.brand_id;
   if (mid && bid && (node.merchant_name || node.brand_name)) {
-    const key = String(mid);
-    if (!seen.has(key)) { seen.add(key); out.push(node); }
+    out.push(node);
   }
   for (const k of Object.keys(node)) {
-    if (typeof node[k] === 'object') collectCards(node[k], out, seen, depth + 1);
+    if (typeof node[k] === 'object') collectCards(node[k], out, depth + 1);
   }
   return out;
 }
@@ -187,7 +188,6 @@ function parseCards(cards) {
 async function processArea({ token, sub, area, scrape_date, scrape_hour, dry_run }) {
   const t0 = Date.now();
   const cards = [];
-  const seen = new Set();
   let totalBytes = 0, totalFetchMs = 0, httpStatus = null;
 
   for (let page = 1; page <= MAX_PAGES; page++) {
@@ -221,7 +221,7 @@ async function processArea({ token, sub, area, scrape_date, scrape_hour, dry_run
                cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs };
     }
 
-    const pageCards = collectCards(parsed, [], seen, 0);
+    const pageCards = collectCards(parsed, [], 0);
     if (pageCards.length === 0) break;
     for (const c of pageCards) cards.push(c);
 
