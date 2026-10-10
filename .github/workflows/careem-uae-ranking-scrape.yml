@@ -1,0 +1,50 @@
+name: Careem UAE – Ranking Scrape (worker)
+run-name: Careem ranking run ${{ inputs.run_id }} m${{ inputs.machine_no }}
+
+# One worker job. Dispatched by Supabase (careem_ranking_dispatch_machine) from
+# ranking-control, OR manually for debug.
+# Each dispatch is one machine → separate workflow_run → fresh runner IP.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'careem_ranking_run.run_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'careem_ranking_run_machine.machine_no'
+        required: true
+        type: string
+      page_delay_ms:
+        description: 'delay between page fetches within one area (ms)'
+        required: false
+        type: string
+        default: '1000'
+
+concurrency:
+  group: careem-uae-ranking-scrape-run-${{ inputs.run_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    name: run ${{ inputs.run_id }} machine ${{ inputs.machine_no }}
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run ranking worker
+        env:
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_ID:         ${{ inputs.run_id }}
+          MACHINE_NO:     ${{ inputs.machine_no }}
+          GITHUB_RUN_ID:  ${{ github.run_id }}
+          PAGE_DELAY_MS:  ${{ inputs.page_delay_ms }}
+          WALL_LIMIT_SEC: '21000'
+        run: node careem/uae/ranking-scrape.js
