@@ -21,6 +21,15 @@ const PAGE_DELAY_MS  = parseInt(process.env.PAGE_DELAY_MS || '1000', 10);
 const WALL_LIMIT_SEC = parseInt(process.env.WALL_LIMIT_SEC || '21000', 10);
 const MAX_PAGES      = 150;
 
+// Optional: specific token slot (1-10) overrides the natural machine_no → slot mapping.
+// Used by the orchestrator on retry dispatches (same-slot for retries 1-3, rotated 4-10).
+const TOKEN_SLOT_OVERRIDE = process.env.TOKEN_SLOT ? parseInt(process.env.TOKEN_SLOT, 10) : null;
+
+// Optional: pin the first claim to a specific area (used on retry dispatch so the
+// replacement machine picks THAT area first instead of whatever's next in queue).
+// After the pinned area is done, the worker falls back to normal claim.
+const PIN_AREA_ID = process.env.PIN_AREA_ID ? parseInt(process.env.PIN_AREA_ID, 10) : null;
+
 if (!SUPABASE_URL || !SUPABASE_KEY || !RUN_ID || !MACHINE_NO) {
   console.error('Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / RUN_ID / MACHINE_NO');
   process.exit(1);
@@ -64,16 +73,16 @@ function decodeJwtSub(token) {
 }
 
 async function getToken() {
-  // 10-token pool test: each machine picks a slot by machine_no.
-  // m1→slot1, m2→slot2, ..., m10→slot10, m11→slot1, m12→slot2, ..., m20→slot10.
-  // Two machines share each access_token.
-  const slot = ((MACHINE_NO - 1) % 10) + 1;
+  // Slot = TOKEN_SLOT override if the dispatcher sent one (retry case),
+  // otherwise natural mapping from machine_no (m1-m10 → slot 1-10, m11-m20 → slot 1-10, ...).
+  const slot = TOKEN_SLOT_OVERRIDE || (((MACHINE_NO - 1) % 10) + 1);
   const rows = await rpc('careem_scraper_token_by_slot', { p_slot: slot });
   const row = Array.isArray(rows) ? rows[0] : rows;
   if (!row?.access_token) {
     throw new Error(`careem_scraper_token_by_slot slot=${slot} returned nothing`);
   }
-  console.log(`[m${MACHINE_NO}] using token slot ${slot} (jti=${row.jwt_jti})`);
+  const src = TOKEN_SLOT_OVERRIDE ? 'override' : 'natural';
+  console.log(`[m${MACHINE_NO}] using token slot ${slot} (${src}, jti=${row.jwt_jti})`);
   return row.access_token;
 }
 
@@ -282,6 +291,11 @@ async function main() {
   console.log(`token loaded, sub=${sub}`);
 
   let areasDone = 0, areasFailed = 0;
+  let pinConsumed = false;  // first iteration uses PIN_AREA_ID if present; after that, normal claim
+
+  if (PIN_AREA_ID) {
+    console.log(`[m${MACHINE_NO}] pinned first-area target = ${PIN_AREA_ID}`);
+  }
 
   while (true) {
     if ((Date.now() - t0) / 1000 > WALL_LIMIT_SEC) {
@@ -289,10 +303,28 @@ async function main() {
       break;
     }
     let claim;
-    try { claim = await rpc('careem_ranking_claim', {
-      p_run_id: parseInt(RUN_ID, 10),
-      p_machine_no: MACHINE_NO,
-    }); } catch (e) { console.error('claim failed:', e.message); break; }
+    try {
+      if (PIN_AREA_ID && !pinConsumed) {
+        pinConsumed = true;
+        claim = await rpc('careem_ranking_claim_pinned', {
+          p_run_id: parseInt(RUN_ID, 10),
+          p_machine_no: MACHINE_NO,
+          p_area_id: PIN_AREA_ID,
+        });
+        if (claim?.skipped) {
+          console.log(`[m${MACHINE_NO}] pinned area ${PIN_AREA_ID} not queued (${claim.reason}); falling back to normal claim`);
+          claim = await rpc('careem_ranking_claim', {
+            p_run_id: parseInt(RUN_ID, 10),
+            p_machine_no: MACHINE_NO,
+          });
+        }
+      } else {
+        claim = await rpc('careem_ranking_claim', {
+          p_run_id: parseInt(RUN_ID, 10),
+          p_machine_no: MACHINE_NO,
+        });
+      }
+    } catch (e) { console.error('claim failed:', e.message); break; }
 
     if (claim?.done) {
       console.log(`claim done: ${claim.reason}`);
