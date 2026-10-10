@@ -1,0 +1,79 @@
+# noon-uae-test-fetch.yml
+# ────────────────────────────────────────────────────────────────────────────
+# Noon Food (UAE) — end-to-end sanity test.
+# Mints a guest session via Supabase RPC, paginates listings, fetches menus.
+#
+# IF YOU ARE AN AI PICKING THIS UP:
+#   - Operational guide:  noon/README.md
+#   - Reverse-engineering log: project doc `claude/noon-keeta-findings.md`
+#   - Node script:        noon/uae/test-fetch.js
+#   - Supabase function:  public.noon_mint_session(lat, lng) in project zxsglrnjlmghplecndue
+#
+# This workflow is manual (`workflow_dispatch`) because it's a diagnostic, not
+# a scheduled scrape. For scheduled scraping, build a separate workflow that
+# iterates over all UAE areas and uploads to the real Supabase tables.
+# ────────────────────────────────────────────────────────────────────────────
+
+name: Noon UAE — test fetch (session + listings + menus)
+
+on:
+  workflow_dispatch:
+    inputs:
+      lat:
+        description: "Latitude (defaults to Dubai Marina)"
+        required: false
+        default: "25.078058170938117"
+      lng:
+        description: "Longitude (defaults to Dubai Marina)"
+        required: false
+        default: "55.15337817083452"
+      pages:
+        description: "Number of /search pages to paginate (default 3 = ~180 outlets)"
+        required: false
+        default: "3"
+      menus:
+        description: "Number of outlet menus to fetch after listing (default 10)"
+        required: false
+        default: "10"
+
+permissions:
+  contents: read
+
+jobs:
+  test-fetch:
+    runs-on: ubuntu-latest
+    # Keep this short — single-location probe should finish in under a minute.
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+        # No npm install needed — the script uses only built-ins (fetch, fs, crypto, path).
+
+      - name: Run noon test fetch
+        env:
+          # Secrets are configured at the org/repo level. These are the same
+          # secrets the Careem workflow uses — SUPABASE_SERVICE_ROLE_KEY is the
+          # only credential needed because `noon_mint_session` is granted to
+          # service_role only.
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Pass through the manual inputs.
+          NOON_LAT: ${{ github.event.inputs.lat }}
+          NOON_LNG: ${{ github.event.inputs.lng }}
+          NOON_PAGES: ${{ github.event.inputs.pages }}
+          NOON_MENUS: ${{ github.event.inputs.menus }}
+        run: node noon/uae/test-fetch.js
+
+      - name: Upload output artifact
+        if: always()  # upload even if the script failed partway — the logs still help diagnose
+        uses: actions/upload-artifact@v4
+        with:
+          name: noon-uae-test-output
+          path: noon-uae-test-output/
+          retention-days: 14
