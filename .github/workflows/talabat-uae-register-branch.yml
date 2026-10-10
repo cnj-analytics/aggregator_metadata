@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        worker_index: [0, 1, 2]
+        worker_index: [0]
     name: register worker ${{ matrix.worker_index }}
     steps:
       - uses: actions/checkout@v4
