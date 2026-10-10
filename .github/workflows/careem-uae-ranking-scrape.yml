@@ -21,6 +21,16 @@ on:
         required: false
         type: string
         default: '1000'
+      token_slot:
+        description: 'Override: token slot 1-10 (empty = use natural machine_no mapping)'
+        required: false
+        type: string
+        default: ''
+      pin_area_id:
+        description: 'Override: claim this area first (used on retry dispatch; empty = normal claim)'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: careem-uae-ranking-scrape-run-${{ inputs.run_id }}-m${{ inputs.machine_no }}
@@ -46,5 +56,7 @@ jobs:
           MACHINE_NO:     ${{ inputs.machine_no }}
           GITHUB_RUN_ID:  ${{ github.run_id }}
           PAGE_DELAY_MS:  ${{ inputs.page_delay_ms }}
+          TOKEN_SLOT:     ${{ inputs.token_slot }}
+          PIN_AREA_ID:    ${{ inputs.pin_area_id }}
           WALL_LIMIT_SEC: '21000'
         run: node careem/uae/ranking-scrape.js
