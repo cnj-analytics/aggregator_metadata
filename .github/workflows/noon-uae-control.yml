@@ -1,0 +1,92 @@
+name: Noon UAE – Control
+run-name: Noon control – ${{ inputs.action }}
+
+# Buttons for the Noon zone/area scrape. Supabase is the orchestrator.
+#   start    seed the work queue, then tell Supabase to dispatch workers
+#   stop     stop the run in progress (workers finish current item and stop)
+#   status   show settings and the last 10 runs
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'What to do'
+        type: choice
+        options: [status, start, stop]
+        default: status
+      modes:
+        description: 'Start only: which modes to seed (zone, area, or both)'
+        type: choice
+        options: [zone+area, zone, area]
+        default: zone+area
+
+permissions:
+  contents: read
+
+concurrency:
+  group: noon-uae-control
+  cancel-in-progress: false
+
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: ${{ inputs.action }}
+        env:
+          DB: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ACTION: ${{ inputs.action }}
+          MODES: ${{ inputs.modes }}
+        run: |
+          set -euo pipefail
+          q() { psql "$DB" -v ON_ERROR_STOP=1 -At -c "$1"; }
+
+          case "$ACTION" in
+            start)
+              # 1. Generate a batch ID
+              BATCH_ID="run-$(TZ=Asia/Dubai date +%Y%m%d-%H%M%S)"
+              echo "Batch ID: $BATCH_ID"
+
+              # 2. Seed the work queue
+              SEED_ARGS="--batch-id=$BATCH_ID"
+              case "$MODES" in
+                zone)      SEED_ARGS="$SEED_ARGS --mode=zone" ;;
+                area)      SEED_ARGS="$SEED_ARGS --mode=area" ;;
+                zone+area) SEED_ARGS="$SEED_ARGS --mode=zone --mode=area" ;;
+              esac
+              echo "Seeding: node noon/uae/queue-seed.js $SEED_ARGS"
+              node noon/uae/queue-seed.js $SEED_ARGS
+
+              # 3. Tell Supabase to create the run and dispatch workers
+              echo "Starting run..."
+              out="$(q "select public.noon_run_begin_with_batch('$BATCH_ID', 'manual')::text")"
+              echo "$out"
+              ;;
+            stop)
+              out="$(q "select public.noon_stop('stopped from GitHub Control')::text")"
+              echo "$out"
+              ;;
+            status)
+              out=""
+              ;;
+          esac
+
+          {
+            echo "## Noon control – $ACTION"
+            [ -n "${out:-}" ] && { echo; echo '```'; echo "$out"; echo '```'; }
+            echo; echo "### Settings"; echo '```'
+            psql "$DB" -v ON_ERROR_STOP=1 -x -c "select machines, max_replacements, delay_ms, claim_size, worker_workflow from public.noon_settings"
+            echo '```'
+            echo; echo "### Last 10 runs"; echo '```'
+            psql "$DB" -v ON_ERROR_STOP=1 -c "select * from public.noon_run_overview order by run_id desc limit 10"
+            echo '```'
+            echo; echo "### Recent log"; echo '```'
+            psql "$DB" -v ON_ERROR_STOP=1 -c "select created_at, event, machine_no, left(detail, 120) as detail from public.noon_run_log order by id desc limit 20"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
