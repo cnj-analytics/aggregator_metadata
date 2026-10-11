@@ -1,0 +1,72 @@
+name: Noon UAE – Worker (started by Supabase)
+run-name: Noon worker · run ${{ inputs.run_id }} · machine ${{ inputs.machine_no }}
+
+# One worker machine. Supabase starts this workflow (one per machine) and controls it:
+# on IP block, the worker reports to Supabase which dispatches a replacement.
+# Do not start this by hand – use "Noon UAE – Control" (Start).
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Supabase run id (set by Supabase)'
+        required: true
+        type: string
+      machine_no:
+        description: 'Machine number within the run (set by Supabase)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Machine ${{ inputs.machine_no }} of run ${{ inputs.run_id }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_ID: ${{ inputs.run_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+        run: |
+          set -euo pipefail
+          echo "Machine ${{ inputs.machine_no }} — checking IP..."
+          curl -s https://api.ipify.org && echo
+          node noon/uae/queue-worker.js 2>&1 | tee run.log
+
+      - name: Build job summary
+        if: always()
+        run: |
+          set +e
+          {
+            echo "## Worker – Machine ${{ inputs.machine_no }} (Run ${{ inputs.run_id }})"
+            echo
+            IP=$(curl -s https://api.ipify.org 2>/dev/null || echo 'unknown')
+            echo "Runner IP: $IP"
+            echo
+            echo '### Summary'
+            echo '```'
+            grep -E 'SUMMARY|worker|processed|errors|tokens used|IP blocked|items_done|report_block|STOP' run.log | tail -30
+            echo '```'
+            echo
+            echo '### Last 50 lines'
+            echo '```'
+            tail -50 run.log 2>/dev/null || echo '(no log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: noon-worker-run-${{ inputs.run_id }}-machine-${{ inputs.machine_no }}
+          path: run.log
+          if-no-files-found: warn
+          retention-days: 14
