@@ -30,14 +30,26 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   process.exit(1);
 }
 
-const MODE = (process.env.NOON_MODE || 'all').toLowerCase();
+// Parse CLI args: --batch-id=xxx --mode=zone --mode=area
+const cliArgs = process.argv.slice(2);
+function cliArg(name) {
+  const prefix = `--${name}=`;
+  const found = cliArgs.filter((a) => a.startsWith(prefix)).map((a) => a.slice(prefix.length));
+  return found.length ? found : null;
+}
+
+const cliModes = cliArg('mode');
+const MODE = cliModes
+  ? (cliModes.includes('zone') && cliModes.includes('area') ? 'all' : cliModes[0])
+  : (process.env.NOON_MODE || 'all').toLowerCase();
 const COARSE_STEP = num('NOON_COARSE_STEP', 0.05);
 const DENSE_STEP = num('NOON_DENSE_STEP', 0.01);
 const ONLY_ERRORED = process.env.NOON_ONLY_ERRORED === 'true';
 const TEST_CITY_ID = process.env.TEST_CITY_ID ? Number(process.env.TEST_CITY_ID) : null;
 
+const cliBatchId = cliArg('batch-id');
 const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 12); // 202610111200
-const BATCH_ID = process.env.NOON_BATCH_ID || `${MODE}-${ts}`;
+const BATCH_ID = (cliBatchId && cliBatchId[0]) || process.env.NOON_BATCH_ID || `${MODE}-${ts}`;
 
 // Same grid boxes as sync-areas.js.
 const UAE_BOX = { name: 'UAE (coarse)', latMin: 22.6, latMax: 26.1, lngMin: 51.5, lngMax: 56.4 };
