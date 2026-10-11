@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 // noon/uae/test-multi-token.js
 //
-// Test: mint N independent Noon sessions via Supabase, then run each in its
-// own worker making locate calls (set-location + whoami-food) directly from
-// this machine's IP. Each worker logs EVERY request so you can watch the run
-// live and see exactly when rate limits or blocks hit.
+// Test: one worker per machine, one token per worker, one IP per machine.
+// Designed to run as a GitHub Actions matrix job — each job gets its own
+// runner (own IP) and mints its own token from Supabase.
 //
-// Purpose: confirm that multiple tokens work independently and find the
-// per-token request limit (~5000 expected).
+// On 403:
+//   1. Token is burned — mint a fresh one and resume from where we left off
+//   2. If the fresh token also 403s immediately — IP is blocked, exit
+//
+// Every single request is logged so you can watch live.
 //
 // Env vars:
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY   required
-//   TOKEN_COUNT          number of tokens to mint          (default 3)
-//   REQUESTS_PER_TOKEN   max requests per token            (default 5500)
-//   DELAY_MS             delay between requests per worker (default 100)
+//   WORKER_ID            which worker this is (0, 1, 2, ...)   required
+//   REQUESTS_PER_TOKEN   max requests per token                (default 5500)
+//   DELAY_MS             delay between requests                (default 100)
 
 'use strict';
 
@@ -26,7 +28,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   process.exit(1);
 }
 
-const TOKEN_COUNT = Number(process.env.TOKEN_COUNT || '3');
+const WORKER_ID = process.env.WORKER_ID || '0';
 const REQUESTS_PER_TOKEN = Number(process.env.REQUESTS_PER_TOKEN || '5500');
 const DELAY_MS = Number(process.env.DELAY_MS || '100');
 
@@ -118,31 +120,69 @@ const TEST_POINTS = [
   [25.5600, 55.5500],  // Umm Al Quwain
 ];
 
-// ── Worker ──────────────────────────────────────────────────────────────────
+// ── Main ────────────────────────────────────────────────────────────────────
 
-async function runWorker(workerId, session) {
-  const jar = { ...(session.cookies || {}) };
-  let successes = 0;
-  let lastError = null;
+(async () => {
+  if (typeof fetch !== 'function') throw new Error('Node 18+ required');
 
-  console.log(`[worker ${workerId}] started | device_id=${session.device_id} | visitor_id=${session.visitor_id}`);
+  console.log(`[worker ${WORKER_ID}] starting on this machine`);
+  console.log(`[worker ${WORKER_ID}] requests_per_token=${REQUESTS_PER_TOKEN} delay_ms=${DELAY_MS}`);
+
+  let session = await mintSession();
+  let jar = { ...(session.cookies || {}) };
+  let tokenNumber = 1;
+  let totalSuccesses = 0;
+  let tokenSuccesses = 0;
+
+  console.log(`[worker ${WORKER_ID}] token #${tokenNumber} minted | device_id=${session.device_id} | visitor_id=${session.visitor_id}`);
+  console.log('');
 
   for (let i = 1; i <= REQUESTS_PER_TOKEN; i++) {
     const [lat, lng] = TEST_POINTS[(i - 1) % TEST_POINTS.length];
     const res = await locate(session, jar, lat, lng);
 
     if (res.ok) {
-      successes++;
-      console.log(`[worker ${workerId}] ${i}/${REQUESTS_PER_TOKEN} OK | zone=${res.zone} | lat=${lat} lng=${lng}`);
+      totalSuccesses++;
+      tokenSuccesses++;
+      console.log(`[worker ${WORKER_ID}] ${i}/${REQUESTS_PER_TOKEN} OK | token#${tokenNumber} (${tokenSuccesses} on this token) | zone=${res.zone} | lat=${lat} lng=${lng}`);
     } else {
-      lastError = `${res.step} HTTP ${res.status}`;
-      console.log(`[worker ${workerId}] ${i}/${REQUESTS_PER_TOKEN} FAIL | ${res.step} HTTP ${res.status} | lat=${lat} lng=${lng}`);
+      console.log(`[worker ${WORKER_ID}] ${i}/${REQUESTS_PER_TOKEN} FAIL | ${res.step} HTTP ${res.status} | lat=${lat} lng=${lng}`);
+
       if (res.status === 403) {
-        console.log(`[worker ${workerId}] GOT 403 — stopping this worker after ${successes} successful requests`);
-        break;
-      }
-      if (res.status === 429) {
-        console.log(`[worker ${workerId}] GOT 429 — pausing 30s then continuing`);
+        console.log(`[worker ${WORKER_ID}] GOT 403 on token #${tokenNumber} after ${tokenSuccesses} successful requests`);
+        console.log(`[worker ${WORKER_ID}] total successes so far: ${totalSuccesses}`);
+        console.log(`[worker ${WORKER_ID}] minting fresh token...`);
+
+        // Mint a new token and retry
+        try {
+          session = await mintSession();
+          jar = { ...(session.cookies || {}) };
+          tokenNumber++;
+          tokenSuccesses = 0;
+          console.log(`[worker ${WORKER_ID}] token #${tokenNumber} minted | device_id=${session.device_id} | visitor_id=${session.visitor_id}`);
+
+          // Test the new token immediately
+          const retryRes = await locate(session, jar, lat, lng);
+          if (retryRes.ok) {
+            totalSuccesses++;
+            tokenSuccesses++;
+            console.log(`[worker ${WORKER_ID}] ${i}/${REQUESTS_PER_TOKEN} RETRY OK | token#${tokenNumber} | zone=${retryRes.zone} | lat=${lat} lng=${lng}`);
+            console.log(`[worker ${WORKER_ID}] new token works — continuing`);
+          } else if (retryRes.status === 403) {
+            console.log(`[worker ${WORKER_ID}] ${i}/${REQUESTS_PER_TOKEN} RETRY FAIL | ${retryRes.step} HTTP ${retryRes.status}`);
+            console.log(`[worker ${WORKER_ID}] FRESH TOKEN ALSO 403 — IP IS BLOCKED`);
+            console.log(`[worker ${WORKER_ID}] stopping at request ${i}/${REQUESTS_PER_TOKEN}`);
+            break;
+          } else {
+            console.log(`[worker ${WORKER_ID}] ${i}/${REQUESTS_PER_TOKEN} RETRY FAIL | ${retryRes.step} HTTP ${retryRes.status} — continuing`);
+          }
+        } catch (mintErr) {
+          console.log(`[worker ${WORKER_ID}] MINT FAILED: ${mintErr.message}`);
+          console.log(`[worker ${WORKER_ID}] stopping at request ${i}/${REQUESTS_PER_TOKEN}`);
+          break;
+        }
+      } else if (res.status === 429) {
+        console.log(`[worker ${WORKER_ID}] GOT 429 — pausing 30s then continuing`);
         await sleep(30000);
       }
     }
@@ -150,45 +190,12 @@ async function runWorker(workerId, session) {
     await sleep(DELAY_MS);
   }
 
-  console.log(`[worker ${workerId}] DONE | ${successes} successes out of ${REQUESTS_PER_TOKEN} max | last_error=${lastError || 'none'}`);
-  return { workerId, successes, lastError, deviceId: session.device_id };
-}
-
-// ── Main ────────────────────────────────────────────────────────────────────
-
-(async () => {
-  if (typeof fetch !== 'function') throw new Error('Node 18+ required');
-
-  console.log(`[test] minting ${TOKEN_COUNT} tokens...`);
-
-  const sessions = [];
-  for (let i = 0; i < TOKEN_COUNT; i++) {
-    const s = await mintSession();
-    sessions.push(s);
-    console.log(`[test] token ${i} minted | device_id=${s.device_id} | zone=${s.food_zonecode}`);
-  }
-
-  console.log(`[test] all ${TOKEN_COUNT} tokens minted — starting workers`);
-  console.log(`[test] requests_per_token=${REQUESTS_PER_TOKEN} delay_ms=${DELAY_MS}`);
-  console.log('');
-
-  const results = await Promise.all(
-    sessions.map((s, i) => runWorker(i, s))
-  );
-
   console.log('');
   console.log('=== SUMMARY ===');
-  for (const r of results) {
-    console.log(`  worker ${r.workerId}: ${r.successes} successes | device_id=${r.deviceId} | last_error=${r.lastError || 'none'}`);
-  }
-
-  const allHit403 = results.every((r) => r.lastError && r.lastError.includes('403'));
-  const totalSuccesses = results.reduce((sum, r) => sum + r.successes, 0);
-  console.log(`  total successes across all workers: ${totalSuccesses}`);
-  if (allHit403) {
-    console.log('  ALL workers hit 403 — per-token limit confirmed');
-  }
+  console.log(`  worker ${WORKER_ID}: ${totalSuccesses} total successes out of ${REQUESTS_PER_TOKEN} max`);
+  console.log(`  tokens used: ${tokenNumber}`);
+  console.log(`  last token successes: ${tokenSuccesses}`);
 })().catch((e) => {
-  console.error('[test] FATAL:', e);
+  console.error('[worker] FATAL:', e);
   process.exit(1);
 });
