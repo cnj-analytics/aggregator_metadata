@@ -22,16 +22,21 @@
 
 ```
 noon/
-├── README.md                        ← you are here
+├── readme.md                        ← you are here
 └── uae/
-    └── test-fetch.js                ← Node.js script that proves end-to-end
+    ├── test-fetch.js                ← Node.js script that proves end-to-end
+    ├── sync-areas.js                ← city/hub/zone discovery + area active-status
+    └── sql/001_noon_city_hub_zone_area.sql  ← DDL for the geography tables
 
 .github/workflows/
-└── noon-uae-test-fetch.yml          ← workflow_dispatch runner
+├── noon-uae-test-fetch.yml          ← workflow_dispatch runner
+└── noon-uae-sync-areas.yml          ← builds noon_city/hub/zone/area
 
 Supabase (project zxsglrnjlmghplecndue):
 ├── public.noon_mint_session(lat, lng)   ← SECURITY DEFINER function
-└── public.noon_auth_session              ← audit log table (RLS enabled)
+├── public.noon_auth_session              ← audit log table (RLS enabled)
+├── public.noon_city / noon_hub / noon_zone / noon_area   ← geography (see below)
+└── public.noon_refresh_active()         ← active roll-up area → zone → hub → city
 ```
 
 The function does ALL the auth work. Scrapers only need to call it, then use the returned cookies + zone-code headers for subsequent `/search` and `/outlet/details/guest/partial` calls.
@@ -217,6 +222,52 @@ Noon's `nguestv2` JWT lives for 5 minutes. Caching would mean refreshing every 4
 | `/search` returns the SAME outlets repeatedly | searchToken not being chained from response→next request | Check that your scraper reads `response.searchToken` and sends it as `body.searchToken` next time |
 | `/outlet/details/guest/partial` returns empty data | Likely a bad `outletCode` or lat/lng mismatch | lat/lng in body MUST be int `*1e7`, not float |
 | HTTP 429 or Akamai challenge | Scraping too aggressively | Add delays (200-500ms between calls); use a fresh session per scrape job |
+
+---
+
+## How Noon geography works (verified 2026-10-11) → city / hub / zone / area tables
+
+**Native hierarchy = the food zone code.** `whoami?experience=food` returns `x-food-zonecode`, e.g.
+`FOOD-AE-DXB-HUB4-DUBAI_MARINA` = country `AE` / city `DXB` / hub `4` / zone `DUBAI_MARINA`.
+A first UAE scan found 12 city codes (DXB, AUH, SHJ, QAJ=Ajman, UAQ, RAK, FUJ, AAN=Al Ain, DIB=Dibba,
+MDZ=Madinat Zayed, RUW=Ruwais, ADH=Al Dhaid) and ~86 zones. Hub numbers repeat across cities.
+
+**There is no native area level.** No area IDs, names or URLs anywhere (the web app has only
+`/outlet/<code>` and search routes; location is set purely by lat/lng).
+
+**Listings depend on coordinates, not on the zone.**
+- Swap test: zone headers from Marina + coordinates in Al Barsha → the Al Barsha list (and vice versa).
+- Same zone, different Talabat area centroids → ~80-85% shared restaurants, different order and distances.
+- Nearby points are snapped by Noon to hidden internal points: e.g. Talabat "Dubai Marina" and "JBR"
+  get an identical list (same order, same distances). The grouping matches no standard grid
+  (rounded coords, geohash, H3, S2). Distances in the listing are road distances.
+- Noon assigns a zone even to sea/desert points, so "zone exists" ≠ "restaurants listed".
+- `/outlet/details/guest/partial` returns `outletLat` / `outletLng` / `roadDistance` per outlet.
+
+**Supabase tables** (DDL: `noon/uae/sql/001_noon_city_hub_zone_area.sql`):
+
+```
+aggregator_country ─┬─ noon_city   (noon_city_code PK, talabat_city_id FK)
+                    │    └─ noon_hub    (noon_hub_id 'DXB-HUB4' PK)
+                    │         └─ noon_zone  (noon_zone_code PK, representative lat/lng, bbox)
+                    │              └─ noon_area (sampling points; FK zone/hub/city;
+                    │                            talabat_area_id FK for Talabat-sourced rows)
+talabat_area ───────┘
+```
+
+- `noon_area` = every Talabat UAE area centroid (`area_source='talabat'`) + one fill-in point for each
+  Noon zone with no Talabat area (`area_source='noon_zone'`). Upsert key `source_key`.
+- `is_active` on an area = Noon lists ≥ 1 restaurant on page 1 at its lat/lng.
+  `noon_refresh_active()` rolls it up area → zone → hub → city.
+- `listing_fingerprint` = md5 of the first page (codes + distances). Areas sharing it get the same list —
+  downstream listing scrapes can skip duplicates.
+
+**Workflow:** `.github/workflows/noon-uae-sync-areas.yml` → `noon/uae/sync-areas.js`
+- `mode=zones` grid scan (coarse 0.05° whole UAE + 0.01° populated regions) → city/hub/zone.
+- `mode=areas` probe areas → noon_area + roll-up. `only_errored=true` retries failures.
+- `mode=all` both (first build).
+- Rate limits: listing calls get HTTP 429 when hammered; the script probes areas serially with a delay
+  and pauses 30 s on 429. Location lookups tolerated ~6/s in testing.
 
 ---
 
