@@ -1,0 +1,117 @@
+name: Noon UAE – Sync Areas (zones + area active-status)
+run-name: Noon sync-areas – ${{ inputs.mode }}${{ inputs.only_errored == 'true' && ' (retry errored)' || '' }}${{ inputs.test_city_id != '' && format(' (talabat city_id={0})', inputs.test_city_id) || '' }}
+
+# Builds Noon Food UAE geography in Supabase:
+#   mode=zones  grid-scan the UAE, upsert noon_city / noon_hub / noon_zone
+#               (native Noon hierarchy from the food zone code). ~16k points,
+#               ~45-60 min at the defaults.
+#   mode=areas  probe every Talabat UAE area centroid (+ one fill-in point per
+#               Noon zone with no Talabat area): zone link + first listing page.
+#               Upserts noon_area and rolls is_active up area -> zone -> hub ->
+#               city via noon_refresh_active(). ~600 points, ~20-30 min.
+#   mode=all    zones, then areas. Use this for the first build.
+#
+# Script: noon/uae/sync-areas.js   Guide: noon/readme.md
+# Sessions are minted by Supabase RPC noon_mint_session (service_role).
+# A failed area probe never demotes an active area; the job goes red and
+# only_errored=true retries just those rows.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'What to run'
+        type: choice
+        options: ['all', 'zones', 'areas']
+        default: 'all'
+      test_city_id:
+        description: 'Areas mode only: probe one Talabat city_id (empty = all UAE). 35 Dubai, 43 Abu Dhabi, 44 Sharjah, 48 RAK, 49 Al Ain, 50 Ajman, 96 Fujairah, 125 UAQ.'
+        type: string
+        default: ''
+      only_errored:
+        description: 'Areas mode only: re-probe only areas with probe_error set or never probed'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      coarse_step:
+        description: 'Zones: grid spacing (degrees) over the whole UAE box'
+        type: string
+        default: '0.05'
+      dense_step:
+        description: 'Zones: grid spacing (degrees) over populated regions (0.01 ≈ 1.1 km)'
+        type: string
+        default: '0.01'
+      zone_concurrency:
+        description: 'Zones: parallel location lookups'
+        type: string
+        default: '4'
+      area_delay_ms:
+        description: 'Areas: delay (ms) between area probes'
+        type: string
+        default: '1500'
+      min_restaurants:
+        description: 'Areas: restaurants on page 1 needed for an area to be active'
+        type: string
+        default: '1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: noon-uae-sync-areas
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Noon sync-areas
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          NOON_MODE: ${{ inputs.mode }}
+          NOON_COARSE_STEP: ${{ inputs.coarse_step }}
+          NOON_DENSE_STEP: ${{ inputs.dense_step }}
+          NOON_ZONE_CONCURRENCY: ${{ inputs.zone_concurrency }}
+          NOON_AREA_DELAY_MS: ${{ inputs.area_delay_ms }}
+          NOON_MIN_RESTAURANTS: ${{ inputs.min_restaurants }}
+          NOON_ONLY_ERRORED: ${{ inputs.only_errored }}
+          TEST_CITY_ID: ${{ inputs.test_city_id }}
+        run: |
+          set -euo pipefail
+          node noon/uae/sync-areas.js 2>&1 | tee run.log
+
+      - name: Build job summary
+        if: always()
+        run: |
+          set +e
+          {
+            echo "## Noon sync-areas (mode: ${{ inputs.mode }})"
+            echo
+            echo '### Key lines'
+            echo '```'
+            grep -E '^\[(zones|noon)\]|roll-up|probed,|distinct first-page|Noon zone\(s\) have no' run.log | grep -v '^\[zones\]   ' | tail -60
+            echo '```'
+            echo
+            echo '### Run log (tail)'
+            echo '```'
+            tail -80 run.log 2>/dev/null || echo '(no log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: noon-sync-areas-${{ github.run_id }}
+          path: run.log
+          if-no-files-found: warn
+          retention-days: 14
