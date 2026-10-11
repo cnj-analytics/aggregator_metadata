@@ -1,21 +1,22 @@
 name: Noon UAE – Test Multi-Token
-run-name: Noon multi-token test – ${{ inputs.token_count }} tokens × ${{ inputs.requests_per_token }} requests
+run-name: Noon multi-token test – ${{ inputs.worker_count }} workers × ${{ inputs.requests_per_token }} requests
 
-# Test script: mint N independent Noon sessions via Supabase, then run N
-# workers in parallel — each worker uses its own token to make locate calls
-# (set-location + whoami-food) directly from GitHub Actions' IP.
+# Test: each worker runs on its own GitHub Actions runner (own IP),
+# mints its own token from Supabase, and makes locate calls directly.
+# On 403: mints fresh token and retries. If fresh token also 403s,
+# IP is blocked and worker exits.
 # Every single request is logged so you can watch live.
-# Purpose: confirm multi-token independence and find the per-token limit.
 
 on:
   workflow_dispatch:
     inputs:
-      token_count:
-        description: 'Number of tokens to mint'
-        type: string
+      worker_count:
+        description: 'Number of workers (each gets its own machine/IP)'
+        type: choice
+        options: ['1', '2', '3', '4', '5']
         default: '3'
       requests_per_token:
-        description: 'Max requests per token (will stop early on 403)'
+        description: 'Max requests per worker (will stop early on IP block)'
         type: string
         default: '5500'
       delay_ms:
@@ -34,6 +35,16 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_id: ${{ fromJson(
+          inputs.worker_count == '1' && '[0]' ||
+          inputs.worker_count == '2' && '[0,1]' ||
+          inputs.worker_count == '3' && '[0,1,2]' ||
+          inputs.worker_count == '4' && '[0,1,2,3]' ||
+          inputs.worker_count == '5' && '[0,1,2,3,4]'
+          ) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -42,15 +53,17 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Run multi-token test
+      - name: Run worker ${{ matrix.worker_id }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          TOKEN_COUNT: ${{ inputs.token_count }}
+          WORKER_ID: ${{ matrix.worker_id }}
           REQUESTS_PER_TOKEN: ${{ inputs.requests_per_token }}
           DELAY_MS: ${{ inputs.delay_ms }}
         run: |
           set -euo pipefail
+          echo "Worker ${{ matrix.worker_id }} — checking IP..."
+          curl -s https://api.ipify.org && echo
           node noon/uae/test-multi-token.js 2>&1 | tee run.log
 
       - name: Build job summary
@@ -58,17 +71,20 @@ jobs:
         run: |
           set +e
           {
-            echo "## Noon Multi-Token Test"
-            echo "Tokens: ${{ inputs.token_count }} | Max requests/token: ${{ inputs.requests_per_token }} | Delay: ${{ inputs.delay_ms }}ms"
+            echo "## Worker ${{ matrix.worker_id }}"
+            echo "Max requests: ${{ inputs.requests_per_token }} | Delay: ${{ inputs.delay_ms }}ms"
+            echo
+            IP=$(curl -s https://api.ipify.org 2>/dev/null || echo 'unknown')
+            echo "Runner IP: $IP"
             echo
             echo '### Summary'
             echo '```'
-            grep -E 'SUMMARY|worker [0-9]+:|total successes|confirmed' run.log | tail -20
+            grep -E 'SUMMARY|worker [0-9]+:|total successes|tokens used|IP IS BLOCKED|FRESH TOKEN' run.log | tail -20
             echo '```'
             echo
-            echo '### Last 100 lines'
+            echo '### Last 50 lines'
             echo '```'
-            tail -100 run.log 2>/dev/null || echo '(no log)'
+            tail -50 run.log 2>/dev/null || echo '(no log)'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -76,7 +92,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: noon-multi-token-test-${{ github.run_id }}
+          name: noon-multi-token-worker-${{ matrix.worker_id }}-${{ github.run_id }}
           path: run.log
           if-no-files-found: warn
           retention-days: 14
