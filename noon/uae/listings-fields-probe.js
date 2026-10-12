@@ -302,6 +302,8 @@ async function fetchPage(loc, searchToken) {
     status: resp.status,
     cards: walkForOutlets(json.results || []),
     token: json.searchToken || null,
+    nbPages: Number.isFinite(json.nbPages) ? json.nbPages : null,
+    nbHits: Number.isFinite(json.nbHits) ? json.nbHits : null,
     bytes: text.length,
     ms,
     envelopeKeys: Object.keys(json),
@@ -398,6 +400,7 @@ async function probeArea(session, area) {
       noon_zone_code: loc.foodZone, latitude: lat, longitude: lng,
       page_no: page, sent_search_token: sentToken, got_search_token: r.token,
       http_status: r.status, cards_on_page: r.cards.length, new_outlets: fresh.length,
+      nb_pages: r.nbPages, nb_hits: r.nbHits,
       response_bytes: r.bytes, elapsed_ms: r.ms,
       envelope_keys: JSON.stringify(r.envelopeKeys), error: null,
     }]);
@@ -422,11 +425,16 @@ async function probeArea(session, area) {
       }
     }
 
-    console.log(`[probe]   page ${String(page).padStart(2)}  cards=${String(r.cards.length).padStart(2)}  new=${String(fresh.length).padStart(2)}  unique=${seen.size}  ${r.bytes}B  ${r.ms}ms  token=${r.token ? 'yes' : 'NONE'}`);
+    console.log(`[probe]   page ${String(page).padStart(2)}/${r.nbPages ?? '?'}  cards=${String(r.cards.length).padStart(2)}  new=${String(fresh.length).padStart(2)}  unique=${seen.size}  nbHits=${r.nbHits ?? '?'}  ${r.bytes}B  ${r.ms}ms  token=${r.token ? 'yes' : 'NONE'}`);
 
     if (r.cards.length === 0) { stopReason = `empty page at ${page}`; break; }
     if (fresh.length === 0) { stopReason = `no new outlets at page ${page}`; break; }
     if (!r.token) { stopReason = `no searchToken returned at page ${page}`; break; }
+
+    // Advance the cursor. /search ignores `page`; the response's searchToken is
+    // the only thing that moves the window forward, so it MUST be chained into
+    // the next request or every page re-serves the first 60 outlets.
+    token = r.token;
 
     await sleep(DELAY_MS);
   }
