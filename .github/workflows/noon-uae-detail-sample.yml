@@ -16,10 +16,10 @@ on:
   workflow_dispatch:
     inputs:
       delay_ms:
-        description: 'Delay between detail calls (ms)'
+        description: 'Delay between detail calls (ms) — 4000 sits under the refill rate'
         required: false
         type: string
-        default: '1000'
+        default: '4000'
       sample_limit:
         description: 'Max outlets to fetch this run'
         required: false
@@ -47,7 +47,7 @@ concurrency:
 jobs:
   sample:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
