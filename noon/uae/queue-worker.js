@@ -178,8 +178,30 @@ async function mintSession(lat = 25.078058170938117, lng = 55.15337817083452) {
   return { ...s, mintedAt: Date.now() };
 }
 
+const TOKEN_LIFETIME_MS = 300000;   // Noon's nguestv2 lives 5 minutes
+
 class NoonWorker {
   constructor(id) { this.id = id; this.session = null; this.tokenNumber = 0; }
+
+  // Milliseconds of usable life left on the current token, by whichever runs
+  // out first: the JWT's own exp, or 5 minutes from when we minted it.
+  remainingMs() {
+    if (!this.session) return 0;
+    const byExp = this.session.nguestv2_exp
+      ? Date.parse(this.session.nguestv2_exp) - Date.now()
+      : Infinity;
+    const byAge = this.session.mintedAt + TOKEN_LIFETIME_MS - Date.now();
+    return Math.max(0, Math.min(byExp, byAge));
+  }
+
+  // Guarantee at least `needMs` of token life before starting a unit of work.
+  // A token minted seconds ago is reused, so this never double-mints straight
+  // after a rotation.
+  async ensureFresh(needMs) {
+    if (this.remainingMs() >= needMs) return this.session;
+    return this.remint();
+  }
+
   async ensure() {
     const exp = this.session && this.session.nguestv2_exp ? Date.parse(this.session.nguestv2_exp) : 0;
     if (!this.session || Date.now() > Math.min(exp - 60000, this.session.mintedAt + 240000)) {
@@ -329,6 +351,13 @@ async function processAreaItem(worker, item) {
 async function processListingItem(worker, item) {
   const areaId = item.noon_area_id;
   if (!areaId) throw new Error('listing item has no noon_area_id');
+
+  // ONE TOKEN PER AREA. Measured: an area takes ~125s median, 211s at p90,
+  // 262s worst, against a 300s token. Minting at the start of the area means
+  // the whole page walk runs on one fresh token instead of straddling an
+  // expiry partway through. A token minted moments ago (e.g. by a 429
+  // rotation) still has its life left and is reused rather than replaced.
+  await worker.ensureFresh(280000);
 
   const loc = await locate(worker, item.latitude, item.longitude);
   if (!loc.foodZone) {
