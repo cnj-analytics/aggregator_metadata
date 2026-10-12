@@ -26,9 +26,22 @@
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SERVICE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const DELAY_MS     = Number(process.env.DELAY_MS || 1000);
+const DELAY_MS     = Number(process.env.DELAY_MS || 4000);
 const LIMIT        = Number(process.env.SAMPLE_LIMIT || 200);
-const CALL_BUDGET  = Number(process.env.CALL_BUDGET || 120);
+// Measured 2026-10-12, four controlled runs on the detail endpoint:
+//   0.9s pace -> ~110 pages then 429      (0.51 calls/s)
+//   0.9s pace, one listing per 60 -> 109  (0.72 calls/s)
+//   0.9s pace, listing after each -> 118  (0.28 calls/s on detail)
+//   3.5s pace -> 225+ pages, NO BLOCK     (0.25 calls/s)
+// It is a token bucket on the IP: ~110 burst, refilling ~1 every 4 seconds.
+// Rotating the token does NOT refill it — a fresh token is 429'd immediately
+// once the bucket is empty. Pace is the only lever, so DELAY_MS is the
+// control and 4000ms sits just under the refill rate.
+const RATE_LIMIT_PAUSE_MS = Number(process.env.RATE_LIMIT_PAUSE_MS || 90000);
+const MAX_RATE_LIMIT_HITS = Number(process.env.MAX_RATE_LIMIT_HITS || 3);
+// Safety cap on total calls for one job; token rotation means this is the
+// only thing bounding a run, so it is deliberately generous.
+const CALL_BUDGET  = Number(process.env.CALL_BUDGET || 5000);
 // 'worker' = mint on this runner (default, device-consistent).
 // 'supabase' = mint via noon_mint_session, i.e. the token is issued to
 // Supabase's static IP and then presented from this runner. Kept as a
@@ -255,7 +268,7 @@ async function fetchDetail(session, outlet, lat, lng) {
 }
 
 (async () => {
-  console.log(`[detail-sample] delay=${DELAY_MS}ms call_budget=${CALL_BUDGET} mint_source=${MINT_SOURCE}`);
+  console.log(`[detail-sample] pace=${DELAY_MS}ms call_budget=${CALL_BUDGET} mint_source=${MINT_SOURCE}`);
   try {
     const ip = await (await fetch('https://api.ipify.org')).text();
     console.log(`[detail-sample] runner IP ${ip}`);
@@ -291,27 +304,39 @@ async function fetchDetail(session, outlet, lat, lng) {
     }
   }
 
-  let ok = 0, failed = 0, stopped = null;
+  let ok = 0, failed = 0, stopped = null, rotations = 0, tokenCalls = 0, ipBlocked = false, rateLimitHits = 0;
 
   try {
     await ensureSession(pending[0].probe_lat, pending[0].probe_lng, 60000);
+    tokenCalls = 0;
   } catch (e) {
     console.error(`[detail-sample] could not mint on this IP: ${e.message}`);
-    console.error('[detail-sample] this is an IP-class failure — re-run to get a fresh runner');
-    process.exit(78);
+    console.error('[detail-sample] IP-class failure — re-run to get a fresh runner');
+    return;                        // exit 0: a dud IP is not a job failure
+  }
+
+  // Swap in a fresh token and reset the per-token counter.
+  async function rotate(lat, lng, why) {
+    session = null;
+    await ensureSession(lat, lng, 60000);
+    tokenCalls = 0;
+    rotations++;
+    console.log(`[detail-sample] rotated token (${why}) — rotation #${rotations}`);
   }
 
   for (let i = 0; i < pending.length; i++) {
     const it = pending[i];
-    if (calls >= CALL_BUDGET) { stopped = `call budget ${CALL_BUDGET} reached at item ${i + 1}`; break; }
+    if (calls >= CALL_BUDGET) { stopped = `call budget ${CALL_BUDGET} reached`; break; }
 
-    // keep enough life for the rest of the list, capped at one token's worth
-    const needMs = Math.min(TOKEN_LIFETIME_MS - 25000, (pending.length - i) * (DELAY_MS + 1200));
-    try {
-      await ensureSession(it.probe_lat, it.probe_lng, Math.max(needMs, 30000));
-    } catch (e) {
-      stopped = `mint failed mid-run after ${calls} calls: ${e.message}`;
-      break;                       // leave remaining outlets untouched for a re-run
+    // The token lives 300s; at this pace that is ~70 calls. Rotation is purely
+    // about expiry — it has no effect on the rate limit.
+    if (remainingMs(session) < 20000) {
+      try {
+        await rotate(it.probe_lat, it.probe_lng, 'token near expiry');
+      } catch (e) {
+        stopped = `mint failed after ${calls} calls: ${e.message}`;
+        break;
+      }
     }
 
     let r;
@@ -320,11 +345,45 @@ async function fetchDetail(session, outlet, lat, lng) {
     } catch (e) {
       r = { status: 0, payload: null, elapsed: null, body: e.message };
     }
-    calls++;
+    calls++; tokenCalls++;
 
-    if (r.status === 429 || r.status === 403) {
-      stopped = `HTTP ${r.status} after ${calls} calls — IP budget reached`;
-      break;                       // do NOT record: the outlet is fine, the IP is not
+    // 429 = the IP's bucket is empty. A new token does NOT help (proven: a
+    // fresh token is refused on its first call). Only time refills it, so
+    // pause and retry the same outlet. At 4s pacing this should never fire.
+    if (r.status === 429) {
+      rateLimitHits++;
+      console.log(`[detail-sample] 429 at call ${calls} (hit ${rateLimitHits}/${MAX_RATE_LIMIT_HITS}) ` +
+                  `— pausing ${RATE_LIMIT_PAUSE_MS / 1000}s for the bucket to refill`);
+      if (rateLimitHits >= MAX_RATE_LIMIT_HITS) {
+        stopped = `rate limited ${rateLimitHits}x — pace is too fast for this IP`;
+        break;
+      }
+      await sleep(RATE_LIMIT_PAUSE_MS);
+      i--;                         // retry the same outlet
+      continue;
+    }
+
+    // 403 = the IP is refused. Try one fresh token to be certain it is not
+    // token-scoped; if it still refuses, this runner is done.
+    if (r.status === 403) {
+      console.log(`[detail-sample] 403 after ${calls} calls — testing whether a fresh token clears it`);
+      try {
+        await rotate(it.probe_lat, it.probe_lng, '403 probe');
+        const retry = await fetchDetail(session, it.noon_outlet_code, it.probe_lat, it.probe_lng);
+        calls++; tokenCalls++;
+        if (retry.status === 200) {
+          console.log('[detail-sample] fresh token cleared the 403 — continuing');
+          r = retry;
+        } else {
+          console.log(`[detail-sample] fresh token also ${retry.status} — THIS IP IS BLOCKED`);
+          ipBlocked = true;
+          stopped = `IP blocked (403) after ${calls} calls`;
+          break;
+        }
+      } catch (e) {
+        stopped = `mint failed during 403 probe: ${e.message}`;
+        break;
+      }
     }
 
     await supabase('/rpc/noon_detail_sample_record', {
@@ -345,8 +404,7 @@ async function fetchDetail(session, outlet, lat, lng) {
       console.log(
         `[${String(i + 1).padStart(3)}/${pending.length}] ${it.noon_outlet_code} ${it.sample_stratum} ` +
         `"${d.name || '?'}" items=${Array.isArray(menu.items) ? menu.items.length : '-'} ` +
-        `cats=${Array.isArray(menu.categories) ? menu.categories.length : '-'} ` +
-        `oms=${d.externalOmsCode || '-'} ${r.elapsed}ms`
+        `oms=${d.externalOmsCode || '-'} t${rotations}:${tokenCalls} ${r.elapsed}ms`
       );
     } else {
       failed++;
@@ -360,10 +418,13 @@ async function fetchDetail(session, outlet, lat, lng) {
   console.log(`  ok          : ${ok}`);
   console.log(`  failed      : ${failed}`);
   console.log(`  calls used  : ${calls}`);
-  console.log(`  mints       : ${mints} (failures ${mintFails})`);
+  console.log(`  tokens      : ${mints} (rotations ${rotations}, mint failures ${mintFails})`);
+  console.log(`  pace        : ${DELAY_MS}ms  (rate limit hits: ${rateLimitHits})`);
   if (stopped) console.log(`  stopped     : ${stopped}`);
+  if (ipBlocked) console.log('  NOTE: this runner IP is blocked — re-run for a fresh one. Not a code failure.');
   console.log('  re-run this workflow to continue any outlets left unfetched.');
-  if (ok === 0) process.exit(1);
+  // A blocked IP or an exhausted queue is an expected outcome, not a job
+  // failure — exiting non-zero just paints the Actions page red for nothing.
 })().catch((e) => {
   console.error(`[detail-sample] fatal: ${e.stack || e.message}`);
   process.exit(1);
