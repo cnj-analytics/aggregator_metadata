@@ -1,0 +1,135 @@
+name: Noon UAE – Listings Fields Probe
+run-name: Noon listings probe · ${{ inputs.area_ids != '' && inputs.area_ids || format('sample of {0}', inputs.area_sample) }}
+
+# Phase 2 step 1: capture the RAW restaurant cards from the Noon area listing
+# endpoint so we can enumerate every available field before designing
+# noon_restaurant_list_queue.
+#
+# Pagination runs until the list is exhausted — an empty page, a page with no
+# new outlet, or no searchToken returned. There is no page limit.
+# page_safety_cap is a runaway guard only; if a run reports hitting it, that is
+# a bug to investigate, not a normal stop.
+#
+# Pace is deliberate, not fast: one page per second, 3 s between areas, 30 s
+# pause on HTTP 429, and the job stops cleanly between areas once
+# wall_limit_sec is passed so it always lands inside a 3-hour budget.
+#
+# Leave area_ids empty for an automatic spread of areas (densest overall, a
+# noon_zone fill-in point, the sparsest non-empty area, plus the densest area
+# of other cities). Set area_ids to re-probe specific areas, or raise
+# area_sample to cover everything.
+#
+# This is a read-only probe against Noon plus inserts into two throwaway
+# tables. It does not touch noon_city / noon_hub / noon_zone / noon_area.
+
+on:
+  workflow_dispatch:
+    inputs:
+      area_ids:
+        description: 'Comma-separated noon_area_id list (empty = auto sample)'
+        required: false
+        type: string
+        default: ''
+      area_sample:
+        description: 'How many areas to sample when area_ids is empty'
+        required: false
+        type: string
+        default: '5'
+      delay_ms:
+        description: 'Delay between page requests (ms)'
+        required: false
+        type: string
+        default: '1000'
+      area_delay_ms:
+        description: 'Delay between areas (ms)'
+        required: false
+        type: string
+        default: '3000'
+      wall_limit_sec:
+        description: 'Stop between areas after this many seconds (default 2h50m)'
+        required: false
+        type: string
+        default: '10200'
+      page_safety_cap:
+        description: 'Runaway guard only — pages per area before giving up'
+        required: false
+        type: string
+        default: '500'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: noon-uae-listings-fields-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 190
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Probe listings
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          AREA_IDS: ${{ inputs.area_ids }}
+          AREA_SAMPLE: ${{ inputs.area_sample }}
+          DELAY_MS: ${{ inputs.delay_ms }}
+          AREA_DELAY_MS: ${{ inputs.area_delay_ms }}
+          WALL_LIMIT_SEC: ${{ inputs.wall_limit_sec }}
+          PAGE_SAFETY_CAP: ${{ inputs.page_safety_cap }}
+        run: |
+          set -euo pipefail
+          export PROBE_BATCH="probe-$(TZ=Asia/Dubai date +%Y%m%d-%H%M%S)"
+          echo "PROBE_BATCH=$PROBE_BATCH" >> "$GITHUB_ENV"
+          echo "Runner IP: $(curl -s https://api.ipify.org)"
+          node noon/uae/listings-fields-probe.js 2>&1 | tee run.log
+
+      - name: Field inventory
+        if: always()
+        env:
+          DB: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set +e
+          {
+            echo "## Noon listings field probe – ${PROBE_BATCH:-unknown}"
+            echo
+            echo '### Per-area result'
+            echo '```'
+            psql "$DB" -c "select * from public.noon_restaurant_list_probe_areas where probe_batch = '${PROBE_BATCH}'"
+            echo '```'
+            echo
+            echo '### Pages that did not exhaust cleanly'
+            echo '```'
+            psql "$DB" -c "select noon_area_id, area_name, page_no, http_status, cards_on_page, new_outlets, left(error,120) as error from public.noon_restaurant_list_probe_page where probe_batch = '${PROBE_BATCH}' and error is not null order by noon_area_id, page_no"
+            echo '```'
+            echo
+            echo '### Field inventory (every path, fill rate, samples)'
+            echo '```'
+            psql "$DB" -c "select path, json_types, cards_with_field, fill_pct, distinct_values, sample_values from public.noon_restaurant_list_probe_fields limit 200"
+            echo '```'
+            echo
+            echo '### Restaurants appearing in more than one probed area'
+            echo '```'
+            psql "$DB" -c "select areas_seen_in, count(*) as restaurants from public.noon_restaurant_list_probe_overlap group by 1 order by 1 desc"
+            echo '```'
+            echo
+            echo '### Last 40 log lines'
+            echo '```'
+            tail -40 run.log 2>/dev/null || echo '(no log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: noon-listings-fields-probe-${{ github.run_id }}
+          path: run.log
+          if-no-files-found: warn
+          retention-days: 14
