@@ -22,7 +22,11 @@ permissions:
 jobs:
   worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # 504 listing areas at ~104s each is ~14.5 machine-hours; across 4 machines
+    # that is ~3h40m per machine. The old 180 cap killed workers mid-run, and a
+    # killed job never releases its claimed items. 330 leaves headroom under
+    # GitHub's 6h ceiling.
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
