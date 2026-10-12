@@ -15,14 +15,21 @@
 //                noon_restaurant_list_queue. A restaurant already in the queue
 //                only gains this area in its noon_area_ids.
 //
-// On token 403:  mint a fresh token and retry.
-// On IP block (fresh token also 403s): report to Supabase → exit.
-// On HTTP 429:   a 429 is not a dead IP, it is this IP being told to slow down.
-//                So the machine does three things, in order: drop its call rate
-//                immediately, finish ONLY the area it is currently on, then hand
-//                every other claimed item back and retire. Supabase starts a
-//                replacement machine — a fresh runner, so a new IP, and it mints
-//                a new token on boot. Carrying on through 429s just burns the IP.
+// Throttling is handled by ROTATING THE TOKEN, not the machine. Evidence from
+// the first full sweep: every replacement runner had a brand-new IP and still
+// hit 429 after ~100-150 requests, so the budget follows the guest session, not
+// the address. Swapping machines to escape it burns runners for nothing.
+//
+// On 403 or 429:  mint a fresh token and retry the same item.
+//   fresh token 403s too → the IP really is blocked → report, retire, replace.
+//   fresh token 429s too → throttling is not token-scoped here → report, retire,
+//                          replace.
+// A 429 also permanently slows this machine's call rate, since the server has
+// said we are going too fast either way.
+//
+// An item is NEVER marked 'error' because of throttling. On stand-down the
+// in-flight item is released back to 'pending' with everything else still
+// claimed, so the queue always completes.
 //
 // Every single request is logged line-by-line.
 //
@@ -397,8 +404,9 @@ async function processListingItem(worker, item) {
   const CLAIM_SIZE = checkin.claim_size || 50;
   const WORKER_ID = `run${RUN_ID}-m${MACHINE_NO}`;
   const RATE_LIMIT_PAUSE_MS = 30000;
-  const RATE_LIMIT_SLOWDOWN = 5;      // multiply the delay on the first 429
-  const RATE_LIMIT_MAX_DELAY = 5000;  // ms, ceiling for the slowed rate
+  const RATE_LIMIT_SLOWDOWN = 2;      // multiply the delay each time we are throttled
+  const RATE_LIMIT_MAX_DELAY = 6000;  // ms, ceiling for the slowed rate
+  const MAX_TOKEN_ROTATIONS = 1;      // fresh tokens to try per item before standing down
 
   console.log(`[machine ${MACHINE_NO}] batch=${BATCH_ID} | claim_size=${CLAIM_SIZE} | delay=${DELAY_MS}ms`);
 
@@ -406,14 +414,14 @@ async function processListingItem(worker, item) {
   let totalProcessed = 0;
   let totalErrors = 0;
   let ipBlocked = false;
-  let rateLimited = false;   // 429 seen: finish this area, then retire
+  let standDown = false;     // fresh token still throttled: retire and hand over
   let delayMs = DELAY_MS;    // raised on 429, never lowered again
   pageDelayMs = DELAY_MS;    // the paginating walk reads this too
   let heartbeatCounter = 0;
 
   // Outer loop: claim batches until the queue drains, the IP is blocked, or a
   // 429 tells us to stand down.
-  while (!ipBlocked && !rateLimited) {
+  while (!ipBlocked && !standDown) {
     const batch = await claimWork(BATCH_ID, WORKER_ID, CLAIM_SIZE);
     if (!batch || batch.length === 0) {
       console.log(`[machine ${MACHINE_NO}] no more items to claim — queue drained for this machine`);
@@ -429,8 +437,12 @@ async function processListingItem(worker, item) {
       let lastErr = null;
       let success = false;
 
-      // Up to 3 attempts per item (handles transient errors + one token remint).
-      for (let attempt = 1; attempt <= 3 && !success && !ipBlocked; attempt++) {
+      // Token rotations spent on THIS item. One rotation is allowed: if the
+      // fresh token is throttled or blocked straight away, the problem is not
+      // the token and the machine stands down.
+      let rotations = 0;
+
+      for (let attempt = 1; attempt <= 4 && !success && !ipBlocked && !standDown; attempt++) {
         try {
           if (item.mode === 'zone') {
             result = await processZoneItem(worker, item);
@@ -440,72 +452,64 @@ async function processListingItem(worker, item) {
             result = await processAreaItem(worker, item);
           }
           success = true;
+          if (rotations > 0) {
+            console.log(`[machine ${MACHINE_NO}] fresh token worked — continuing on item ${item.id}`);
+          }
         } catch (e) {
           lastErr = e;
+          const throttled = !!e.rateLimited;
+          const blocked = !!e.forbidden;
 
-          if (e.rateLimited) {
-            if (!rateLimited) {
-              rateLimited = true;
-              delayMs = Math.min(delayMs * RATE_LIMIT_SLOWDOWN, RATE_LIMIT_MAX_DELAY);
-              pageDelayMs = delayMs;
-              console.log(`[machine ${MACHINE_NO}] 429 on item ${item.id} (${label}) — SLOWING to ${delayMs}ms/call and finishing this area, then retiring`);
-            }
-            console.log(`[machine ${MACHINE_NO}] 429 — pausing ${RATE_LIMIT_PAUSE_MS / 1000}s before retrying item ${item.id}`);
-            await sleep(RATE_LIMIT_PAUSE_MS);
-            continue;
-          }
+          if (throttled || blocked) {
+            const kind = blocked ? '403' : '429';
 
-          if (e.forbidden) {
-            console.log(`[machine ${MACHINE_NO}] 403 on item ${item.id} (${label}) — token may be burned, reminting...`);
-            await worker.remint();
-
-            // Test the new token on the same item.
-            try {
-              if (item.mode === 'zone') {
-                result = await processZoneItem(worker, item);
-              } else if (item.mode === 'listing') {
-                result = await processListingItem(worker, item);
-              } else {
-                result = await processAreaItem(worker, item);
-              }
-              success = true;
-              console.log(`[machine ${MACHINE_NO}] remint worked — continuing`);
-            } catch (retryErr) {
-              if (retryErr.forbidden) {
+            if (rotations >= MAX_TOKEN_ROTATIONS) {
+              // Already tried a fresh token on this item and still refused.
+              if (blocked) {
                 console.log(`[machine ${MACHINE_NO}] FRESH TOKEN ALSO 403 — IP IS BLOCKED`);
                 ipBlocked = true;
-                break;
-              }
-              if (retryErr.rateLimited) {
-                if (!rateLimited) {
-                  rateLimited = true;
-                  delayMs = Math.min(delayMs * RATE_LIMIT_SLOWDOWN, RATE_LIMIT_MAX_DELAY);
-                  pageDelayMs = delayMs;
-                  console.log(`[machine ${MACHINE_NO}] 429 after remint — SLOWING to ${delayMs}ms/call and finishing this area, then retiring`);
-                }
-                await sleep(RATE_LIMIT_PAUSE_MS);
               } else {
-                lastErr = retryErr;
-                await sleep(2000 * attempt);
+                console.log(`[machine ${MACHINE_NO}] FRESH TOKEN ALSO 429 — throttling is not token-scoped, standing down`);
+                standDown = true;
               }
+              break;
             }
-            continue;
+
+            rotations++;
+            if (throttled) {
+              // The server said we are too fast; keep the slower rate for good.
+              delayMs = Math.min(delayMs * RATE_LIMIT_SLOWDOWN, RATE_LIMIT_MAX_DELAY);
+              pageDelayMs = delayMs;
+              console.log(`[machine ${MACHINE_NO}] 429 on item ${item.id} (${label}) — slowing to ${delayMs}ms/call, pausing ${RATE_LIMIT_PAUSE_MS / 1000}s, rotating token`);
+              await sleep(RATE_LIMIT_PAUSE_MS);
+            } else {
+              console.log(`[machine ${MACHINE_NO}] 403 on item ${item.id} (${label}) — token burned, rotating`);
+            }
+
+            try {
+              await worker.remint();
+            } catch (mintErr) {
+              console.log(`[machine ${MACHINE_NO}] mint failed after ${kind}: ${mintErr.message}`);
+              await sleep(5000);
+            }
+            continue;   // retry the same item on the new token
           }
 
-          // Other errors: wait and retry.
+          // Anything else: genuine error, back off and retry.
           await sleep(2000 * attempt);
         }
       }
 
-      if (ipBlocked) {
-        // Release remaining claimed items back to pending
+      if (ipBlocked || standDown) {
+        // The in-flight item is still 'claimed', so this hands it back to
+        // 'pending' along with everything else. Nothing is lost to throttling.
         const released = await releaseWork(WORKER_ID, BATCH_ID);
-        console.log(`[machine ${MACHINE_NO}] released ${released} claimed items back to pending`);
+        console.log(`[machine ${MACHINE_NO}] standing down (${ipBlocked ? 'IP blocked' : 'rate limited'}) — released ${released} claimed items back to pending, including the one in progress`);
 
-        // Report IP block to Supabase — it will dispatch a replacement
-        console.log(`[machine ${MACHINE_NO}] reporting IP block to Supabase...`);
-        const rep = await workerReportBlock(totalProcessed, totalErrors);
-        console.log(`[machine ${MACHINE_NO}] report_block response: ${JSON.stringify(rep)}`);
+        const rep = ipBlocked
+          ? await workerReportBlock(totalProcessed, totalErrors)
+          : await workerReportRateLimit(totalProcessed, totalErrors);
+        console.log(`[machine ${MACHINE_NO}] report response: ${JSON.stringify(rep)}`);
 
         if (rep.replaced) {
           console.log(`[machine ${MACHINE_NO}] replacement machine ${rep.replacement_machine} dispatched`);
@@ -532,21 +536,6 @@ async function processListingItem(worker, item) {
         console.log(`[machine ${MACHINE_NO}] ${totalProcessed + totalErrors} ERROR item=${item.id} | ${label} | ${errMsg}`);
       }
 
-      // 429 seen earlier in this item: the area is now done, so stand down.
-      // Everything still claimed goes back to pending for the replacement.
-      if (rateLimited) {
-        const released = await releaseWork(WORKER_ID, BATCH_ID);
-        console.log(`[machine ${MACHINE_NO}] rate limited — finished current area, released ${released} claimed items`);
-        const rep = await workerReportRateLimit(totalProcessed, totalErrors);
-        console.log(`[machine ${MACHINE_NO}] report_rate_limit: ${JSON.stringify(rep)}`);
-        if (rep.replaced) {
-          console.log(`[machine ${MACHINE_NO}] replacement machine ${rep.replacement_machine} dispatched with a fresh IP and token`);
-        } else {
-          console.log(`[machine ${MACHINE_NO}] no replacement dispatched (cap reached or no work left)`);
-        }
-        break;
-      }
-
       // Heartbeat every 25 items
       heartbeatCounter++;
       if (heartbeatCounter >= 25) {
@@ -568,7 +557,7 @@ async function processListingItem(worker, item) {
   }
 
   // Clean exit only: a 429 retirement already reported itself above.
-  if (!ipBlocked && !rateLimited) {
+  if (!ipBlocked && !standDown) {
     console.log(`[machine ${MACHINE_NO}] reporting finished to Supabase...`);
     const fin = await workerFinished(totalProcessed, totalErrors);
     console.log(`[machine ${MACHINE_NO}] finished response: ${JSON.stringify(fin)}`);
@@ -584,7 +573,7 @@ async function processListingItem(worker, item) {
   console.log(`  errors: ${totalErrors}`);
   console.log(`  tokens used: ${worker.tokenNumber}`);
   console.log(`  IP blocked: ${ipBlocked}`);
-  console.log(`  rate limited: ${rateLimited}${rateLimited ? ` (final delay ${delayMs}ms)` : ''}`);
+  console.log(`  stood down (rate limited): ${standDown}${standDown ? ` (final delay ${delayMs}ms)` : ''}`);
 
   try {
     const status = await queueStatus(BATCH_ID);
@@ -593,7 +582,7 @@ async function processListingItem(worker, item) {
     console.log(`  queue status: error — ${e.message}`);
   }
 
-  if (ipBlocked || rateLimited) {
+  if (ipBlocked || standDown) {
     process.exitCode = 2; // Non-zero but not 1, so the workflow summary step still runs
   }
 })().catch((e) => {
