@@ -595,6 +595,7 @@ async function processListingItem(worker, item) {
   let delayMs = DELAY_MS;    // raised on 429, never lowered again
   pageDelayMs = DELAY_MS;    // the paginating walk reads this too
   let heartbeatCounter = 0;
+  let throttleHits = 0;      // 429s cleared by rotating the token (detail mode)
 
   // Outer loop: claim batches until the queue drains, the IP is blocked, or a
   // 429 tells us to stand down.
@@ -657,8 +658,20 @@ async function processListingItem(worker, item) {
             }
 
             rotations++;
-            if (throttled) {
-              // The server said we are too fast; keep the slower rate for good.
+            if (throttled && item.mode === 'detail') {
+              // Measured on the restaurant-detail endpoint: the quota sits
+              // on the TOKEN, not the IP. A fresh token is accepted at once
+              // (17/17 in run 7), so pausing 30s and permanently halving the
+              // rate buys nothing and cost us 14s/item instead of 2s. Rotate
+              // and carry straight on at the configured pace. If the fresh
+              // token is ALSO refused, MAX_TOKEN_ROTATIONS still trips and
+              // the machine retires for a replacement with a new IP.
+              throttleHits++;
+              console.log(`[machine ${MACHINE_NO}] 429 on item ${item.id} (${label}) — token spent (#${throttleHits}), rotating and continuing at ${delayMs}ms/call`);
+            } else if (throttled) {
+              // Listing/area/zone walks: there a fresh token was refused
+              // 83/83 times, so the quota is on the IP and backing off is
+              // the right move. Behaviour unchanged.
               delayMs = Math.min(delayMs * RATE_LIMIT_SLOWDOWN, RATE_LIMIT_MAX_DELAY);
               pageDelayMs = delayMs;
               console.log(`[machine ${MACHINE_NO}] 429 on item ${item.id} (${label}) — slowing to ${delayMs}ms/call, pausing ${RATE_LIMIT_PAUSE_MS / 1000}s, rotating token`);
@@ -757,6 +770,7 @@ async function processListingItem(worker, item) {
   console.log(`  tokens used: ${worker.tokenNumber}`);
   console.log(`  IP blocked: ${ipBlocked}`);
   console.log(`  stood down (rate limited): ${standDown}${standDown ? ` (final delay ${delayMs}ms)` : ''}`);
+  console.log(`  429s cleared by token rotation: ${throttleHits}`);
 
   try {
     const status = await queueStatus(BATCH_ID);
