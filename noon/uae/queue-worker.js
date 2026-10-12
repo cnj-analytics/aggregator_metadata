@@ -61,6 +61,8 @@ const BUILD = '22098';
 const SET_LOCATION_URL = 'https://api-app.noon.com/_vs/st/mp-identity-api-geo/serviceable-geo-info/set-location-by-lat-lng';
 const WHOAMI_FOOD_URL = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami?experience=food&select_nearby=1';
 const SEARCH_URL = 'https://api-app-fd.noon.com/_svc/mp-food-api-catalog/api/search';
+const DETAIL_URL =
+  'https://api-app-fd.noon.com/_svc/mp-food-api-mpnoon/consumer/restaurant/outlet/details/guest/partial';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -172,10 +174,88 @@ async function queueStatus(batchId) {
 
 // ── Noon auth + locate ────────────────────────────────────────────────────
 
+// MINT_SOURCE picks where the guest token is issued.
+//   'worker'   (default) - minted here, on this runner's own IP. A token
+//              issued to one address and presented from another is a
+//              mismatch no real device produces, and Supabase has a single
+//              static egress IP that degraded badly under load (778 mints in
+//              a day took it to a 66% failure rate and abandoned 9 areas).
+//   'supabase' - the old path, kept for diagnostics only.
+const MINT_SOURCE = (process.env.MINT_SOURCE || 'worker').toLowerCase();
+const WHOAMI_URL = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami';
+
+function decodeJwt(jwt) {
+  try {
+    const seg = String(jwt).split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const p = JSON.parse(Buffer.from(seg + '='.repeat((4 - (seg.length % 4)) % 4), 'base64').toString('utf8'));
+    return { exp: p.exp ? new Date(p.exp * 1000).toISOString() : null, kid: p.kid || null };
+  } catch { return { exp: null, kid: null }; }
+}
+
+// The 3-step chain Noon's app performs. nguestv2 is issued by step 1; steps 2
+// and 3 resolve the location and return the zone headers the food API wants
+// echoed back.
+async function mintSessionLocal(lat, lng) {
+  const deviceId = crypto.randomUUID();
+  const visitorId = crypto.randomUUID();
+  const jar = {};
+  const base = () => ({
+    'User-Agent': UA, 'x-platform': 'ios', 'x-build': BUILD, 'x-mp': 'noon',
+    'x-content': 'mobile', Accept: 'application/json',
+    'x-device-id': deviceId, 'x-visitor-id': visitorId,
+  });
+
+  const r1 = await fetch(WHOAMI_URL, {
+    headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() },
+  });
+  if (r1.status === 403) throw Object.assign(new Error('mint whoami 403'), { forbidden: true });
+  if (r1.status !== 200) throw new Error(`mint whoami ecom HTTP ${r1.status}`);
+  mergeSetCookies(jar, r1);
+
+  const r2 = await fetch(SET_LOCATION_URL, {
+    method: 'POST',
+    headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae',
+               'x-device-lat': String(lat), 'x-device-lng': String(lng),
+               'Content-Type': 'application/json', Cookie: cookieString(jar) },
+    body: JSON.stringify({ location: { lat, lng }, lang: 'en' }),
+  });
+  if (r2.status === 403) throw Object.assign(new Error('mint set-location 403'), { forbidden: true });
+  if (r2.status !== 200) throw new Error(`mint set-location HTTP ${r2.status}`);
+  const setloc = await r2.json().catch(() => ({}));
+  mergeSetCookies(jar, r2);
+
+  const r3 = await fetch(WHOAMI_FOOD_URL, {
+    headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae',
+               'x-device-lat': String(lat), 'x-device-lng': String(lng),
+               'x-whoami-request-id': crypto.randomUUID(), Cookie: cookieString(jar) },
+  });
+  if (r3.status === 403) throw Object.assign(new Error('mint whoami food 403'), { forbidden: true });
+  if (r3.status !== 200) throw new Error(`mint whoami food HTTP ${r3.status}`);
+  const who = await r3.json().catch(() => ({}));
+  mergeSetCookies(jar, r3);
+
+  if (!jar.nguestv2) throw new Error('mint produced no nguestv2');
+  const { exp, kid } = decodeJwt(jar.nguestv2);
+  const zones = who && who.headers && typeof who.headers === 'object' ? who.headers : {};
+
+  return {
+    ok: true,
+    device_id: deviceId, visitor_id: visitorId,
+    cookies: jar, cookie_string: cookieString(jar),
+    zone_codes: zones, food_zonecode: zones['x-food-zonecode'] || null,
+    resolved_area: setloc.area || null,
+    nguestv2_exp: exp, nguestv2_kid: kid,
+    mintedAt: Date.now(),
+  };
+}
+
 async function mintSession(lat = 25.078058170938117, lng = 55.15337817083452) {
-  const s = await supabase('/rpc/noon_mint_session', { method: 'POST', body: { p_lat: lat, p_lng: lng } });
-  if (!s || s.ok !== true) throw new Error(`noon_mint_session ok=false: ${s && s.error}`);
-  return { ...s, mintedAt: Date.now() };
+  if (MINT_SOURCE === 'supabase') {
+    const s = await supabase('/rpc/noon_mint_session', { method: 'POST', body: { p_lat: lat, p_lng: lng } });
+    if (!s || s.ok !== true) throw new Error(`noon_mint_session ok=false: ${s && s.error}`);
+    return { ...s, mintedAt: Date.now() };
+  }
+  return mintSessionLocal(lat, lng);
 }
 
 const TOKEN_LIFETIME_MS = 300000;   // Noon's nguestv2 lives 5 minutes
@@ -202,18 +282,18 @@ class NoonWorker {
     return this.remint();
   }
 
-  async ensure() {
+  async ensure(lat, lng) {
     const exp = this.session && this.session.nguestv2_exp ? Date.parse(this.session.nguestv2_exp) : 0;
     if (!this.session || Date.now() > Math.min(exp - 60000, this.session.mintedAt + 240000)) {
-      this.session = await mintSession();
+      this.session = (lat != null && lng != null) ? await mintSession(lat, lng) : await mintSession();
       this.tokenNumber++;
-      console.log(`[machine ${MACHINE_NO}] minted token #${this.tokenNumber} | device_id=${this.session.device_id} | visitor_id=${this.session.visitor_id}`);
+      console.log(`[machine ${MACHINE_NO}] minted token #${this.tokenNumber} via ${MINT_SOURCE} | device_id=${this.session.device_id} | zone=${this.session.food_zonecode || '-'}`);
     }
     return this.session;
   }
-  async remint() {
+  async remint(lat, lng) {
     this.session = null;
-    return this.ensure();
+    return this.ensure(lat, lng);
   }
 }
 
@@ -326,6 +406,74 @@ async function listingPage(loc, searchToken) {
 const firstListingPage = async (loc) => (await listingPage(loc, null)).outlets;
 
 // ── Process one item ────────────────────────────────────────────────────────
+
+// ── Restaurant page (outlet detail) ─────────────────────────────────────────
+//
+// One call per branch. Measured on this endpoint (four controlled runs):
+// it is a token bucket on the IP — roughly 110 burst, refilling about one
+// every 4 seconds. Rotating the token does NOT refill it (a fresh token is
+// 429'd immediately once empty), so PACE is the only lever and the queue is
+// run at delay_ms = 4000. The result is extracted straight into
+// noon_branch_information by noon_detail_record; raw payloads are not kept.
+async function processDetailItem(worker, item) {
+  const outlet = item.noon_outlet_code;
+  if (!outlet) throw new Error('detail item has no noon_outlet_code');
+
+  const session = await worker.ensure(item.latitude, item.longitude);
+  const lat = item.latitude;
+  const lng = item.longitude;
+
+  const headers = {
+    ...baseHeaders(session, lat, lng),
+    'x-mp-country': 'ae',
+    'x-experience': 'food',
+    'x-lat': String(Math.round(lat * 1e7)),
+    'x-lng': String(Math.round(lng * 1e7)),
+    'x-whoami-request-id': crypto.randomUUID(),
+    Cookie: cookieString({ ...(session.cookies || {}) }),
+    'Content-Type': 'application/json',
+  };
+  const zones = session.zone_codes && typeof session.zone_codes === 'object' ? session.zone_codes : {};
+  for (const [k, v] of Object.entries(zones)) {
+    if (v !== null && typeof v !== 'object' && !k.toLowerCase().includes('ab-test')) headers[k] = String(v);
+  }
+
+  const started = Date.now();
+  const resp = await fetch(DETAIL_URL, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      outletCode: outlet,
+      lat: Math.round(lat * 1e7),
+      lng: Math.round(lng * 1e7),
+    }),
+  });
+  const elapsed = Date.now() - started;
+
+  if (resp.status === 429) throw Object.assign(new Error('detail 429'), { rateLimited: true });
+  if (resp.status === 403) throw Object.assign(new Error('detail 403'), { forbidden: true });
+  if (resp.status === 404) return { outlet, http: 404, skipped: 'not found' };
+  if (!resp.ok) throw new Error(`detail HTTP ${resp.status}`);
+
+  const payload = await resp.json();
+  const rec = await supabase('/rpc/noon_detail_record', {
+    method: 'POST',
+    body: { p_outlet: outlet, p_http: 200, p_payload: payload, p_elapsed_ms: elapsed },
+  });
+
+  const d = (payload && payload.data) || {};
+  const menu = d.menu || {};
+  return {
+    outlet,
+    http: 200,
+    name: d.name || null,
+    oms: d.externalOmsCode || null,
+    has_address: !!d.address,
+    menu_items: Array.isArray(menu.items) ? menu.items.length : null,
+    elapsed_ms: elapsed,
+    recorded: rec && rec.ok === true,
+  };
+}
 
 async function processZoneItem(worker, item) {
   const loc = await locate(worker, item.latitude, item.longitude);
@@ -460,7 +608,9 @@ async function processListingItem(worker, item) {
 
     for (let i = 0; i < batch.length; i++) {
       const item = batch[i];
-      const label = item.mode === 'area' ? item.area_name : `${item.latitude},${item.longitude}`;
+      const label = item.mode === 'area' ? item.area_name
+        : item.mode === 'detail' ? item.noon_outlet_code
+        : `${item.latitude},${item.longitude}`;
 
       let result = null;
       let lastErr = null;
@@ -477,6 +627,8 @@ async function processListingItem(worker, item) {
             result = await processZoneItem(worker, item);
           } else if (item.mode === 'listing') {
             result = await processListingItem(worker, item);
+          } else if (item.mode === 'detail') {
+            result = await processDetailItem(worker, item);
           } else {
             result = await processAreaItem(worker, item);
           }
@@ -555,6 +707,8 @@ async function processListingItem(worker, item) {
           console.log(`[machine ${MACHINE_NO}] ${totalProcessed} DONE item=${item.id} | zone=${result.zone || '(none)'} | ${item.latitude},${item.longitude}`);
         } else if (item.mode === 'listing') {
           console.log(`[machine ${MACHINE_NO}] ${totalProcessed} DONE item=${item.id} | ${label} | ${result.unique} restaurants over ${result.pages} pages | +${result.inserted} new, ${result.merged} merged | queue=${result.queue_total ?? '?'} | ${result.stop_reason}`);
+        } else if (item.mode === 'detail') {
+          console.log(`[machine ${MACHINE_NO}] ${totalProcessed} DONE item=${item.id} | ${label} | "${result.name || '?'}" | oms=${result.oms || '-'} | addr=${result.has_address ? 'y' : 'n'} | items=${result.menu_items ?? '-'} | ${result.elapsed_ms}ms`);
         } else {
           console.log(`[machine ${MACHINE_NO}] ${totalProcessed} DONE item=${item.id} | ${label} | zone=${result.zone || '(none)'} | ${result.count} restaurants`);
         }
