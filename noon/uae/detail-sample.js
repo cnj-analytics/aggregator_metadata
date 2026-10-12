@@ -29,6 +29,12 @@ const SERVICE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const DELAY_MS     = Number(process.env.DELAY_MS || 1000);
 const LIMIT        = Number(process.env.SAMPLE_LIMIT || 200);
 const CALL_BUDGET  = Number(process.env.CALL_BUDGET || 120);
+// 'worker' = mint on this runner (default, device-consistent).
+// 'supabase' = mint via noon_mint_session, i.e. the token is issued to
+// Supabase's static IP and then presented from this runner. Kept as a
+// diagnostic: the listing scrape ran this way all day at ~130 calls per IP,
+// while worker-minted detail runs were blocked at 35, then 15, then 1.
+const MINT_SOURCE  = (process.env.MINT_SOURCE || 'worker').toLowerCase();
 
 if (!SUPABASE_URL || !SERVICE_KEY) {
   console.error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required');
@@ -171,6 +177,31 @@ async function mintSession(lat, lng) {
   };
 }
 
+// Mint via Supabase (token issued to Supabase's egress IP, used from here).
+async function mintSessionViaSupabase(lat, lng) {
+  let s;
+  try {
+    s = await supabase('/rpc/noon_mint_session', { method: 'POST', body: { p_lat: lat, p_lng: lng } });
+  } catch (e) {
+    throw new MintError(`noon_mint_session call failed: ${e.message}`, 0);
+  }
+  if (!s || s.ok !== true) throw new MintError(`noon_mint_session ok=false: ${s && s.error}`, 0);
+  return {
+    device_id: s.device_id,
+    visitor_id: s.visitor_id,
+    cookie_string: s.cookie_string,
+    zone_codes: s.zone_codes || {},
+    food_zonecode: s.food_zonecode || null,
+    resolved_area: s.resolved_area || null,
+    nguestv2_exp: s.nguestv2_exp || null,
+    nguestv2_kid: s.nguestv2_kid || null,
+    mintedAt: Date.now(),
+  };
+}
+
+const mint = (lat, lng) =>
+  MINT_SOURCE === 'supabase' ? mintSessionViaSupabase(lat, lng) : mintSession(lat, lng);
+
 function remainingMs(session) {
   if (!session) return 0;
   const byExp = session.nguestv2_exp ? Date.parse(session.nguestv2_exp) - Date.now() : Infinity;
@@ -224,7 +255,7 @@ async function fetchDetail(session, outlet, lat, lng) {
 }
 
 (async () => {
-  console.log(`[detail-sample] delay=${DELAY_MS}ms call_budget=${CALL_BUDGET} (minting on this runner)`);
+  console.log(`[detail-sample] delay=${DELAY_MS}ms call_budget=${CALL_BUDGET} mint_source=${MINT_SOURCE}`);
   try {
     const ip = await (await fetch('https://api.ipify.org')).text();
     console.log(`[detail-sample] runner IP ${ip}`);
@@ -246,10 +277,11 @@ async function fetchDetail(session, outlet, lat, lng) {
   async function ensureSession(lat, lng, needMs) {
     if (session && remainingMs(session) >= needMs) return session;
     try {
-      session = await mintSession(lat, lng);
-      mints++; calls += 3;
+      session = await mint(lat, lng);
+      mints++;
+      if (MINT_SOURCE !== 'supabase') calls += 3;   // supabase mints leave from Supabase's IP
       console.log(
-        `[detail-sample] minted token #${mints} | device=${session.device_id} ` +
+        `[detail-sample] minted token #${mints} via ${MINT_SOURCE} | device=${session.device_id} ` +
         `| zone=${session.food_zonecode} | exp=${session.nguestv2_exp}`
       );
       return session;
