@@ -8,18 +8,25 @@
 // mode=areas  Read Talabat area centroids from Supabase + fill-in points for Noon
 //             zones with no Talabat area, insert each as an 'area' queue item.
 // mode=all    Both (zones first, then areas — areas needs zone table populated).
+// mode=listings
+//             Read every ACTIVE noon_area and insert each as a 'listing' queue
+//             item. A listing worker walks that area's full result set, page by
+//             page, and upserts the restaurants into noon_restaurant_list_queue.
+//             Requires zones+areas to have been run first.
 //
 // A batch_id is generated from mode + timestamp, or set via NOON_BATCH_ID.
 // The script prints the batch_id so the workflow can pass it to workers.
 //
 // Env vars:
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY   required
-//   NOON_MODE            zones | areas | all   (default all)
+//   NOON_MODE            zones | areas | all | listings  (default all)
 //   NOON_BATCH_ID        override batch id     (default: auto-generated)
 //   NOON_COARSE_STEP     deg (default 0.05)
 //   NOON_DENSE_STEP      deg (default 0.01)
 //   NOON_ONLY_ERRORED    'true' = seed only errored/never-probed areas
 //   TEST_CITY_ID         Talabat city_id filter for areas mode
+//   NOON_AREA_IDS        listings mode: comma-separated noon_area_id list to
+//                        seed instead of every active area (for test runs)
 
 'use strict';
 
@@ -40,8 +47,12 @@ function cliArg(name) {
 
 const cliModes = cliArg('mode');
 const MODE = cliModes
-  ? (cliModes.includes('zone') && cliModes.includes('area') ? 'all' : cliModes[0])
+  ? (cliModes.includes('listing') || cliModes.includes('listings')
+      ? 'listings'
+      : (cliModes.includes('zone') && cliModes.includes('area') ? 'all' : cliModes[0]))
   : (process.env.NOON_MODE || 'all').toLowerCase();
+const AREA_IDS = (cliArg('area-ids') || [process.env.NOON_AREA_IDS || ''])
+  .join(',').split(',').map((x) => x.trim()).filter(Boolean).map(Number);
 const COARSE_STEP = num('NOON_COARSE_STEP', 0.05);
 const DENSE_STEP = num('NOON_DENSE_STEP', 0.01);
 const ONLY_ERRORED = process.env.NOON_ONLY_ERRORED === 'true';
@@ -230,17 +241,58 @@ async function seedAreas() {
   return rows.length;
 }
 
+// ── listings: one item per active area ────────────────────────────────────
+async function seedListings() {
+  let filter = '&is_active=eq.true';
+  if (AREA_IDS.length) filter = `&noon_area_id=in.(${AREA_IDS.join(',')})`;
+
+  const areas = await selectAll(
+    'noon_area',
+    'noon_area_id,source_key,area_source,talabat_area_id,area_name,area_name_ar,area_slug,latitude,longitude',
+    filter + '&order=noon_area_id'
+  );
+
+  if (AREA_IDS.length) {
+    console.log(`[seed] listings: ${areas.length} of ${AREA_IDS.length} requested area(s) found`);
+  } else {
+    console.log(`[seed] listings: ${areas.length} active area(s)`);
+  }
+  if (!areas.length) return 0;
+
+  const rows = areas.map((a) => ({
+    batch_id: BATCH_ID,
+    mode: 'listing',
+    noon_area_id: a.noon_area_id,
+    latitude: a.latitude,
+    longitude: a.longitude,
+    source_key: a.source_key,
+    area_source: a.area_source,
+    talabat_area_id: a.talabat_area_id,
+    area_name: a.area_name,
+    area_name_ar: a.area_name_ar,
+    area_slug: a.area_slug,
+    status: 'pending',
+  }));
+
+  await insertBatch(rows);
+  console.log(`[seed] listings: ${rows.length} items inserted for batch ${BATCH_ID}`);
+  return rows.length;
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
 (async () => {
   if (typeof fetch !== 'function') throw new Error('Node 18+ required');
-  if (!['zones', 'areas', 'all'].includes(MODE)) throw new Error(`NOON_MODE must be zones|areas|all, got ${MODE}`);
+  if (!['zones', 'areas', 'all', 'listings'].includes(MODE)) {
+    throw new Error(`NOON_MODE must be zones|areas|all|listings, got ${MODE}`);
+  }
 
   console.log(`[seed] mode=${MODE} batch_id=${BATCH_ID}`);
 
   let totalItems = 0;
   if (MODE === 'zones' || MODE === 'all') totalItems += await seedZones();
   if (MODE === 'areas' || MODE === 'all') totalItems += await seedAreas();
+  if (MODE === 'listings') totalItems += await seedListings();
 
   console.log(`[seed] total: ${totalItems} items seeded`);
 
