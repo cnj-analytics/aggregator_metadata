@@ -7,13 +7,22 @@
 // back incrementally. On IP block, reports to Supabase which retires this
 // machine and dispatches a replacement.
 //
-// Zone items:   locate(lat,lng) → record the food zone code.
-// Area items:   locate(lat,lng) → fetch first listing page → record zone, count,
-//               fingerprint, resolved address.
+// Zone items:    locate(lat,lng) → record the food zone code.
+// Area items:    locate(lat,lng) → fetch first listing page → record zone, count,
+//                fingerprint, resolved address.
+// Listing items: locate(lat,lng) → walk EVERY page via chained searchToken until
+//                the list is exhausted, then upsert the restaurants into
+//                noon_restaurant_list_queue. A restaurant already in the queue
+//                only gains this area in its noon_area_ids.
 //
 // On token 403:  mint a fresh token and retry.
 // On IP block (fresh token also 403s): report to Supabase → exit.
-// On HTTP 429:   pause 30s and retry.
+// On HTTP 429:   a 429 is not a dead IP, it is this IP being told to slow down.
+//                So the machine does three things, in order: drop its call rate
+//                immediately, finish ONLY the area it is currently on, then hand
+//                every other claimed item back and retire. Supabase starts a
+//                replacement machine — a fresh runner, so a new IP, and it mints
+//                a new token on boot. Carrying on through 429s just burns the IP.
 //
 // Every single request is logged line-by-line.
 //
@@ -47,6 +56,12 @@ const WHOAMI_FOOD_URL = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami
 const SEARCH_URL = 'https://api-app-fd.noon.com/_svc/mp-food-api-catalog/api/search';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Delay between page requests. main() sets it from Supabase settings and the
+// 429 rule raises it, so the paginating walk below picks the change up mid-run.
+let pageDelayMs = 200;
+const PAGE_LIMIT = 60;          // Noon's own page size
+const PAGE_SAFETY_CAP = 500;    // runaway guard only; exhaustion is the real stop
 
 // ── Supabase REST ───────────────────────────────────────────────────────────
 
@@ -96,6 +111,13 @@ async function workerReportBlock(itemsDone, itemsError) {
   });
 }
 
+async function workerReportRateLimit(itemsDone, itemsError) {
+  return supabase('/rpc/noon_worker_report_rate_limit', {
+    method: 'POST',
+    body: { p_run_id: Number(RUN_ID), p_machine_no: Number(MACHINE_NO), p_items_done: itemsDone, p_items_error: itemsError },
+  });
+}
+
 async function workerFinished(itemsDone, itemsError) {
   return supabase('/rpc/noon_worker_finished', {
     method: 'POST',
@@ -123,6 +145,14 @@ async function releaseWork(workerId, batchId) {
   return supabase('/rpc/noon_release_work', {
     method: 'POST',
     body: { p_worker_id: workerId, p_batch_id: batchId },
+  });
+}
+
+// Postgres does the card → row mapping, so there is one source of truth for it.
+async function upsertQueue(noonAreaId, cards) {
+  return supabase('/rpc/noon_queue_upsert_batch', {
+    method: 'POST',
+    body: { p_noon_area_id: noonAreaId, p_cards: cards },
   });
 }
 
@@ -219,7 +249,7 @@ async function locate(worker, lat, lng) {
   };
 }
 
-async function firstListingPage(loc) {
+async function listingPage(loc, searchToken) {
   const { session, lat, lng } = loc;
   const headers = {
     ...baseHeaders(session, lat, lng),
@@ -238,14 +268,18 @@ async function firstListingPage(loc) {
   }
   const body = {
     queryEntity: null, q: null, f: {}, contexts: [], withContent: true,
-    excludeOutletCodes: [], limit: 60, page: 1,
+    excludeOutletCodes: [], limit: PAGE_LIMIT, page: 1,
     sort: { by: 'popularity', dir: 'desc' },
     type: 'outlet', qType: 'search_query', getFallback: true,
   };
+  // /search ignores `page`; the response's searchToken is the real cursor and
+  // must be chained in, or every page re-serves the first 60 outlets.
+  if (searchToken) body.searchToken = searchToken;
+
   const resp = await fetch(SEARCH_URL, { method: 'POST', headers, body: JSON.stringify(body) });
   if (resp.status === 429) throw Object.assign(new Error('search 429'), { rateLimited: true });
   if (resp.status === 403) throw Object.assign(new Error('search 403'), { forbidden: true });
-  if (resp.status === 404) return [];
+  if (resp.status === 404) return { outlets: [], token: null };
   if (!resp.ok) throw new Error(`search HTTP ${resp.status}`);
   const json = await resp.json();
   const outlets = [];
@@ -257,8 +291,10 @@ async function firstListingPage(loc) {
       for (const k of Object.keys(x)) walk(x[k], depth + 1);
     }
   })(json.results || [], 0);
-  return outlets;
+  return { outlets, token: json.searchToken || null };
 }
+
+const firstListingPage = async (loc) => (await listingPage(loc, null)).outlets;
 
 // ── Process one item ────────────────────────────────────────────────────────
 
@@ -280,6 +316,59 @@ async function processAreaItem(worker, item) {
     fingerprint,
     resolved_address: loc.resolvedAddress,
     geo_city_id: loc.geoCityId,
+  };
+}
+
+async function processListingItem(worker, item) {
+  const areaId = item.noon_area_id;
+  if (!areaId) throw new Error('listing item has no noon_area_id');
+
+  const loc = await locate(worker, item.latitude, item.longitude);
+  if (!loc.foodZone) {
+    return { zone: null, pages: 0, unique: 0, skipped: 'no food zone at this point' };
+  }
+
+  const seen = new Set();
+  const cards = [];
+  let token = null;
+  let page = 0;
+  let stopReason = null;
+
+  while (page < PAGE_SAFETY_CAP) {
+    page++;
+    const r = await listingPage(loc, token);
+
+    const fresh = r.outlets.filter((o) => !seen.has(o.outletCode));
+    for (const o of fresh) { seen.add(o.outletCode); cards.push(o); }
+
+    if (r.outlets.length === 0) { stopReason = `empty page at ${page}`; break; }
+    if (fresh.length === 0)     { stopReason = `no new outlets at page ${page}`; break; }
+    if (!r.token)               { stopReason = `no searchToken at page ${page}`; break; }
+
+    token = r.token;              // advance the cursor
+    await sleep(pageDelayMs);
+  }
+  if (!stopReason) stopReason = `RUNAWAY: hit PAGE_SAFETY_CAP=${PAGE_SAFETY_CAP}`;
+
+  let inserted = 0, merged = 0, queueTotal = null;
+  for (let i = 0; i < cards.length; i += 500) {
+    const res = await upsertQueue(areaId, cards.slice(i, i + 500));
+    if (res) {
+      inserted += res.inserted || 0;
+      merged   += res.merged   || 0;
+      queueTotal = res.queue_total ?? queueTotal;
+    }
+  }
+
+  return {
+    zone: loc.foodZone,
+    pages: page,
+    unique: seen.size,
+    inserted,
+    merged,
+    queue_total: queueTotal,
+    stop_reason: stopReason,
+    resolved_address: loc.resolvedAddress,
   };
 }
 
@@ -308,6 +397,8 @@ async function processAreaItem(worker, item) {
   const CLAIM_SIZE = checkin.claim_size || 50;
   const WORKER_ID = `run${RUN_ID}-m${MACHINE_NO}`;
   const RATE_LIMIT_PAUSE_MS = 30000;
+  const RATE_LIMIT_SLOWDOWN = 5;      // multiply the delay on the first 429
+  const RATE_LIMIT_MAX_DELAY = 5000;  // ms, ceiling for the slowed rate
 
   console.log(`[machine ${MACHINE_NO}] batch=${BATCH_ID} | claim_size=${CLAIM_SIZE} | delay=${DELAY_MS}ms`);
 
@@ -315,10 +406,14 @@ async function processAreaItem(worker, item) {
   let totalProcessed = 0;
   let totalErrors = 0;
   let ipBlocked = false;
+  let rateLimited = false;   // 429 seen: finish this area, then retire
+  let delayMs = DELAY_MS;    // raised on 429, never lowered again
+  pageDelayMs = DELAY_MS;    // the paginating walk reads this too
   let heartbeatCounter = 0;
 
-  // Outer loop: keep claiming batches until the queue is drained or IP is blocked.
-  while (!ipBlocked) {
+  // Outer loop: claim batches until the queue drains, the IP is blocked, or a
+  // 429 tells us to stand down.
+  while (!ipBlocked && !rateLimited) {
     const batch = await claimWork(BATCH_ID, WORKER_ID, CLAIM_SIZE);
     if (!batch || batch.length === 0) {
       console.log(`[machine ${MACHINE_NO}] no more items to claim — queue drained for this machine`);
@@ -339,6 +434,8 @@ async function processAreaItem(worker, item) {
         try {
           if (item.mode === 'zone') {
             result = await processZoneItem(worker, item);
+          } else if (item.mode === 'listing') {
+            result = await processListingItem(worker, item);
           } else {
             result = await processAreaItem(worker, item);
           }
@@ -347,7 +444,13 @@ async function processAreaItem(worker, item) {
           lastErr = e;
 
           if (e.rateLimited) {
-            console.log(`[machine ${MACHINE_NO}] 429 on item ${item.id} (${label}) — pausing ${RATE_LIMIT_PAUSE_MS / 1000}s`);
+            if (!rateLimited) {
+              rateLimited = true;
+              delayMs = Math.min(delayMs * RATE_LIMIT_SLOWDOWN, RATE_LIMIT_MAX_DELAY);
+              pageDelayMs = delayMs;
+              console.log(`[machine ${MACHINE_NO}] 429 on item ${item.id} (${label}) — SLOWING to ${delayMs}ms/call and finishing this area, then retiring`);
+            }
+            console.log(`[machine ${MACHINE_NO}] 429 — pausing ${RATE_LIMIT_PAUSE_MS / 1000}s before retrying item ${item.id}`);
             await sleep(RATE_LIMIT_PAUSE_MS);
             continue;
           }
@@ -360,6 +463,8 @@ async function processAreaItem(worker, item) {
             try {
               if (item.mode === 'zone') {
                 result = await processZoneItem(worker, item);
+              } else if (item.mode === 'listing') {
+                result = await processListingItem(worker, item);
               } else {
                 result = await processAreaItem(worker, item);
               }
@@ -372,7 +477,12 @@ async function processAreaItem(worker, item) {
                 break;
               }
               if (retryErr.rateLimited) {
-                console.log(`[machine ${MACHINE_NO}] 429 after remint — pausing ${RATE_LIMIT_PAUSE_MS / 1000}s`);
+                if (!rateLimited) {
+                  rateLimited = true;
+                  delayMs = Math.min(delayMs * RATE_LIMIT_SLOWDOWN, RATE_LIMIT_MAX_DELAY);
+                  pageDelayMs = delayMs;
+                  console.log(`[machine ${MACHINE_NO}] 429 after remint — SLOWING to ${delayMs}ms/call and finishing this area, then retiring`);
+                }
                 await sleep(RATE_LIMIT_PAUSE_MS);
               } else {
                 lastErr = retryErr;
@@ -410,6 +520,8 @@ async function processAreaItem(worker, item) {
         totalProcessed++;
         if (item.mode === 'zone') {
           console.log(`[machine ${MACHINE_NO}] ${totalProcessed} DONE item=${item.id} | zone=${result.zone || '(none)'} | ${item.latitude},${item.longitude}`);
+        } else if (item.mode === 'listing') {
+          console.log(`[machine ${MACHINE_NO}] ${totalProcessed} DONE item=${item.id} | ${label} | ${result.unique} restaurants over ${result.pages} pages | +${result.inserted} new, ${result.merged} merged | queue=${result.queue_total ?? '?'} | ${result.stop_reason}`);
         } else {
           console.log(`[machine ${MACHINE_NO}] ${totalProcessed} DONE item=${item.id} | ${label} | zone=${result.zone || '(none)'} | ${result.count} restaurants`);
         }
@@ -418,6 +530,21 @@ async function processAreaItem(worker, item) {
         await completeWork(item.id, 'error', null, errMsg.slice(0, 500));
         totalErrors++;
         console.log(`[machine ${MACHINE_NO}] ${totalProcessed + totalErrors} ERROR item=${item.id} | ${label} | ${errMsg}`);
+      }
+
+      // 429 seen earlier in this item: the area is now done, so stand down.
+      // Everything still claimed goes back to pending for the replacement.
+      if (rateLimited) {
+        const released = await releaseWork(WORKER_ID, BATCH_ID);
+        console.log(`[machine ${MACHINE_NO}] rate limited — finished current area, released ${released} claimed items`);
+        const rep = await workerReportRateLimit(totalProcessed, totalErrors);
+        console.log(`[machine ${MACHINE_NO}] report_rate_limit: ${JSON.stringify(rep)}`);
+        if (rep.replaced) {
+          console.log(`[machine ${MACHINE_NO}] replacement machine ${rep.replacement_machine} dispatched with a fresh IP and token`);
+        } else {
+          console.log(`[machine ${MACHINE_NO}] no replacement dispatched (cap reached or no work left)`);
+        }
+        break;
       }
 
       // Heartbeat every 25 items
@@ -436,12 +563,12 @@ async function processAreaItem(worker, item) {
         }
       }
 
-      await sleep(DELAY_MS);
+      await sleep(delayMs);
     }
   }
 
-  // If we exited cleanly (not IP blocked), tell Supabase we're done
-  if (!ipBlocked) {
+  // Clean exit only: a 429 retirement already reported itself above.
+  if (!ipBlocked && !rateLimited) {
     console.log(`[machine ${MACHINE_NO}] reporting finished to Supabase...`);
     const fin = await workerFinished(totalProcessed, totalErrors);
     console.log(`[machine ${MACHINE_NO}] finished response: ${JSON.stringify(fin)}`);
@@ -457,6 +584,7 @@ async function processAreaItem(worker, item) {
   console.log(`  errors: ${totalErrors}`);
   console.log(`  tokens used: ${worker.tokenNumber}`);
   console.log(`  IP blocked: ${ipBlocked}`);
+  console.log(`  rate limited: ${rateLimited}${rateLimited ? ` (final delay ${delayMs}ms)` : ''}`);
 
   try {
     const status = await queueStatus(BATCH_ID);
@@ -465,7 +593,7 @@ async function processAreaItem(worker, item) {
     console.log(`  queue status: error — ${e.message}`);
   }
 
-  if (ipBlocked) {
+  if (ipBlocked || rateLimited) {
     process.exitCode = 2; // Non-zero but not 1, so the workflow summary step still runs
   }
 })().catch((e) => {
