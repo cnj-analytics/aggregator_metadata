@@ -40,11 +40,7 @@ jobs:
                 -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
                 -H "Content-Type: application/json" -d '{}')
           n=${n:-0}
-          if   [ "$n" -gt 400 ]; then k=5
-          elif [ "$n" -gt 300 ]; then k=4
-          elif [ "$n" -gt 200 ]; then k=3
-          elif [ "$n" -gt 100 ]; then k=2
-          else k=1; fi
+          k=5  # always 5 parallel jobs — pool size per user requirement
           echo "waiting=$n" >> "$GITHUB_OUTPUT"
           echo "jobs=$(python3 -c "import json;print(json.dumps(list(range($k))))")" >> "$GITHUB_OUTPUT"
           echo "Waiting outlets: $n → $k job(s)"
@@ -71,7 +67,7 @@ jobs:
           JOB_COUNT: ${{ strategy.job-total }}
           SUMMARY_FILE: register-job-${{ matrix.job }}.json
           DELAY_MS: '4000'
-          CALL_BUDGET: '100'
+          CALL_BUDGET: '500'
           TIME_BUDGET_MIN: '40'
         run: node noon/uae/register-branch.js
       - name: Upload job summary
