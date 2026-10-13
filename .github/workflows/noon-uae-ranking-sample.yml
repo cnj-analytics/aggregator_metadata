@@ -1,0 +1,79 @@
+name: Noon UAE – Ranking Sample (started by Supabase)
+run-name: Noon ranking sample · run ${{ inputs.run_id }} · machine ${{ inputs.machine_no }}
+
+# One sample machine. Supabase holds the area queue and starts this workflow
+# (one dispatch per machine). On 429/403 the worker hands its area back and
+# retires; Supabase dispatches a replacement, which lands on a fresh runner IP.
+# Do not start this by hand – call noon_sample_run_begin() in Supabase.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'noon_sample_run.run_id (set by Supabase)'
+        required: true
+        type: string
+      machine_no:
+        description: 'Machine number within the run (set by Supabase)'
+        required: true
+        type: string
+      page_delay_ms:
+        description: 'Delay between listing pages in ms'
+        required: false
+        default: '1000'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Machine ${{ inputs.machine_no }} of run ${{ inputs.run_id }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_ID: ${{ inputs.run_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          PAGE_DELAY_MS: ${{ inputs.page_delay_ms }}
+          WALL_LIMIT_SEC: '6600'
+        run: |
+          set -euo pipefail
+          echo "Machine ${{ inputs.machine_no }} — checking IP..."
+          curl -s https://api.ipify.org && echo
+          node noon/uae/ranking-sample.js 2>&1 | tee run.log
+
+      - name: Build job summary
+        if: always()
+        run: |
+          set +e
+          {
+            echo "## Ranking sample – Machine ${{ inputs.machine_no }} (Run ${{ inputs.run_id }})"
+            echo
+            echo "Runner IP: $(curl -s https://api.ipify.org 2>/dev/null || echo unknown)"
+            echo
+            echo '### Areas'
+            echo '```'
+            grep -E 'area .* (done|rate_limited|blocked|error)' run.log | tail -40
+            echo '```'
+            echo
+            echo '### Last 40 lines'
+            echo '```'
+            tail -40 run.log 2>/dev/null || echo '(no log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: noon-ranking-sample-run-${{ inputs.run_id }}-machine-${{ inputs.machine_no }}
+          path: run.log
+          if-no-files-found: warn
+          retention-days: 14
