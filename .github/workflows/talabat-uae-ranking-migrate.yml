@@ -1,0 +1,53 @@
+name: Talabat UAE – Ranking Migrate (one-off)
+
+# ONE-OFF migration to consolidate Talabat's Iceberg data into the shared
+# analytics bucket (where Deliveroo + Careem already live), freeing up the
+# standalone talabat-ranking-archive bucket.
+#
+# Workflow is dry-run by default — flip DRY_RUN to false to actually copy.
+# Safe to re-run: overwrite_filter per-day is idempotent.
+on:
+  workflow_dispatch:
+    inputs:
+      source_bucket:
+        description: 'Source analytics bucket (where data is now)'
+        required: false
+        type: string
+        default: 'talabat-ranking-archive'
+      dest_bucket:
+        description: 'Destination analytics bucket (shared, holds Deliveroo + Careem)'
+        required: false
+        type: string
+        default: 'deliveroo-ranking-archive'
+      dry_run:
+        description: 'Dry run — list days that would move; write nothing'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: talabat-uae-ranking-migrate
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --quiet "pyiceberg[pyarrow]==0.12.0"
+      - name: Migrate
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_S3_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          SUPABASE_S3_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          SUPABASE_S3_REGION: ap-southeast-2
+          SOURCE_BUCKET: ${{ inputs.source_bucket }}
+          DEST_BUCKET: ${{ inputs.dest_bucket }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: python talabat/uae/ranking-migrate.py
