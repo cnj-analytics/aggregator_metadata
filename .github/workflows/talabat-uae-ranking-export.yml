@@ -1,7 +1,7 @@
 name: Talabat UAE – Ranking Export (daily)
 
 # Copies finished hours of talabat_ranking_analysis to the Analytics Bucket
-# (talabat-ranking-archive, Iceberg table talabat.ranking_analysis) and records each
+# (deliveroo-ranking-archive, Iceberg table talabat.ranking_analysis — shared with Deliveroo + Careem) and records each
 # verified hour in talabat_ranking_export_log. The ranking-control's housekeeping step
 # then drops hour partitions older than 24h that have a verified export.
 #
@@ -40,6 +40,6 @@ jobs:
           SUPABASE_S3_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
           SUPABASE_S3_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
           SUPABASE_S3_REGION: ap-southeast-2
-          ANALYTICS_BUCKET: talabat-ranking-archive
+          ANALYTICS_BUCKET: deliveroo-ranking-archive
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: python talabat/uae/ranking-export.py
