@@ -1,0 +1,54 @@
+name: Noon UAE – Ranking Scrape (worker)
+run-name: Noon ranking run ${{ inputs.run_id }} m${{ inputs.machine_no }}
+
+# One worker job.  Dispatched by Supabase (noon_ranking_dispatch_machine) from
+# ranking-control, OR manually for debug.
+# Each dispatch is one machine -> separate workflow_run -> fresh runner IP.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'noon_ranking_run.run_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'noon_ranking_run_machine.machine_no'
+        required: true
+        type: string
+      page_delay_ms:
+        description: 'delay between page fetches within one area (ms)'
+        required: false
+        type: string
+        default: '2000'
+      pin_area_id:
+        description: 'Override: claim this area first (used on retry dispatch; empty = normal claim)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: noon-uae-ranking-scrape-run-${{ inputs.run_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    name: run ${{ inputs.run_id }} machine ${{ inputs.machine_no }}
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run ranking worker
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_ID: ${{ inputs.run_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          WALL_LIMIT_SEC: '4200'
+        run: node noon/uae/ranking-scrape.js
