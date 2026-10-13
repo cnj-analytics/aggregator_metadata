@@ -31,7 +31,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install
-        run: pip install --quiet "pyiceberg[pyarrow]==0.12.0" "psycopg[binary]==3.3.6"
+        run: pip install --quiet "pyiceberg[pyarrow,sql-sqlite]==0.12.0" "psycopg[binary]==3.3.6"
       - name: Export finished hours
         env:
           SUPABASE_URL:                  ${{ secrets.SUPABASE_URL }}
