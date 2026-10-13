@@ -18,7 +18,7 @@ Env:
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY   (Iceberg catalog auth)
   SUPABASE_DB_URL                           (direct Postgres connection string)
   SUPABASE_S3_ACCESS_KEY_ID, SUPABASE_S3_SECRET_ACCESS_KEY, SUPABASE_S3_REGION
-  ANALYTICS_BUCKET                          (default careem-ranking-archive)
+  ANALYTICS_BUCKET                          (default deliveroo-ranking-archive — shared with Deliveroo, Careem uses its own namespace)
   DRY_RUN                                   ("true" = read Postgres and report only)
   GITHUB_RUN_ID, GITHUB_STEP_SUMMARY        (set by GitHub)
 """
@@ -34,7 +34,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
-BUCKET = os.environ.get("ANALYTICS_BUCKET", "careem-ranking-archive")
+BUCKET = os.environ.get("ANALYTICS_BUCKET", "deliveroo-ranking-archive")
 NAMESPACE = "careem"
 TABLE = "ranking_analysis"       # sorted by branch (charts are per branch)
 RUN_ID = os.environ.get("GITHUB_RUN_ID", "local")
