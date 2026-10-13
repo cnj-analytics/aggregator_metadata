@@ -336,6 +336,7 @@ function parseCards(outlets, nonFoodSet) {
       o.name || null,                      // [21] noon_card_name
       o.pageUrl || null,                   // [22] noon_card_url
       o.imageUrl || o.logoUrl || null,     // [23] noon_card_image_url
+      Array.isArray(o.cuisines) ? o.cuisines : [], // [24] cuisines (for queue)
     ]);
   }
   return { rows, dropped };
