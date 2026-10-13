@@ -412,10 +412,19 @@ async function processArea(areaId, lat, lng, pageDelayMs, maxPages) {
 
   while (page < cap) {
     page++;
+    const pt0 = Date.now();
     const r = await fetchPage(loc, searchToken);
+    const pageMs = Date.now() - pt0;
 
     const fresh = r.outlets.filter((o) => !seen.has(o.outletCode));
     for (const o of fresh) { seen.add(o.outletCode); allOutlets.push(o); }
+
+    // Per-page progress log
+    console.log(
+      `[m${MACHINE}] ${areaId} p${page}: ${r.outlets.length} outlets ` +
+      `(${fresh.length} new, ${allOutlets.length} total) ${pageMs}ms` +
+      `${r.token ? '' : ' no-token'}`
+    );
 
     if (r.outlets.length === 0) { stopReason = `empty@${page}`;    break; }
     if (fresh.length === 0)     { stopReason = `no-new@${page}`;   break; }
