@@ -336,7 +336,7 @@ function parseCards(outlets) {
     const o = outlets[i];
     const code = o.outletCode;
     if (!code || seen.has(code)) continue;
-    seen.set(code);
+    seen.add(code);
 
     const rank = rows.length + 1; // 1-based deduplicated position
 
