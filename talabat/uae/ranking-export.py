@@ -22,7 +22,7 @@ Env:
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY   (Iceberg catalog auth)
   SUPABASE_DB_URL                           (direct Postgres connection string)
   SUPABASE_S3_ACCESS_KEY_ID, SUPABASE_S3_SECRET_ACCESS_KEY, SUPABASE_S3_REGION
-  ANALYTICS_BUCKET   (default talabat-ranking-archive)
+  ANALYTICS_BUCKET   (default deliveroo-ranking-archive — shared with Deliveroo + Careem)
   DRY_RUN            ("true" = read Postgres and report only; nothing written)
   GITHUB_RUN_ID, GITHUB_STEP_SUMMARY        (set by GitHub)
 """
@@ -38,7 +38,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
-BUCKET = os.environ.get("ANALYTICS_BUCKET", "talabat-ranking-archive")
+BUCKET = os.environ.get("ANALYTICS_BUCKET", "deliveroo-ranking-archive")
 NAMESPACE = "talabat"
 TABLE = "ranking_analysis"
 RUN_ID = os.environ.get("GITHUB_RUN_ID", "local")
@@ -250,7 +250,7 @@ def main():
 
         failures = 0
         for day, items in sorted(by_day.items()):
-            chunks = [items[i:i + CHUNK_HOURS] for i in range(0, len(items), CHUNK_HOURS)]
+            chunks = [items[i:i + CHUNK_HOURS] for i in range(0, len(items), CHUNK_HOURSY]
             for chunk in chunks:
                 hours = [h for h, _, _ in chunk]
                 label = f"{day} {hours[0].strftime('%H')}-{hours[-1].strftime('%H')}h"
