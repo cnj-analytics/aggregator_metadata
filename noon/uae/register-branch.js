@@ -35,11 +35,11 @@ const SUPABASE_URL  = process.env.SUPABASE_URL;
 const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const JOB_INDEX     = parseInt(process.env.JOB_INDEX || '0', 10);
 const JOB_COUNT     = parseInt(process.env.JOB_COUNT || '1', 10);
-const CLAIM_SIZE    = parseInt(process.env.CLAIM_SIZE || '1', 10);
+const CLAIM_SIZE    = parseInt(process.env.CLAIM_SIZE || '5', 10);
 const TIME_BUDGET_MS = parseInt(process.env.TIME_BUDGET_MIN || '40', 10) * 60_000;
 const SUMMARY_FILE  = process.env.SUMMARY_FILE || 'summary.json';
 const DELAY_MS      = parseInt(process.env.DELAY_MS || '4000', 10);
-const CALL_BUDGET   = parseInt(process.env.CALL_BUDGET || '100', 10);
+const CALL_BUDGET   = parseInt(process.env.CALL_BUDGET || '500', 10);
 const START_STAGGER_MS = 2000;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
