@@ -250,7 +250,7 @@ def main():
 
         failures = 0
         for day, items in sorted(by_day.items()):
-            chunks = [items[i:i + CHUNK_HOURS] for i in range(0, len(items), CHUNK_HOURSY]
+            chunks = [items[i:i + CHUNK_HOURS] for i in range(0, len(items), CHUNK_HOURS)]
             for chunk in chunks:
                 hours = [h for h, _, _ in chunk]
                 label = f"{day} {hours[0].strftime('%H')}-{hours[-1].strftime('%H')}h"
