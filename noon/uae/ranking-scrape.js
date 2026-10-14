@@ -431,8 +431,8 @@ function parseCards(outlets, nonFoodSet) {
       typeof d.time === 'string' ? d.time : null,         // [32] delivery_time
       classified.percent,                  // [33] noon_promo_percent (extracted)
       logoUrl,                             // [34] brand logo URL (full CDN)
-      !!(o.isVip),                         // [35] noon_branch_is_vip
-      o.vipMsg || null,                    // [36] noon_branch_vip_msg
+      typeof o.isVip === 'boolean' ? o.isVip : null, // [35] noon_is_vip (ranking row; null when missing)
+      o.vipMsg || null,                    // [36] noon_vip_msg (ranking row; null when blank)
     ]);
   }
   return { rows, dropped };
