@@ -1,11 +1,11 @@
 // register-branch.js
 //
-// Noon UAE — register new restaurants (one job of JOB_COUNT).
+// Noon UAE â register new restaurants (one job of JOB_COUNT).
 //
 // Started by Supabase (trigger on noon_restaurant_list_queue INSERT via
 // noon_dispatch_registration) whenever the ranking scrape discovers outlet
 // codes that are not in noon_branch. Each job:
-//   1. claims the oldest waiting outlet (noon_registration_claim) — atomic,
+//   1. claims the oldest waiting outlet (noon_registration_claim) â atomic,
 //      no two jobs get the same one;
 //   2. mints its own 3-step guest token on this runner's IP (same chain as
 //      ranking-scrape.js);
@@ -23,8 +23,8 @@
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JOB_INDEX, JOB_COUNT,
 //      CLAIM_SIZE (default 1), TIME_BUDGET_MIN (default 40), SUMMARY_FILE,
-//      DELAY_MS (default 4000 — detail endpoint refill ~1 per 4s per IP),
-//      CALL_BUDGET (default 100 — safety cap per machine)
+//      DELAY_MS (default 4000 â detail endpoint refill ~1 per 4s per IP),
+//      CALL_BUDGET (default 100 â safety cap per machine)
 
 'use strict';
 
@@ -35,11 +35,11 @@ const SUPABASE_URL  = process.env.SUPABASE_URL;
 const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const JOB_INDEX     = parseInt(process.env.JOB_INDEX || '0', 10);
 const JOB_COUNT     = parseInt(process.env.JOB_COUNT || '1', 10);
-const CLAIM_SIZE    = parseInt(process.env.CLAIM_SIZE || '5', 10);
+const CLAIM_SIZE    = parseInt(process.env.CLAIM_SIZE || '1', 10);
 const TIME_BUDGET_MS = parseInt(process.env.TIME_BUDGET_MIN || '40', 10) * 60_000;
 const SUMMARY_FILE  = process.env.SUMMARY_FILE || 'summary.json';
 const DELAY_MS      = parseInt(process.env.DELAY_MS || '4000', 10);
-const CALL_BUDGET   = parseInt(process.env.CALL_BUDGET || '500', 10);
+const CALL_BUDGET   = parseInt(process.env.CALL_BUDGET || '100', 10);
 const START_STAGGER_MS = 2000;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
@@ -260,7 +260,7 @@ function buildRecord(claim, detail) {
   try {
     while (Date.now() - started < TIME_BUDGET_MS && calls < CALL_BUDGET) {
       const batch = await rpc('noon_registration_claim', { p_limit: CLAIM_SIZE });
-      if (!batch || !batch.length) { log('queue empty – done'); break; }
+      if (!batch || !batch.length) { log('queue empty â done'); break; }
 
       for (const q of batch) {
         if (calls >= CALL_BUDGET) break;
@@ -285,7 +285,7 @@ function buildRecord(claim, detail) {
 
           const rec = buildRecord(q, payload);
           const out = await rpc('noon_register_branch', { p: rec });
-          res.status = 'registered';
+          res.status = (out && out.skipped) ? 'skipped' : 'registered';
           res.detail = { ...out, name: rec.name };
         } catch (e) {
           res.status = 'failed';
@@ -301,7 +301,7 @@ function buildRecord(claim, detail) {
             res.ms = Date.now() - t0;
             results.push(res);
             log(`${res.status.padEnd(10)} ${(q.name || '').slice(0, 40).padEnd(40)} ${res.detail}`);
-            log(`IP-class failure (${e.rateLimited ? '429' : '403'}) — stopping this job`);
+            log(`IP-class failure (${e.rateLimited ? '429' : '403'}) â stopping this job`);
             throw e;
           }
         }
@@ -310,7 +310,9 @@ function buildRecord(claim, detail) {
         log(`${res.status.padEnd(10)} ${(q.name || '').slice(0, 40).padEnd(40)} ` +
           (res.status === 'registered'
             ? `areas+${res.detail.delivery_areas_added} rankings->${res.detail.rankings_moved} brand_new=${res.detail.brand_created}`
-            : `${res.detail} (queue: ${res.queue_status})`));
+            : res.status === 'skipped'
+              ? `reason=${res.detail.reason}`
+              : `${res.detail} (queue: ${res.queue_status})`));
         await sleep(DELAY_MS);
       }
     }
