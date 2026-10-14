@@ -71,7 +71,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const PAGE_LIMIT        = 60;    // Noon's own page size
 const PAGE_SAFETY_CAP   = 500;   // runaway guard
-const MAX_AREAS_PER_RUN = 2;     // Noon rule: hard cap, fresh IP for more
+const MAX_AREAS_PER_RUN = 1;     // Noon rule: hard cap, fresh IP for more
 const EARLY_EXIT_PAGES  = 50;    // if area 1 >= this, don't claim area 2
 
 // U+E001 is Noon's custom dirham glyph -> normalise to "AED"
