@@ -1,11 +1,11 @@
 // register-branch.js
 //
-// Noon UAE â register new restaurants (one job of JOB_COUNT).
+// Noon UAE — register new restaurants (one job of JOB_COUNT).
 //
 // Started by Supabase (trigger on noon_restaurant_list_queue INSERT via
 // noon_dispatch_registration) whenever the ranking scrape discovers outlet
 // codes that are not in noon_branch. Each job:
-//   1. claims the oldest waiting outlet (noon_registration_claim) â atomic,
+//   1. claims the oldest waiting outlet (noon_registration_claim) — atomic,
 //      no two jobs get the same one;
 //   2. mints its own 3-step guest token on this runner's IP (same chain as
 //      ranking-scrape.js);
@@ -23,8 +23,8 @@
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JOB_INDEX, JOB_COUNT,
 //      CLAIM_SIZE (default 1), TIME_BUDGET_MIN (default 40), SUMMARY_FILE,
-//      DELAY_MS (default 4000 â detail endpoint refill ~1 per 4s per IP),
-//      CALL_BUDGET (default 100 â safety cap per machine)
+//      DELAY_MS (default 4000 — detail endpoint refill ~1 per 4s per IP),
+//      CALL_BUDGET (default 100 — safety cap per machine)
 
 'use strict';
 
@@ -254,16 +254,27 @@ function buildRecord(claim, detail) {
   const results = [];
   let calls = 0;
 
+  // Live knobs from noon_registration_settings (Supabase). Env is the fallback.
+  let callBudget = CALL_BUDGET;
+  let delayMs    = DELAY_MS;
+  try {
+    const cb = await rpc('noon_registration_setting', { p_key: 'call_budget' });
+    const dm = await rpc('noon_registration_setting', { p_key: 'delay_ms' });
+    if (Number.isFinite(cb)) callBudget = cb;
+    if (Number.isFinite(dm)) delayMs    = dm;
+  } catch (_) { /* keep env fallback */ }
+
   if (JOB_INDEX > 0) await sleep(JOB_INDEX * START_STAGGER_MS);
-  log(`Register job ${JOB_INDEX + 1}/${JOB_COUNT} | delay=${DELAY_MS}ms | budget=${CALL_BUDGET} calls`);
+  log(`Register job ${JOB_INDEX + 1}/${JOB_COUNT} | delay=${delayMs}ms | budget=${callBudget} calls (settings win over env)`);
 
   try {
-    while (Date.now() - started < TIME_BUDGET_MS && calls < CALL_BUDGET) {
+    while (Date.now() - started < TIME_BUDGET_MS && calls < callBudget) {
+      // p_limit is a fallback; the RPC reads claim_size from noon_registration_settings.
       const batch = await rpc('noon_registration_claim', { p_limit: CLAIM_SIZE });
-      if (!batch || !batch.length) { log('queue empty â done'); break; }
+      if (!batch || !batch.length) { log('queue empty – done'); break; }
 
       for (const q of batch) {
-        if (calls >= CALL_BUDGET) break;
+        if (calls >= callBudget) break;
 
         const t0 = Date.now();
         const res = {
@@ -301,7 +312,7 @@ function buildRecord(claim, detail) {
             res.ms = Date.now() - t0;
             results.push(res);
             log(`${res.status.padEnd(10)} ${(q.name || '').slice(0, 40).padEnd(40)} ${res.detail}`);
-            log(`IP-class failure (${e.rateLimited ? '429' : '403'}) â stopping this job`);
+            log(`IP-class failure (${e.rateLimited ? '429' : '403'}) — stopping this job`);
             throw e;
           }
         }
@@ -313,14 +324,14 @@ function buildRecord(claim, detail) {
             : res.status === 'skipped'
               ? `reason=${res.detail.reason}`
               : `${res.detail} (queue: ${res.queue_status})`));
-        await sleep(DELAY_MS);
+        await sleep(delayMs);
       }
     }
   } catch (e) {
     log(`stopping early: ${e.message}`);
   }
 
-  log(`done | ${results.length} outlets processed | ${calls}/${CALL_BUDGET} calls | ${tokenCount} tokens | ${Math.round((Date.now() - started) / 1000)}s`);
+  log(`done | ${results.length} outlets processed | ${calls}/${callBudget} calls | ${tokenCount} tokens | ${Math.round((Date.now() - started) / 1000)}s`);
   fs.writeFileSync(SUMMARY_FILE, JSON.stringify(results, null, 1));
 })().catch(e => {
   console.error('FATAL:', e.message || e);
