@@ -3,11 +3,11 @@ name: Noon UAE – Register Branch
 # Started by Supabase (noon_dispatch_registration trigger) when the ranking
 # scrape finds outlet codes that are not in noon_branch. Can also be run by hand.
 #
-# Model: ONE machine operating at a time. The machine claims 5 outlets per batch
-# (CLAIM_SIZE=5) and loops until the queue is empty or the time budget is spent.
-# When the machine finishes, the report job calls noon_registration_run_completed
-# which reopens the trigger-gate; if the queue still has items the report job
-# dispatches a follow-up run.
+# Model: ONE machine operating at a time, and each machine registers at most
+# 5 outlets before exiting. When the machine finishes, the report job calls
+# noon_registration_run_completed (reopens the trigger-gate) and, if the queue
+# still has pending outlets, dispatches the next machine. This keeps machine
+# lifetime short and predictable.
 on:
   workflow_dispatch:
 
@@ -20,9 +20,37 @@ permissions:
   actions: write   # lets the run re-dispatch itself when a backlog remains
 
 jobs:
-  register:
+  guard:
+    # Exit cleanly if another run of this workflow is already in progress.
+    # Covers manual Run-workflow clicks that bypass the Supabase trigger-gate.
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    outputs:
+      proceed: ${{ steps.g.outputs.proceed }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          others=$(gh run list \
+            --workflow noon-uae-register-branch.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --status in_progress \
+            --limit 20 \
+            --json databaseId \
+            --jq "[.[] | select(.databaseId != ${{ github.run_id }})] | length")
+          echo "Other in-progress runs: ${others:-0}"
+          if [ "${others:-0}" -gt 0 ]; then
+            echo "Another run is already in progress — exiting this one."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  register:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -37,8 +65,8 @@ jobs:
           SUMMARY_FILE: register-job.json
           CLAIM_SIZE: '5'
           DELAY_MS: '4000'
-          CALL_BUDGET: '500'
-          TIME_BUDGET_MIN: '40'
+          CALL_BUDGET: '5'
+          TIME_BUDGET_MIN: '5'
         run: node noon/uae/register-branch.js
       - name: Upload job summary
         if: always()
@@ -50,8 +78,8 @@ jobs:
           retention-days: 7
 
   report:
-    needs: [register]
-    if: always()
+    needs: [guard, register]
+    if: always() && needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
