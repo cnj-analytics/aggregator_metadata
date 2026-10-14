@@ -57,6 +57,54 @@ if (!RUN_ID || !MACHINE) {
 const WALL_LIMIT_MS = (Number(process.env.WALL_LIMIT_SEC) || 4500) * 1000;
 const START_TIME    = Date.now();
 
+// -- Audit log (403 pattern analysis). Never blocks or stops a scrape. ------
+
+let NOON_REQ = 0;      // Noon requests made from this machine's IP
+let RUNNER_IP = null;  // public IP of this GitHub runner
+const rawFetch = globalThis.fetch;
+globalThis.fetch = (u, o) => {
+  if (String(u).includes('noon.com')) NOON_REQ++;
+  return rawFetch(u, o);
+};
+const AREA_CTX = { page: 0 };
+
+function failStep(msg) {
+  const m = String(msg || '');
+  if (m.startsWith('mint whoami-food')) return 'mint_whoami_food';
+  if (m.startsWith('mint whoami')) return 'mint_whoami';
+  if (m.startsWith('mint set-location')) return 'mint_set_location';
+  if (m.startsWith('locate set-loc')) return 'locate_set_location';
+  if (m.startsWith('locate whoami')) return 'locate_whoami';
+  if (m.startsWith('search')) return 'search';
+  return 'other';
+}
+
+async function audit(row) {
+  try {
+    const r = await rawFetch(`${SUPABASE_URL}/rest/v1/noon_scrape_audit`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        run_id: RUN_ID, machine_no: MACHINE, github_run_id: GH_RUN_ID,
+        runner_ip: RUNNER_IP,
+        machine_started_at: new Date(START_TIME).toISOString(),
+        machine_age_s: Math.round((Date.now() - START_TIME) / 1000),
+        areas_cap: MAX_AREAS_PER_RUN,
+        ...row,
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) console.log(`[m${MACHINE}] audit log HTTP ${r.status}`);
+  } catch (e) {
+    console.log(`[m${MACHINE}] audit log failed: ${e.message}`);
+  }
+}
+
 // -- Constants --------------------------------------------------------------
 
 const UA    = 'noon/22098 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
@@ -442,6 +490,8 @@ function parseCards(outlets, nonFoodSet) {
 
 async function processArea(areaId, lat, lng, pageDelayMs, maxPages, nonFoodSet) {
   const t0 = Date.now();
+  AREA_CTX.page = 0;
+  session = null;
 
   // One token per area, minted now. Not re-minted mid-walk.
   await mintToken(lat, lng);
@@ -458,6 +508,7 @@ async function processArea(areaId, lat, lng, pageDelayMs, maxPages, nonFoodSet) 
 
   while (page < cap) {
     page++;
+    AREA_CTX.page = page;
     const pt0 = Date.now();
     const r = await fetchPage(loc, searchToken);
     const pageMs = Date.now() - pt0;
@@ -528,6 +579,13 @@ async function processArea(areaId, lat, lng, pageDelayMs, maxPages, nonFoodSet) 
   const nonFoodSet  = new Set(Array.isArray(nonFoodList) ? nonFoodList : []);
   console.log(`[m${MACHINE}] non-food cuisines (${nonFoodSet.size}): ${[...nonFoodSet].join(', ')}`);
 
+  // -- Runner IP for the audit log (not a Noon request) --------------------
+  try {
+    const ipr = await rawFetch('https://api.ipify.org', { signal: AbortSignal.timeout(4000) });
+    RUNNER_IP = (await ipr.text()).trim() || null;
+  } catch (_) { /* unknown IP is fine */ }
+  console.log(`[m${MACHINE}] runner ip=${RUNNER_IP || 'unknown'}`);
+
   // -- claim -> process -> report loop (max 2 areas) -----------------------
   let exitReason = 'areas_complete';
 
@@ -564,6 +622,18 @@ async function processArea(areaId, lat, lng, pageDelayMs, maxPages, nonFoodSet) 
     const maxPg    = claim.max_pages     || PAGE_SAFETY_CAP;
 
     console.log(`[m${MACHINE}] claimed ${areaId} (${areaName}) [area ${areaIdx + 1}/${MAX_AREAS_PER_RUN}] | delay=${pageDel}ms max=${maxPg}`);
+
+    // Audit context for this area
+    const claimedAt = Date.now();
+    const reqBefore = NOON_REQ;
+    const auditBase = () => ({
+      area_seq: areaIdx + 1, noon_area_id: areaId, area_name: areaName,
+      claimed_at: new Date(claimedAt).toISOString(), ended_at: new Date().toISOString(),
+      gap_s: claim.gap_seconds || 0, page_delay_ms: pageDel, max_pages: maxPg,
+      token_no: tokenNumber, token_age_ms: session ? Date.now() - session.mintedAt : null,
+      req_before: reqBefore, req_area: NOON_REQ - reqBefore,
+      elapsed_ms: Date.now() - claimedAt,
+    });
 
     if (claim.gap_seconds > 0) {
       console.log(`[m${MACHINE}] gap ${claim.gap_seconds}s`);
@@ -605,6 +675,10 @@ async function processArea(areaId, lat, lng, pageDelayMs, maxPages, nonFoodSet) 
       });
 
       totalAreas++;
+      await audit({
+        ...auditBase(), outcome: 'ok', pages: result.pages, cards: result.cards,
+        rows_parsed: result.rows.length, rows_saved: savedAnalysis, stop_reason: result.stopReason,
+      });
       totalRows += result.rows.length;
       console.log(
         `[m${MACHINE}] ${areaId} ok: ${result.cards} cards, ${result.rows.length} rows (${result.dropped} dropped), ` +
@@ -632,6 +706,11 @@ async function processArea(areaId, lat, lng, pageDelayMs, maxPages, nonFoodSet) 
       // replacement machine on a fresh IP.
       if (e.rateLimited || e.forbidden) {
         const kind = e.forbidden ? 'blocked' : 'rate_limited';
+        await audit({
+          ...auditBase(), outcome: kind, pages: Math.max(0, AREA_CTX.page - 1),
+          fail_step: failStep(e.message), fail_page: AREA_CTX.page || null,
+          http_status: e.forbidden ? 403 : 429, error: e.message.slice(0, 300),
+        });
         console.log(`[m${MACHINE}] ${kind} on ${areaId}: ${e.message} - stopping machine immediately`);
 
         const rep = await rpc('noon_ranking_report', {
@@ -646,6 +725,12 @@ async function processArea(areaId, lat, lng, pageDelayMs, maxPages, nonFoodSet) 
 
       // Non-throttle error -> report and stop (one error exhausts the budget too)
       console.log(`[m${MACHINE}] error on ${areaId}: ${e.message}`);
+      await audit({
+        ...auditBase(), outcome: 'error', pages: Math.max(0, AREA_CTX.page - 1),
+        fail_step: failStep(e.message), fail_page: AREA_CTX.page || null,
+        http_status: Number((e.message.match(/HTTP (\d{3})/) || [])[1]) || null,
+        error: e.message.slice(0, 300),
+      });
       await rpc('noon_ranking_report', {
         p_run_id: RUN_ID, p_machine_no: MACHINE, p_area_id: areaId,
         p_result: { status: 'error', error: e.message.slice(0, 500) },
