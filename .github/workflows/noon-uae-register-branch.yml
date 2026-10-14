@@ -1,16 +1,13 @@
 name: Noon UAE – Register Branch
 
-# Started automatically by Supabase (noon_dispatch_registration trigger)
-# when the ranking scrape finds outlet codes that are not in noon_branch.
-# Can also be run by hand.
+# Started by Supabase (noon_dispatch_registration trigger) when the ranking
+# scrape finds outlet codes that are not in noon_branch. Can also be run by hand.
 #
-# Normal: 1 job, first come first served – takes the oldest waiting outlet,
-# fetches detail, registers partner/brand/branch/info/delivery-areas, promotes
-# parked rankings, marks the queue row registered, takes the next, until the
-# queue is empty.
-# Backlog (more than 100 waiting when the run starts): up to 5 jobs share the
-# same queue. If the time budget runs out with outlets still waiting, the run
-# dispatches itself again.
+# Model: ONE machine operating at a time. The machine claims 5 outlets per batch
+# (CLAIM_SIZE=5) and loops until the queue is empty or the time budget is spent.
+# When the machine finishes, the report job calls noon_registration_run_completed
+# which reopens the trigger-gate; if the queue still has items the report job
+# dispatches a follow-up run.
 on:
   workflow_dispatch:
 
@@ -23,49 +20,22 @@ permissions:
   actions: write   # lets the run re-dispatch itself when a backlog remains
 
 jobs:
-  plan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      waiting: ${{ steps.p.outputs.waiting }}
-      jobs: ${{ steps.p.outputs.jobs }}
-    steps:
-      - id: p
-        name: How many outlets are waiting?
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: |
-          n=$(curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/noon_registration_waiting" \
-                -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
-                -H "Content-Type: application/json" -d '{}')
-          n=${n:-0}
-          k=5  # always 5 parallel jobs — pool size per user requirement
-          echo "waiting=$n" >> "$GITHUB_OUTPUT"
-          echo "jobs=$(python3 -c "import json;print(json.dumps(list(range($k))))")" >> "$GITHUB_OUTPUT"
-          echo "Waiting outlets: $n → $k job(s)"
-
   register:
-    needs: plan
-    if: needs.plan.outputs.waiting != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 50
-    strategy:
-      fail-fast: false
-      matrix:
-        job: ${{ fromJSON(needs.plan.outputs.jobs) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Register (job ${{ matrix.job }})
+      - name: Register
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          JOB_INDEX: ${{ matrix.job }}
-          JOB_COUNT: ${{ strategy.job-total }}
-          SUMMARY_FILE: register-job-${{ matrix.job }}.json
+          JOB_INDEX: '0'
+          JOB_COUNT: '1'
+          SUMMARY_FILE: register-job.json
+          CLAIM_SIZE: '5'
           DELAY_MS: '4000'
           CALL_BUDGET: '500'
           TIME_BUDGET_MIN: '40'
@@ -74,14 +44,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: register-summary-job-${{ matrix.job }}
-          path: register-job-${{ matrix.job }}.json
+          name: register-summary
+          path: register-job.json
           if-no-files-found: warn
           retention-days: 7
 
   report:
-    needs: [plan, register]
-    if: always() && needs.plan.outputs.waiting != '0'
+    needs: [register]
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -90,17 +60,21 @@ jobs:
           node-version: '20'
       - uses: actions/download-artifact@v4
         with:
-          pattern: register-summary-job-*
+          name: register-summary
           path: summaries
-          merge-multiple: true
       - name: Build report
         run: node noon/uae/register-report.js summaries >> "$GITHUB_STEP_SUMMARY"
-      - name: Start again if outlets are still waiting
+      - name: Mark workflow completed and start next if queue has items
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 1. Reopen the trigger-gate: mark this dispatch log row completed
+          curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/noon_registration_run_completed" \
+                -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+                -H "Content-Type: application/json" -d '{}'
+          # 2. If queue still has pending items, dispatch the next workflow
           n=$(curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/noon_registration_waiting" \
                 -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
                 -H "Content-Type: application/json" -d '{}')
