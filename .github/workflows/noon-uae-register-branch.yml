@@ -4,10 +4,12 @@ name: Noon UAE – Register Branch
 # scrape finds outlet codes that are not in noon_branch. Can also be run by hand.
 #
 # Model: ONE machine operating at a time, and each machine registers at most
-# 5 outlets before exiting. When the machine finishes, the report job calls
-# noon_registration_run_completed (reopens the trigger-gate) and, if the queue
-# still has pending outlets, dispatches the next machine. This keeps machine
-# lifetime short and predictable.
+# CALL_BUDGET outlets before exiting. When the machine finishes, the report
+# job calls noon_registration_run_completed (reopens the trigger-gate) and
+# then noon_registration_try_dispatch (the SAME gated RPC the ranking-scrape
+# trigger uses) to request the next machine. Routing both paths through one
+# gated dispatcher prevents the Supabase trigger and the self-dispatch from
+# racing and spawning duplicate workflow runs on the same tick.
 on:
   workflow_dispatch:
 
@@ -17,7 +19,7 @@ concurrency:
 
 permissions:
   contents: read
-  actions: write   # lets the run re-dispatch itself when a backlog remains
+  actions: write   # kept for optional manual escape-hatches; not used anymore
 
 jobs:
   guard:
@@ -92,22 +94,24 @@ jobs:
           path: summaries
       - name: Build report
         run: node noon/uae/register-report.js summaries >> "$GITHUB_STEP_SUMMARY"
-      - name: Mark workflow completed and start next if queue has items
+      - name: Reopen gate and request next dispatch (gated)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          GH_TOKEN: ${{ github.token }}
         run: |
-          # 1. Reopen the trigger-gate: mark this dispatch log row completed
+          # 1. Mark this dispatch log row completed (reopens the Supabase gate).
           curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/noon_registration_run_completed" \
-                -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+                -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+                -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
                 -H "Content-Type: application/json" -d '{}'
-          # 2. If queue still has pending items, dispatch the next workflow
-          n=$(curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/noon_registration_waiting" \
-                -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
-                -H "Content-Type: application/json" -d '{}')
-          echo "Still waiting: ${n:-0}"
-          if [ "${n:-0}" -gt 0 ]; then
-            gh workflow run noon-uae-register-branch.yml --repo "$GITHUB_REPOSITORY" --ref main
-            echo "Dispatched a follow-up run."
-          fi
+
+          # 2. Ask the SAME gated RPC the ranking-scrape trigger uses to dispatch
+          #    the next machine. The RPC takes an advisory lock, re-checks the
+          #    dispatch log, and only fires if nothing else just did. This replaces
+          #    the previous `gh workflow run` self-dispatch, which bypassed the log
+          #    and could race the ranking trigger's dispatch on the same tick.
+          resp=$(curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/noon_registration_try_dispatch" \
+                 -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+                 -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+                 -H "Content-Type: application/json" -d '{}')
+          echo "noon_registration_try_dispatch -> ${resp:-no body}"
