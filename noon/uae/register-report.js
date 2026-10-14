@@ -25,9 +25,17 @@ const okRows   = rows.filter(r => r.status === 'registered');
 const failRows = rows.filter(r => r.status === 'failed');
 const avgMs    = okRows.length ? Math.round(okRows.reduce((a, r) => a + (r.ms || 0), 0) / okRows.length) : 0;
 
+const skipRows = rows.filter(r => r.status === 'skipped');
+const skipByReason = skipRows.reduce((a, r) => {
+  const k = (r.detail && r.detail.reason) || 'unknown';
+  a[k] = (a[k] || 0) + 1;
+  return a;
+}, {});
+
 const totals = {
   processed:     rows.length,
   registered:    byStatus.registered || 0,
+  skipped:       byStatus.skipped || 0,
   failed:        byStatus.failed || 0,
   fatal:         byStatus.fatal || 0,
   avg_ms:        avgMs,
@@ -41,6 +49,17 @@ console.log('| metric | value |');
 console.log('|---|---|');
 for (const [k, v] of Object.entries(totals)) console.log(`| ${k} | ${v} |`);
 console.log('');
+
+if (Object.keys(skipByReason).length) {
+  console.log('### Skipped by reason');
+  console.log('');
+  console.log('| reason | count |');
+  console.log('|---|---|');
+  for (const [k, v] of Object.entries(skipByReason).sort((a, b) => b[1] - a[1])) {
+    console.log(`| ${k} | ${v} |`);
+  }
+  console.log('');
+}
 
 if (failRows.length) {
   console.log('### Failures (first 20)');
