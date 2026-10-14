@@ -2,24 +2,36 @@
 //
 // Careem UAE — Ranking worker (one GitHub Actions job per machine).
 // Loops: machine_start -> claim area -> fetch all pages -> parse -> report ->
-// sleep. Exits on 429/5xx, deadline, "no areas left", or wall limit.
+// sleep. Exits on 429/403 (report says stop_job), deadline, "no areas left",
+// or wall limit.
+//
+// Careem server errors (5xx) and network errors on a page are retried on the
+// SAME page up to 3 times (3s, 8s, 15s) so cards already collected are kept.
+// If the page still fails, the area is reported 'failed' with the HTTP status,
+// key response headers and the start of the response body, and
+// careem_ranking_report requeues it (up to 3 times).
 //
 // Env (all required unless noted):
-//   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-//   RUN_ID            bigint (from workflow input)
-//   MACHINE_NO        integer (from workflow input)
-//   GITHUB_RUN_ID     informational
-//   PAGE_DELAY_MS     delay between page fetches within one area (default 1000)
-//   WALL_LIMIT_SEC    hard stop (default 21000 = 5h50m)
+// SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+// RUN_ID bigint (from workflow input)
+// MACHINE_NO integer (from workflow input)
+// GITHUB_RUN_ID informational
+// PAGE_DELAY_MS delay between page fetches within one area (default 1000)
+// WALL_LIMIT_SEC hard stop (default 21000 = 5h50m)
 
-const SUPABASE_URL   = process.env.SUPABASE_URL;
-const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RUN_ID         = process.env.RUN_ID;
-const MACHINE_NO     = parseInt(process.env.MACHINE_NO || '0', 10);
-const GITHUB_RUN_ID  = process.env.GITHUB_RUN_ID || '';
-const PAGE_DELAY_MS  = parseInt(process.env.PAGE_DELAY_MS || '1000', 10);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const RUN_ID = process.env.RUN_ID;
+const MACHINE_NO = parseInt(process.env.MACHINE_NO || '0', 10);
+const GITHUB_RUN_ID = process.env.GITHUB_RUN_ID || '';
+const PAGE_DELAY_MS = parseInt(process.env.PAGE_DELAY_MS || '1000', 10);
 const WALL_LIMIT_SEC = parseInt(process.env.WALL_LIMIT_SEC || '21000', 10);
-const MAX_PAGES      = 150;
+const MAX_PAGES = 150;
+
+// NEW: same-page retry on Careem 5xx / network errors (waits before each retry).
+const PAGE_RETRY_DELAYS_MS = [3000, 8000, 15000];
+// NEW: one retry of the save RPC (save is delete-then-insert, so repeating is safe).
+const SAVE_RETRY_DELAY_MS = 3000;
 
 // Optional: specific token slot (1-10) overrides the natural machine_no → slot mapping.
 // Used by the orchestrator on retry dispatches (same-slot for retries 1-3, rotated 4-10).
@@ -147,18 +159,76 @@ async function fetchPage(token, sub, page, area) {
   const t0 = Date.now();
   const resp = await fetch(pageUrl(page), { headers, redirect: 'follow' });
   const text = await resp.text();
-  return { status: resp.status, text, elapsed: Date.now() - t0, bytes: text.length };
+  // NEW: keep the headers that tell us WHO answered an error (Careem's app,
+  // their gateway, or a CDN in front of it).
+  const hdr = {
+    server: resp.headers.get('server') || '',
+    via: resp.headers.get('via') || '',
+    cf_ray: resp.headers.get('cf-ray') || '',
+    req_id: resp.headers.get('x-request-id') || resp.headers.get('x-amzn-requestid') ||
+            resp.headers.get('x-careem-request-id') || '',
+    ctype: resp.headers.get('content-type') || '',
+    retry_after: resp.headers.get('retry-after') || '',
+  };
+  return { status: resp.status, text, elapsed: Date.now() - t0, bytes: text.length, hdr };
+}
+
+// NEW: one-line description of an error response, stored in run_area.error.
+function describeHttp(fp, page) {
+  const h = fp.hdr || {};
+  const body = (fp.text || '').replace(/\s+/g, ' ').slice(0, 300);
+  const parts = [`http_${fp.status}`, `page=${page}`];
+  if (h.server) parts.push(`server=${h.server}`);
+  if (h.via) parts.push(`via=${h.via}`);
+  if (h.cf_ray) parts.push(`cf-ray=${h.cf_ray}`);
+  if (h.req_id) parts.push(`req=${h.req_id}`);
+  if (h.retry_after) parts.push(`retry-after=${h.retry_after}`);
+  if (h.ctype) parts.push(`ctype=${h.ctype}`);
+  parts.push(`ms=${fp.elapsed}`);
+  parts.push(`body=${body || '(empty)'}`);
+  return parts.join(' ');
+}
+
+// NEW: fetch one page, retrying the SAME page on 5xx / network errors.
+// 429 and 403 are returned immediately (handled by the rate-limit/block path).
+async function fetchPageWithRetry(token, sub, page, area) {
+  let lastErr = null;
+  let lastFp = null;
+  for (let attempt = 0; attempt <= PAGE_RETRY_DELAYS_MS.length; attempt++) {
+    if (attempt > 0) {
+      const d = PAGE_RETRY_DELAYS_MS[attempt - 1];
+      console.log(`[m${MACHINE_NO}] area ${area.careem_area_id} page ${page} ` +
+                  `retry ${attempt}/${PAGE_RETRY_DELAYS_MS.length} in ${d}ms after: ${String(lastErr).slice(0, 200)}`);
+      await sleep(d);
+    }
+    let fp;
+    try {
+      fp = await fetchPage(token, sub, page, area);
+    } catch (e) {
+      lastErr = `fetch failed: page=${page} ${e.message}`;
+      lastFp = null;
+      continue;
+    }
+    if (fp.status >= 500 && fp.status <= 599) {
+      lastErr = describeHttp(fp, page);
+      lastFp = fp;
+      console.log(`[m${MACHINE_NO}] area ${area.careem_area_id} ${lastErr}`);
+      continue;
+    }
+    return { fp, retries: attempt };
+  }
+  return { fp: lastFp, retries: PAGE_RETRY_DELAYS_MS.length, error: lastErr };
 }
 
 // ── Parse card → positional slot row ───────────────────────────────────
 function toBool(v) { return v === true || v === 'true'; }
-function toNum(v)  { return (v === null || v === undefined || v === '') ? null : Number(v); }
+function toNum(v) { return (v === null || v === undefined || v === '') ? null : Number(v); }
 
 function parseCards(cards) {
   // first-sighting rank per merchant_id + appearances counter
-  const firstRank = new Map();  // merchant_id -> rank
+  const firstRank = new Map(); // merchant_id -> rank
   const appearances = new Map();
-  const firstCard = new Map();  // merchant_id -> card
+  const firstCard = new Map(); // merchant_id -> card
   let rank = 0;
   for (const c of cards) {
     const mid = c.merchant_id || c.outlet_id || c.restaurant_id;
@@ -177,24 +247,24 @@ function parseCards(cards) {
     const c = firstCard.get(key);
     const app = appearances.get(key) || 1;
     rows.push([
-      key,                                               // 0 branch_id (as text, cast bigint in SQL)
-      r,                                                 // 1 rank
-      app,                                               // 2 appearances
-      toBool(c.merchant_availability),                   // 3 is_available
-      toBool(c.is_busy),                                 // 4 is_busy
-      c.availability || '',                              // 5 availability_text
-      toNum(c.merchant_rating),                          // 6 rating
-      toNum(c.no_of_reviews),                            // 7 rating_count
-      toNum(c.eta_minutes),                              // 8 eta_minutes
-      toBool(c.is_cplus),                                // 9 is_cplus
-      toBool(c.is_offer),                                // 10 has_offer
-      toNum(c.offer_id),                                 // 11 offer_id
-      c.offer_text || '',                                // 12 offer_text
-      toBool(c.is_ad_slot),                              // 13 is_sponsored
-      toNum(c.ad_id),                                    // 14 ad_id
-      c.merchant_name || '',                             // 15 card_name
-      '',                                                // 16 card_image_url (not in Careem listing)
-      '',                                                // 17 card_url
+      key, // 0 branch_id (as text, cast bigint in SQL)
+      r, // 1 rank
+      app, // 2 appearances
+      toBool(c.merchant_availability), // 3 is_available
+      toBool(c.is_busy), // 4 is_busy
+      c.availability || '', // 5 availability_text
+      toNum(c.merchant_rating), // 6 rating
+      toNum(c.no_of_reviews), // 7 rating_count
+      toNum(c.eta_minutes), // 8 eta_minutes
+      toBool(c.is_cplus), // 9 is_cplus
+      toBool(c.is_offer), // 10 has_offer
+      toNum(c.offer_id), // 11 offer_id
+      c.offer_text || '', // 12 offer_text
+      toBool(c.is_ad_slot), // 13 is_sponsored
+      toNum(c.ad_id), // 14 ad_id
+      c.merchant_name || '', // 15 card_name
+      '', // 16 card_image_url (not in Careem listing)
+      '', // 17 card_url
     ]);
   }
   return rows;
@@ -202,43 +272,48 @@ function parseCards(cards) {
 
 // ── Process one area ───────────────────────────────────────────────────
 async function processArea({ token, sub, area, scrape_date, scrape_hour, dry_run }) {
-  const t0 = Date.now();
   const cards = [];
-  let totalBytes = 0, totalFetchMs = 0, httpStatus = null;
+  let totalBytes = 0, totalFetchMs = 0, httpStatus = null, pageRetries = 0;
 
   for (let page = 1; page <= MAX_PAGES; page++) {
-    let fp;
-    try { fp = await fetchPage(token, sub, page, area); }
-    catch (e) {
-      return { status: 'failed', error: `fetch failed: ${e.message}`,
-               cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs };
+    const res = await fetchPageWithRetry(token, sub, page, area);
+    pageRetries += res.retries;
+
+    if (res.error) {
+      // Still failing after the same-page retries (5xx or network).
+      return { status: 'failed', http_status: res.fp ? res.fp.status : null,
+        error: `${res.error} (after ${PAGE_RETRY_DELAYS_MS.length} page retries)`,
+        cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs, page_retries: pageRetries };
     }
+    const fp = res.fp;
     httpStatus = fp.status;
     totalBytes += fp.bytes;
     totalFetchMs += fp.elapsed;
 
     if (fp.status === 429) return { status: 'rate_limited', http_status: 429, error: 'http_429',
-                                    cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs };
+      cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs, page_retries: pageRetries };
     if (fp.status === 403) return { status: 'blocked', http_status: 403, error: 'http_403',
-                                    cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs };
+      cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs, page_retries: pageRetries };
     if (fp.status === 204 || (fp.status >= 200 && fp.status < 300 && fp.bytes === 0)) {
       // empty = end of pages
       break;
     }
     if (fp.status < 200 || fp.status >= 400) {
-      return { status: 'failed', http_status: fp.status, error: `http_${fp.status}`,
-               cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs };
+      // Other 4xx (not 403/429): not retried at page level, but now logged in full.
+      return { status: 'failed', http_status: fp.status, error: describeHttp(fp, page),
+        cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs, page_retries: pageRetries };
     }
 
     let parsed;
     try { parsed = JSON.parse(fp.text); }
     catch (e) {
-      return { status: 'failed', http_status: fp.status, error: `non-JSON: ${e.message}`,
-               cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs };
+      return { status: 'failed', http_status: fp.status,
+        error: `non-JSON: page=${page} ${e.message} body=${(fp.text || '').slice(0, 200)}`,
+        cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs, page_retries: pageRetries };
     }
 
     const pageCards = collectCards(parsed, [], 0);
-    console.log(`[m${MACHINE_NO}]   area ${area.careem_area_id} page ${page} → ${pageCards.length} cards, ${fp.bytes}B, ${fp.elapsed}ms (status ${fp.status})`);
+    console.log(`[m${MACHINE_NO}] area ${area.careem_area_id} page ${page} → ${pageCards.length} cards, ${fp.bytes}B, ${fp.elapsed}ms (status ${fp.status})`);
     if (pageCards.length === 0) break;
     for (const c of pageCards) cards.push(c);
 
@@ -248,26 +323,34 @@ async function processArea({ token, sub, area, scrape_date, scrape_hour, dry_run
   const rows = parseCards(cards);
   if (dry_run) {
     return { status: 'ok', http_status: httpStatus, cards: cards.length,
-             ranking_rows: rows.length, pending_rows: 0, bytes: totalBytes, fetch_ms: totalFetchMs };
+      ranking_rows: rows.length, pending_rows: 0, bytes: totalBytes, fetch_ms: totalFetchMs,
+      page_retries: pageRetries };
   }
 
-  try {
-    const saved = await rpc('careem_ranking_save_area_hour', {
-      p_area_id: area.careem_area_id,
-      p_date:    scrape_date,
-      p_hour:    scrape_hour + ':00',
-      p_rows:    rows,
-    });
-    return {
-      status: 'ok', http_status: httpStatus, cards: cards.length,
-      ranking_rows: (saved?.inserted || 0),
-      pending_rows: (saved?.pending  || 0),
-      bytes: totalBytes, fetch_ms: totalFetchMs,
-    };
-  } catch (e) {
-    return { status: 'failed', http_status: httpStatus, error: `save_area_hour: ${e.message}`,
-             cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs };
+  // Save, with one retry (delete-then-insert, so a repeat cannot duplicate).
+  let lastSaveErr = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const saved = await rpc('careem_ranking_save_area_hour', {
+        p_area_id: area.careem_area_id,
+        p_date: scrape_date,
+        p_hour: scrape_hour + ':00',
+        p_rows: rows,
+      });
+      return {
+        status: 'ok', http_status: httpStatus, cards: cards.length,
+        ranking_rows: (saved?.inserted || 0),
+        pending_rows: (saved?.pending || 0),
+        bytes: totalBytes, fetch_ms: totalFetchMs, page_retries: pageRetries,
+      };
+    } catch (e) {
+      lastSaveErr = e.message;
+      console.log(`[m${MACHINE_NO}] area ${area.careem_area_id} save attempt ${attempt} failed: ${e.message.slice(0, 200)}`);
+      if (attempt < 2) await sleep(SAVE_RETRY_DELAY_MS);
+    }
   }
+  return { status: 'failed', http_status: httpStatus, error: `save_area_hour: ${lastSaveErr}`,
+    cards: cards.length, bytes: totalBytes, fetch_ms: totalFetchMs, page_retries: pageRetries };
 }
 
 // ── Main loop ──────────────────────────────────────────────────────────
@@ -291,7 +374,7 @@ async function main() {
   console.log(`token loaded, sub=${sub}`);
 
   let areasDone = 0, areasFailed = 0;
-  let pinConsumed = false;  // first iteration uses PIN_AREA_ID if present; after that, normal claim
+  let pinConsumed = false; // first iteration uses PIN_AREA_ID if present; after that, normal claim
 
   if (PIN_AREA_ID) {
     console.log(`[m${MACHINE_NO}] pinned first-area target = ${PIN_AREA_ID}`);
@@ -342,8 +425,10 @@ async function main() {
       dry_run: start.dry_run,
     });
     console.log(`[m${MACHINE_NO}] area ${area.careem_area_id} → ${outcome.status} ` +
-                `cards=${outcome.cards||0} rows=${outcome.ranking_rows||0} ` +
-                `pending=${outcome.pending_rows||0} bytes=${outcome.bytes||0}`);
+      `cards=${outcome.cards||0} rows=${outcome.ranking_rows||0} ` +
+      `pending=${outcome.pending_rows||0} bytes=${outcome.bytes||0} ` +
+      `page_retries=${outcome.page_retries||0}` +
+      (outcome.error ? ` error=${String(outcome.error).slice(0, 300)}` : ''));
 
     try {
       const rep = await rpc('careem_ranking_report', {
