@@ -277,6 +277,81 @@ function isRestaurant(outlet, nonFoodSet) {
   return false;
 }
 
+// -- New-schema helpers (Noon changed /search response shape on 2026-10-14) --
+
+const CDN_PREFIX = 'https://f.nooncdn.com/food_production/';
+const cdnUrl = (key) =>
+  (typeof key === 'string' && key.trim()) ? CDN_PREFIX + key.trim() + '?width=720&format=webp' : null;
+
+// Rating state is now carried in rating.title: null -> not_rated, "New" -> new,
+// anything else (e.g., "4.4 (500+)") -> rated.
+function deriveRatingStatus(title) {
+  if (title == null || String(title).trim() === '') return 'not_rated';
+  if (/^new$/i.test(String(title).trim())) return 'new';
+  return 'rated';
+}
+
+/**
+ * Classify a promo text string into the noon_promo_scope enum values and
+ * extract numeric percent and cap when present. Any one of the three card tag
+ * fields (tag / extendedTag / miniTag) can match. extendedTag often carries
+ * the richest form (with "up to X" caps or "select items" scope).
+ *
+ * Returns { scope, percent, cap }. All nullable.
+ *
+ * Pattern catalogue (from 2026-10-14 live sample of 12,565 cards):
+ *   - "30% off", "50% OFF"                 -> percent_off
+ *   - "30% off up to  20"                  -> percent_off_capped (cap=20)
+ *   - "Flat 50% off"                       -> flat_percent_off
+ *   - "64% off select items"               -> percent_off_select_items
+ *   - "50% off full menu"                  -> percent_off_full_menu
+ *   - "30% OFF Bestsellers"                -> percent_off_bestsellers
+ *   - "50% off above  1"                   -> percent_off_above_min (threshold=1)
+ *   - "Offers"                             -> offers_generic
+ *   - "Free Delivery"                      -> free_delivery
+ */
+function classifyPromo(tag, extendedTag, miniTag) {
+  // Prefer extendedTag because it has the richest text ("up to", "select items")
+  const texts = [extendedTag, tag, miniTag].filter(
+    (t) => typeof t === 'string' && t.trim()
+  );
+  if (texts.length === 0) return { scope: null, percent: null, cap: null };
+
+  const joined = texts.join(' | ');
+  const low = joined.toLowerCase();
+
+  // free_delivery FIRST (only promos the restaurant pays matter — but
+  // Noon still uses the tag text as our signal, so we read it here)
+  if (/\bfree\s*delivery\b/i.test(joined)) {
+    return { scope: 'free_delivery', percent: null, cap: null };
+  }
+
+  // percent capture: first NN% in any text
+  const percentMatch = joined.match(/(\d{1,3})\s*%/);
+  const percent = percentMatch ? Math.min(100, parseInt(percentMatch[1], 10)) : null;
+
+  // cap capture: "up to <num>" (dirham amount, no AED prefix in Noon text)
+  const capMatch = joined.match(/up\s*to\s*[^0-9]*([\d.]+)/i);
+  const cap = capMatch ? parseFloat(capMatch[1]) : null;
+
+  // Classify scope by phrase
+  if (/bestseller/i.test(joined))     return { scope: 'percent_off_bestsellers', percent, cap };
+  if (/select\s*items?/i.test(joined)) return { scope: 'percent_off_select_items', percent, cap };
+  if (/full\s*menu/i.test(joined))     return { scope: 'percent_off_full_menu', percent, cap };
+  if (/\babove\b/i.test(joined)) {
+    // "50% off above  1" -> percent_off_above_min, cap carries the threshold
+    const aboveMatch = joined.match(/above\s*[^0-9]*([\d.]+)/i);
+    const threshold = aboveMatch ? parseFloat(aboveMatch[1]) : null;
+    return { scope: 'percent_off_above_min', percent, cap: threshold };
+  }
+  if (/\bflat\b/i.test(joined))        return { scope: 'flat_percent_off', percent, cap: null };
+  if (/up\s*to/i.test(joined))         return { scope: 'percent_off_capped', percent, cap };
+  if (percent != null)                 return { scope: 'percent_off', percent, cap: null };
+  if (/^\s*offers?\s*$/i.test(joined)) return { scope: 'offers_generic', percent: null, cap: null };
+
+  return { scope: 'offers_generic', percent: null, cap: null };
+}
+
 // -- Card -> ranking row ----------------------------------------------------
 
 function parseCards(outlets, nonFoodSet) {
@@ -293,40 +368,49 @@ function parseCards(outlets, nonFoodSet) {
 
     const rank = rows.length + 1;
 
+    // Rating: new schema uses rating.score + rating.title + rating.titleCode.
     const rt = o.rating || {};
-    const rating           = rt.value != null ? rt.value : null;
+    const rating           = rt.score != null ? rt.score : null;
     const ratingCount      = rt.count != null ? rt.count : null;
-    const ratingStatus     = rt.status || null;
+    const ratingTitle      = rt.title || null;
     const ratingDisplayCnt = rt.displayCount || null;
+    const ratingStatus     = deriveRatingStatus(ratingTitle);
 
-    const p           = o.promo || {};
-    const tag         = typeof p.tag === 'string' ? p.tag : null;
-    const miniTag     = typeof p.miniTag === 'string' ? p.miniTag : null;
-    const extendedTag = typeof p.extendedTag === 'string' ? p.extendedTag : null;
+    // Promo tags are now top-level, not nested under o.promo.
+    const tag         = typeof o.tag === 'string' ? o.tag : null;
+    const miniTag     = typeof o.miniTag === 'string' ? o.miniTag : null;
+    const extendedTag = typeof o.extendedTag === 'string' ? o.extendedTag : null;
     const hasPromo    = !!(tag || miniTag || extendedTag);
     const promoText   = cleanText(tag) || cleanText(extendedTag) || cleanText(miniTag);
 
-    const allTags      = [tag, miniTag, extendedTag].filter(Boolean).join(' ').toLowerCase();
-    const isFreeDeliv  = allTags.includes('free delivery');
+    const classified   = classifyPromo(tag, extendedTag, miniTag);
+    // Free-delivery flag reads ONLY from the promo text (restaurant-paid signal).
+    const isFreeDeliv  = classified.scope === 'free_delivery';
     const isNonFreeDel = hasPromo && !isFreeDeliv;
+
+    // Images: new schema returns raw CDN keys in media.*; build full URLs.
+    const d           = o.delivery || {};
+    const bannerKey   = (o.media && typeof o.media.heroImage === 'string') ? o.media.heroImage : null;
+    const logoKey     = (o.media && typeof o.media.logoImage === 'string') ? o.media.logoImage : null;
+    const bannerUrl   = cdnUrl(bannerKey);
+    const logoUrl     = cdnUrl(logoKey);
 
     rows.push([
       code,                                // [0]  noon_branch_id
-      rank,                                // [1]  noon_rank
-      o.operatingStatus || null,           // [2]  noon_operating_status
-      o.operatingType   || null,           // [3]  noon_operating_type
-      rating,                              // [4]  noon_rating
+      rank,                                // [1]  noon_listing_rank
+      o.operatingStatusCode || null,       // [2]  noon_operating_status (RENAMED)
+      o.operatingType       || null,       // [3]  noon_operating_type
+      rating,                              // [4]  noon_rating (rating.score)
       ratingCount,                         // [5]  noon_rating_count
-      ratingStatus,                        // [6]  noon_rating_status
+      ratingStatus,                        // [6]  noon_rating_status (derived)
       hasPromo,                            // [7]  noon_has_promo
       promoText,                           // [8]  noon_promo_text
-      p.scope || null,                     // [9]  noon_promo_scope
-      p.cap != null ? p.cap : (p.maxDiscount != null ? p.maxDiscount : null),
-                                           // [10] noon_promo_cap
+      classified.scope,                    // [9]  noon_promo_scope (classified)
+      classified.cap,                      // [10] noon_promo_cap (extracted)
       o.widgetGroup || null,               // [11] noon_widget_group
       !!(o.isPersonalized),                // [12] noon_is_personalized
-      !!(o.isSponsored),                   // [13] noon_is_sponsored
-      o.adSlot != null ? o.adSlot : null,  // [14] noon_ad_slot
+      false,                               // [13] noon_is_sponsored  (DEPRECATED: Noon dropped this signal)
+      null,                                // [14] noon_ad_slot        (DEPRECATED: Noon dropped this signal)
       ratingDisplayCnt,                    // [15] noon_rating_display_count
       cleanText(miniTag),                  // [16] noon_promo_mini_tag
       cleanText(extendedTag),              // [17] noon_promo_extended_tag
@@ -334,9 +418,21 @@ function parseCards(outlets, nonFoodSet) {
       isNonFreeDel,                        // [19] noon_promo_is_non_free_delivery
       !!(o.isNearAndQuick),                // [20] noon_is_near_and_quick
       o.name || null,                      // [21] noon_card_name
-      o.pageUrl || null,                   // [22] noon_card_url
-      o.imageUrl || o.logoUrl || null,     // [23] noon_card_image_url
+      o.linkUrl || null,                   // [22] noon_card_url (RENAMED: pageUrl -> linkUrl)
+      bannerUrl,                           // [23] noon_card_banner_url (full CDN URL, used as branch banner)
       Array.isArray(o.cuisines) ? o.cuisines : [], // [24] cuisines (for queue)
+      o.restaurantCode || null,            // [25] noon_restaurant_code (NEW: brand code at scrape time)
+      typeof o.price === 'string' ? o.price : null, // [26] noon_card_price_tier ($, $$, $$$)
+      typeof o.distance === 'number' ? o.distance : null, // [27] noon_card_distance_m
+      ratingTitle,                         // [28] noon_card_rating_title
+      typeof d.fee === 'number' ? d.fee : null,          // [29] delivery_fee
+      typeof d.originalFee === 'number' ? d.originalFee : null, // [30] delivery_original_fee
+      typeof d.minOrder === 'number' ? d.minOrder : null, // [31] delivery_min_order
+      typeof d.time === 'string' ? d.time : null,         // [32] delivery_time
+      classified.percent,                  // [33] noon_promo_percent (extracted)
+      logoUrl,                             // [34] brand logo URL (full CDN)
+      !!(o.isVip),                         // [35] noon_branch_is_vip
+      o.vipMsg || null,                    // [36] noon_branch_vip_msg
     ]);
   }
   return { rows, dropped };
