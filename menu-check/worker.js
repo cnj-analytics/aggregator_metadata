@@ -187,9 +187,24 @@ async function fetchCareem(item) {
 
 // -- Deliveroo (menu page, nearest delivery areas) ------------------------------
 
+const GH32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+function geohash(lat, lng, p = 12) {
+  const la = [-90, 90], lo = [-180, 180]; let even = true, bit = 0, ch = 0, s = '';
+  while (s.length < p) {
+    const r = even ? lo : la, v = even ? lng : lat, mid = (r[0] + r[1]) / 2;
+    if (v >= mid) { ch |= 16 >> bit; r[0] = mid; } else r[1] = mid;
+    even = !even;
+    if (++bit === 5) { s += GH32[ch]; bit = 0; ch = 0; }
+  }
+  return s;
+}
+
 async function fetchDeliveroo(item) {
   if (!item.page_url) return { ok: false, unavailable: true, error: 'no Deliveroo page URL' };
-  const geos = (item.geohashes && item.geohashes.length) ? item.geohashes : [''];
+  // Restaurant's own location first, then the stored nearest delivery areas.
+  const own = (item.lat != null && item.lng != null) ? geohash(Number(item.lat), Number(item.lng)) : null;
+  const geos = [...new Set([own, ...(item.geohashes || [])].filter(Boolean))];
+  if (!geos.length) geos.push('');
   let lastNote = 'no menu on page';
   for (const gh of geos) {
     const url = gh ? `${item.page_url}?geohash=${gh}` : item.page_url;
@@ -209,7 +224,7 @@ async function fetchDeliveroo(item) {
     const menu = d?.props?.initialState?.menuPage?.menu || {};
     const meta = menu?.metas?.root;
     if (!meta) { lastNote = 'no menu on page'; continue; }
-    if (meta?.restaurant?.menuDisabled) { lastNote = 'not delivering to nearest areas (offline or out of range)'; continue; }
+    // menuDisabled = can't order right now (closed/busy/out of range); the menu is still on the page.
     const cats = meta.categories || [];
     if (!cats.length) { lastNote = 'menu has no categories'; continue; }
     const catIds = new Set(cats.map((c) => c.id));
@@ -218,10 +233,13 @@ async function fetchDeliveroo(item) {
       .map((x) => ({ id: x.id, n: x.name, p: x?.price?.fractional != null ? x.price.fractional / 100 : null }));
     const rest = meta.restaurant || {};
     const title = (menu?.header?.title || '').trim();
-    return {
+    const out = {
       ok: true, name: clean(title || rest.name), area: clean(rest?.location?.address?.neighborhood),
       address: clean(rest?.location?.address?.address1), categories: cats.length, items: dedupeItems(items),
+      // saved in the error column as a note; status stays 'done'
+      error: rest.menuDisabled ? 'note: ordering paused at check time (closed/busy)' : undefined,
     };
+    return out;
   }
   return { ok: false, unavailable: true, error: `deliveroo: ${lastNote}` };
 }
