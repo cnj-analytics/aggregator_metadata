@@ -111,10 +111,13 @@ function dedupeItems(list) {
 async function fetchTalabat(item) {
   const resp = await http(`https://api.talabat.com/menubff/v4/branches/${item.call_id}/menu`, {
     headers: {
+      // same headers as talabat/uae/register-branch.js (works from GitHub runners)
       'User-Agent': 'talabat/8701 CFNetwork/3896.100.1.2.1 Darwin/27.0.0',
-      Accept: '*/*', 'Accept-Language': 'en-US', appbrand: '1', 'x-country': 'ae',
+      Accept: '*/*', 'Accept-Language': 'en-US', 'Accept-Encoding': 'gzip, deflate, br',
+      appbrand: '1', 'x-country': 'ae',
       'x-app-version': '13.93.0', 'x-device-version': '13.93.0', 'x-device-source': '4',
-      'x-device-framework': 'flutter', 'x-marshmallow-version': 'mm3', tokentypekey: 'guest',
+      'x-device-framework': 'flutter', 'x-marshmallow-version': 'mm3', 'http2-enabled': 'true',
+      tokentypekey: 'guest',
     },
   });
   if (!resp.ok) throw new HttpError(`talabat HTTP ${resp.status}`, resp.status);
