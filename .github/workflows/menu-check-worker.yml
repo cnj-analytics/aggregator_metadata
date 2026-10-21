@@ -1,0 +1,42 @@
+name: Menu Check – Worker (started by Supabase)
+run-name: Menu check run ${{ inputs.run_id }} m${{ inputs.machine_no }}
+
+# One worker machine. Dispatched by Supabase (menu_check_dispatch_machine),
+# OR manually for debug. Each dispatch = one machine = fresh runner IP.
+# The machine checks jobs_per_machine restaurants (default 5), saving each one
+# to Supabase as soon as it is fetched, then exits; Supabase starts a fresh one.
+# Start/stop the whole run from Supabase: select menu_check_start(); / select menu_check_stop();
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'menu_check_run.run_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'menu_check_machine.machine_no'
+        required: true
+        type: string
+
+concurrency:
+  group: menu-check-run-${{ inputs.run_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    name: run ${{ inputs.run_id }} machine ${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: menu-check
+      - name: Run menu-check worker
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_ID: ${{ inputs.run_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: node menu-check/worker.js
