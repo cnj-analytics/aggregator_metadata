@@ -200,14 +200,14 @@ async function mintToken(lat, lng) {
   const ecomH = () => ({ ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae',
     'x-device-lat': String(lat), 'x-device-lng': String(lng), Cookie: ck() });
 
-  // --- PHASE 1: App launch (ecom home screen) ---
+  // --- PHASE 1: App launch (~5s) ---
   const r1 = await fetch(WHOAMI_URL, {
     headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() } });
   if (r1.status === 403) throw Object.assign(new Error('mint whoami 403'), { forbidden: true });
   if (!r1.ok) throw new Error(`mint whoami HTTP ${r1.status}`);
   mergeSetCookies(jar, r1);
 
-  await sleep(6000 + Math.floor(Math.random() * 2000));   // 7.3s splash screen
+  await sleep(1500 + Math.floor(Math.random() * 500));
 
   const r2 = await fetch(SET_LOCATION_URL, {
     method: 'POST', headers: { ...ecomH(), 'Content-Type': 'application/json' },
@@ -216,7 +216,7 @@ async function mintToken(lat, lng) {
   if (!r2.ok) throw new Error(`mint set-location HTTP ${r2.status}`);
   mergeSetCookies(jar, r2);
 
-  await sleep(400 + Math.floor(Math.random() * 300));
+  await sleep(300 + Math.floor(Math.random() * 200));
   const r3 = await fetch(WHOAMI_FOOD_URL, {
     headers: { ...ecomH(), 'x-whoami-request-id': crypto.randomUUID() } });
   if (r3.status === 403) throw Object.assign(new Error('mint whoami-food 403'), { forbidden: true });
@@ -230,22 +230,21 @@ async function mintToken(lat, lng) {
   session = { deviceId, visitorId, jar, zones, mintedAt: Date.now() };
   console.log(`[m${MACHINE}] token #${tokenNumber} | zone=${zones['x-food-zonecode'] || '-'}`);
 
-  // 4-7. Ecom home warm-up burst
-  await sleep(200 + Math.floor(Math.random() * 200));
+  await sleep(200);
   const _s = (u, h) => fetch(u, { headers: h }).catch(() => {});
   await Promise.allSettled([
     _s(`${APP_BASE}/_svc/mp-vip-api-v1/membership?primaryUphoneCode=none`, ecomH()),
     _s(`${APP_BASE}/_svc/catalog/api/v3/u/`, ecomH()),
   ]);
 
-  await sleep(4000 + Math.floor(Math.random() * 3000));   // 5.9s home loading
+  await sleep(800 + Math.floor(Math.random() * 400));
 
   await Promise.allSettled([
     _s(`${APP_BASE}/_svc/configs-v1/configs`, ecomH()),
     _s(`${APP_BASE}/_svc/cart-v1/cart`, ecomH()),
   ]);
 
-  await sleep(150 + Math.floor(Math.random() * 150));
+  await sleep(100);
   await Promise.allSettled([
     fetch(`${APP_BASE}/_svc/mp-ads-api-adserver/ads/get-by-slot-codes`, {
       method: 'POST', headers: { ...ecomH(), 'Content-Type': 'application/json' },
@@ -253,8 +252,8 @@ async function mintToken(lat, lng) {
     _s(`${APP_BASE}/_svc/catalog/api/v3/u/?limit=18`, ecomH()),
   ]);
 
-  // --- PHASE 2: User taps Food tab ---
-  await sleep(1200 + Math.floor(Math.random() * 800));
+  // --- PHASE 2: Food tab (~5s) ---
+  await sleep(500 + Math.floor(Math.random() * 300));
   const foodH = () => ({ ...base(), 'x-experience': 'food', 'x-locale': 'en-ae',
     'x-device-lat': String(lat), 'x-device-lng': String(lng), Cookie: ck() });
 
@@ -267,7 +266,7 @@ async function mintToken(lat, lng) {
     _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/customer/navbar-tabs-config`, foodH()),
   ]);
 
-  await sleep(700 + Math.floor(Math.random() * 500));
+  await sleep(500 + Math.floor(Math.random() * 300));
   const searchH = () => {
     const h = { ...foodH(), 'x-mp-country': 'ae',
       'x-lat': String(Math.round(lat * 1e7)), 'x-lng': String(Math.round(lng * 1e7)),
@@ -284,41 +283,41 @@ async function mintToken(lat, lng) {
     _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=homepage_carousel_featured_tab&f%5Btags%5D=listing_ad&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, searchH()),
   ]);
 
-  await sleep(150 + Math.floor(Math.random() * 200));
+  await sleep(100);
   await Promise.allSettled([
     _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/search?content=noon_food_garnierkiwi&get_fallback=false`, searchH()),
     _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/reels`, searchH()),
   ]);
 
-  // --- PHASE 3: User browses food home ---
-  await sleep(1000 + Math.floor(Math.random() * 500));
+  // --- PHASE 3: Browse food home (~5s) ---
+  await sleep(500 + Math.floor(Math.random() * 300));
   await Promise.allSettled([
     _s(WHOAMI_URL, { ...base(), 'x-experience': 'ecom', Cookie: ck() }),
     _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/customer/whoami`, foodH()),
     _s(`${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, searchH()),
   ]);
 
-  await sleep(2500 + Math.floor(Math.random() * 2000));
+  await sleep(800 + Math.floor(Math.random() * 400));
   await fetch(`${FD_BASE}/_svc/mp-food-api-catalog/api/personalization/preferences/get-options`, {
     method: 'POST', headers: { ...searchH(), 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
-  await sleep(200 + Math.floor(Math.random() * 200));
+  await sleep(200);
   await fetch(`${FD_BASE}/_svc/mp-food-api-catalog/api/personalization/preferences/init`, {
     method: 'POST', headers: { ...searchH(), 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
 
-  await sleep(2000 + Math.floor(Math.random() * 2000));
+  await sleep(800 + Math.floor(Math.random() * 400));
   await Promise.allSettled([
     _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/light/`, searchH()),
     _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/`, foodH()),
   ]);
-  await sleep(300 + Math.floor(Math.random() * 300));
+  await sleep(200);
   await Promise.allSettled([
     _s(`${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, searchH()),
     _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=recommended_new_user_carousel_tab&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, searchH()),
     _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/reels`, searchH()),
   ]);
 
-  // 9.3s gap before search (user decides to tap "See All")
-  await sleep(7000 + Math.floor(Math.random() * 4000));
+  // --- PHASE 4: User taps See All (~5s) ---
+  await sleep(4000 + Math.floor(Math.random() * 1000));
 
   return session;
 }
