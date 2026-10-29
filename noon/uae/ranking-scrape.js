@@ -17,10 +17,9 @@
 //   * Non-restaurant outlets (all cuisines in noon_cuisines where is_food=false)
 //     are dropped at parse time so they never pollute the registration queue.
 //
-// Auth: Noon's 3-step guest token minted locally on this runner's IP.
-//   1. GET  whoami (ecom)    -> nguestv2 cookie
-//   2. POST set-location     -> resolve lat/lng to zone
-//   3. GET  whoami (food)    -> zone headers for the food API
+// Auth: Full session simulation (40+ warm-up calls mimicking real iOS app
+//   launch) before search begins. HTTP/1.1 transport (best Akamai evasion).
+//   Burst-scroll timing (3 pages at 750ms + 2s pause).
 //
 // Pagination: /search ignores `page`; chaining `searchToken` is the cursor.
 // Each page returns up to 60 outlets. Walk until empty / no new outlets /
@@ -109,13 +108,16 @@ async function audit(row) {
 
 // -- Constants --------------------------------------------------------------
 
-const UA    = 'noon/22098 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
-const BUILD = '22098';
+const UA    = 'noon/22895 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
+const BUILD = '22895';
 
 const WHOAMI_URL       = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami';
 const SET_LOCATION_URL = 'https://api-app.noon.com/_vs/st/mp-identity-api-geo/serviceable-geo-info/set-location-by-lat-lng';
 const WHOAMI_FOOD_URL  = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami?experience=food&select_nearby=1';
 const SEARCH_URL       = 'https://api-app-fd.noon.com/_svc/mp-food-api-catalog/api/search';
+
+const APP_BASE = 'https://api-app.noon.com';
+const FD_BASE  = 'https://api-app-fd.noon.com';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -166,76 +168,176 @@ function mergeSetCookies(jar, resp) {
 const cookieStr = (jar) =>
   Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
 
-// -- Token (one per area, no re-mint mid-walk) ------------------------------
+// -- Token (one per area, full session simulation) -------------------------
 
 let session     = null;
 let tokenNumber = 0;
 
 /**
- * 3-step Noon guest auth. One token lives ~300s. Called once per area at
- * area start. Never called mid-walk — token exhaustion inside an area is
- * accepted (unlikely at 60 pages * 500ms = 30s per area).
+ * Full 4-phase session simulation (40+ warm-up calls mimicking real iOS app
+ * launch). Based on Proxyman capture of real Noon iOS app traffic.
+ * One token lives ~300s. Called once per area at area start.
  */
 async function mintToken(lat, lng) {
-  const deviceId  = crypto.randomUUID();
-  const visitorId = crypto.randomUUID();
+  const deviceId = crypto.randomUUID().toUpperCase();
+  const visitorId = crypto.randomUUID().toUpperCase();
   const jar = {};
+  const sentryId = () => crypto.randomUUID().replace(/-/g, '');
+  const sTrace = () => {
+    const s = sentryId();
+    return {
+      'sentry-trace': `${s}-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
+      baggage: `sentry-environment=production,sentry-public_key=d61e4de762b3c36e7c14f2d7cf6030c1,sentry-release=com.noon.buyerapp%405.261024%2B${BUILD},sentry-trace_id=${s}`,
+    };
+  };
   const base = () => ({
-    'User-Agent': UA, 'x-platform': 'ios', 'x-build': BUILD,
-    'x-mp': 'noon', 'x-content': 'mobile', Accept: 'application/json',
-    'x-device-id': deviceId, 'x-visitor-id': visitorId,
+    'User-Agent': UA, 'x-platform': 'ios', 'x-build': BUILD, 'x-mp': 'noon', 'x-content': 'mobile',
+    Accept: 'application/json, text/plain, */*', 'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br', 'Cache-Control': 'no-cache',
+    'x-device-id': deviceId, 'x-visitor-id': visitorId, ...sTrace(),
   });
+  const ck = () => cookieStr(jar);
+  const ecomH = () => ({ ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae',
+    'x-device-lat': String(lat), 'x-device-lng': String(lng), Cookie: ck() });
 
-  // Step 1 - whoami (ecom)
+  // --- PHASE 1: App launch (ecom home screen) ---
   const r1 = await fetch(WHOAMI_URL, {
-    headers: { ...base(), 'x-experience': 'ecom',
-      'x-whoami-request-id': crypto.randomUUID() },
-  });
+    headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() } });
   if (r1.status === 403) throw Object.assign(new Error('mint whoami 403'), { forbidden: true });
   if (!r1.ok) throw new Error(`mint whoami HTTP ${r1.status}`);
   mergeSetCookies(jar, r1);
 
-  // Step 2 - set-location
+  await sleep(6000 + Math.floor(Math.random() * 2000));   // 7.3s splash screen
+
   const r2 = await fetch(SET_LOCATION_URL, {
-    method: 'POST',
-    headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae',
-      'x-device-lat': String(lat), 'x-device-lng': String(lng),
-      'Content-Type': 'application/json', Cookie: cookieStr(jar) },
-    body: JSON.stringify({ location: { lat, lng }, lang: 'en' }),
-  });
+    method: 'POST', headers: { ...ecomH(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ location: { lat, lng }, lang: 'en' }) });
   if (r2.status === 403) throw Object.assign(new Error('mint set-location 403'), { forbidden: true });
   if (!r2.ok) throw new Error(`mint set-location HTTP ${r2.status}`);
   mergeSetCookies(jar, r2);
 
-  // Step 3 - whoami (food)
+  await sleep(400 + Math.floor(Math.random() * 300));
   const r3 = await fetch(WHOAMI_FOOD_URL, {
-    headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae',
-      'x-device-lat': String(lat), 'x-device-lng': String(lng),
-      'x-whoami-request-id': crypto.randomUUID(), Cookie: cookieStr(jar) },
-  });
+    headers: { ...ecomH(), 'x-whoami-request-id': crypto.randomUUID() } });
   if (r3.status === 403) throw Object.assign(new Error('mint whoami-food 403'), { forbidden: true });
   if (!r3.ok) throw new Error(`mint whoami-food HTTP ${r3.status}`);
   const who = await r3.json().catch(() => ({}));
   mergeSetCookies(jar, r3);
-
   if (!jar.nguestv2) throw new Error('mint produced no nguestv2');
 
   const zones = who && who.headers && typeof who.headers === 'object' ? who.headers : {};
   tokenNumber++;
   session = { deviceId, visitorId, jar, zones, mintedAt: Date.now() };
   console.log(`[m${MACHINE}] token #${tokenNumber} | zone=${zones['x-food-zonecode'] || '-'}`);
+
+  // 4-7. Ecom home warm-up burst
+  await sleep(200 + Math.floor(Math.random() * 200));
+  const _s = (u, h) => fetch(u, { headers: h }).catch(() => {});
+  await Promise.allSettled([
+    _s(`${APP_BASE}/_svc/mp-vip-api-v1/membership?primaryUphoneCode=none`, ecomH()),
+    _s(`${APP_BASE}/_svc/catalog/api/v3/u/`, ecomH()),
+  ]);
+
+  await sleep(4000 + Math.floor(Math.random() * 3000));   // 5.9s home loading
+
+  await Promise.allSettled([
+    _s(`${APP_BASE}/_svc/configs-v1/configs`, ecomH()),
+    _s(`${APP_BASE}/_svc/cart-v1/cart`, ecomH()),
+  ]);
+
+  await sleep(150 + Math.floor(Math.random() * 150));
+  await Promise.allSettled([
+    fetch(`${APP_BASE}/_svc/mp-ads-api-adserver/ads/get-by-slot-codes`, {
+      method: 'POST', headers: { ...ecomH(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(['ocm_ae_mb_homepage_in_the_spotlight_1', 'ocm_ae_mb_homepage_in_the_spotlight_2']) }).catch(() => {}),
+    _s(`${APP_BASE}/_svc/catalog/api/v3/u/?limit=18`, ecomH()),
+  ]);
+
+  // --- PHASE 2: User taps Food tab ---
+  await sleep(1200 + Math.floor(Math.random() * 800));
+  const foodH = () => ({ ...base(), 'x-experience': 'food', 'x-locale': 'en-ae',
+    'x-device-lat': String(lat), 'x-device-lng': String(lng), Cookie: ck() });
+
+  await Promise.allSettled([
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/`, foodH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/popups`, foodH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/customer/whoami`, foodH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/page/suggestions`, foodH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/customer/favorite/restaurants`, foodH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/customer/navbar-tabs-config`, foodH()),
+  ]);
+
+  await sleep(700 + Math.floor(Math.random() * 500));
+  const searchH = () => {
+    const h = { ...foodH(), 'x-mp-country': 'ae',
+      'x-lat': String(Math.round(lat * 1e7)), 'x-lng': String(Math.round(lng * 1e7)),
+      'x-border-enabled': 'true', 'x-rocket-enabled': 'true' };
+    for (const [k, v] of Object.entries(zones)) { if (v != null && typeof v !== 'object') h[k] = String(v); }
+    return h;
+  };
+
+  await Promise.allSettled([
+    _s(`${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, searchH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/static`, searchH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=recommended_new_user_carousel_tab&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, searchH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/admon/content-ad/banner-carousel?entity_type=food_banner_module&entity_code=homepage_hero_banner_ads_carousel_ae&limit=20&min_assets=2`, searchH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=homepage_carousel_featured_tab&f%5Btags%5D=listing_ad&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, searchH()),
+  ]);
+
+  await sleep(150 + Math.floor(Math.random() * 200));
+  await Promise.allSettled([
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/search?content=noon_food_garnierkiwi&get_fallback=false`, searchH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/reels`, searchH()),
+  ]);
+
+  // --- PHASE 3: User browses food home ---
+  await sleep(1000 + Math.floor(Math.random() * 500));
+  await Promise.allSettled([
+    _s(WHOAMI_URL, { ...base(), 'x-experience': 'ecom', Cookie: ck() }),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/customer/whoami`, foodH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, searchH()),
+  ]);
+
+  await sleep(2500 + Math.floor(Math.random() * 2000));
+  await fetch(`${FD_BASE}/_svc/mp-food-api-catalog/api/personalization/preferences/get-options`, {
+    method: 'POST', headers: { ...searchH(), 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
+  await sleep(200 + Math.floor(Math.random() * 200));
+  await fetch(`${FD_BASE}/_svc/mp-food-api-catalog/api/personalization/preferences/init`, {
+    method: 'POST', headers: { ...searchH(), 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
+
+  await sleep(2000 + Math.floor(Math.random() * 2000));
+  await Promise.allSettled([
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/light/`, searchH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/`, foodH()),
+  ]);
+  await sleep(300 + Math.floor(Math.random() * 300));
+  await Promise.allSettled([
+    _s(`${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, searchH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=recommended_new_user_carousel_tab&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, searchH()),
+    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/reels`, searchH()),
+  ]);
+
+  // 9.3s gap before search (user decides to tap "See All")
+  await sleep(7000 + Math.floor(Math.random() * 4000));
+
   return session;
 }
 
 // -- Noon API calls ---------------------------------------------------------
 
 function hdrs(lat, lng) {
+  const sid = crypto.randomUUID().replace(/-/g, '');
   return {
     'User-Agent': UA, 'x-platform': 'ios', 'x-build': BUILD,
     'x-mp': 'noon', 'x-content': 'mobile', 'x-locale': 'en-ae',
     'x-device-id': session.deviceId, 'x-visitor-id': session.visitorId,
     'x-device-lat': String(lat), 'x-device-lng': String(lng),
-    Accept: 'application/json',
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'no-cache',
+    'sentry-trace': `${sid}-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}-0`,
+    baggage: `sentry-environment=production,sentry-public_key=d61e4de762b3c36e7c14f2d7cf6030c1,sentry-release=com.noon.buyerapp%405.261024%2B${BUILD},sentry-trace_id=${sid}`,
   };
 }
 
@@ -277,16 +379,22 @@ async function fetchPage(loc, searchToken) {
     'x-whoami-request-id': crypto.randomUUID(),
     Cookie: loc.cookie, 'Content-Type': 'application/json',
   };
+  // Pass ALL whoami headers including ab-test (real app sends them all)
   for (const [k, v] of Object.entries(loc.zh)) {
-    if (v != null && typeof v !== 'object' && !k.toLowerCase().includes('ab-test'))
-      headers[k] = String(v);
+    if (v != null && typeof v !== 'object') headers[k] = String(v);
   }
 
   const body = {
     queryEntity: null, q: null, f: {}, contexts: [], withContent: true,
-    excludeOutletCodes: [], limit: PAGE_LIMIT, page: 1,
-    sort: { by: 'popularity', dir: 'desc' },
-    type: 'outlet', qType: 'search_query', getFallback: true,
+    excludeOutletCodes: [], limit: PAGE_LIMIT, scopes: null, page: 1,
+    dishTags: [], ratingMin: null,
+    sort: { by: 'popularity', dir: 'desc', slab: null },
+    widgets: null, content: null, withHits: false, filteredByWidget: null,
+    internalFilteredByWidget: 'homepage_navpill_filters_widget',
+    getFallback: true, type: 'outlet', qType: 'search_query',
+    minCount: 0, groupDishes: false, isSsc: false,
+    hideSearchBar: false, hideSearchOptions: false,
+    isOutletAdProcessingEnabled: true, withDishFetchQuery: null,
   };
   if (searchToken) body.searchToken = searchToken;
 
@@ -488,6 +596,13 @@ function parseCards(outlets, nonFoodSet) {
   return { rows, dropped };
 }
 
+// -- Burst-scroll timing ----------------------------------------------------
+
+function pageGap(page) {
+  if (page % 3 === 0) return 2000;   // pause after every 3rd page
+  return 750;                          // quick scroll within burst
+}
+
 // -- Process one area -------------------------------------------------------
 
 async function processArea(areaId, lat, lng, pageDelayMs, maxPages, nonFoodSet) {
@@ -495,11 +610,11 @@ async function processArea(areaId, lat, lng, pageDelayMs, maxPages, nonFoodSet) 
   AREA_CTX.page = 0;
   session = null;
 
-  // One token per area, minted now. Not re-minted mid-walk.
+  // Full session simulation (40+ warm-up calls mimicking real iOS app)
   await mintToken(lat, lng);
 
-  // Locate: set-location + whoami-food
-  const loc = await locate(lat, lng);
+  // Session simulation already did locate — build loc from session
+  const loc = { lat, lng, zh: session.zones, cookie: cookieStr(session.jar) };
 
   const allOutlets = [];
   const seen = new Set();
@@ -529,7 +644,8 @@ async function processArea(areaId, lat, lng, pageDelayMs, maxPages, nonFoodSet) 
     if (!r.token)               { stopReason = `no-token@${page}`; break; }
 
     searchToken = r.token;
-    if (page < cap) await sleep(pageDelayMs);
+    // Burst-scroll timing (3 pages at 750ms + 2s pause)
+    if (page < cap) await sleep(pageGap(page));
   }
   if (!stopReason) stopReason = `max-pages(${cap})`;
 
