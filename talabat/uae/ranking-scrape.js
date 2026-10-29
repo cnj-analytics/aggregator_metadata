@@ -120,17 +120,19 @@ async function fetchPage(area, page) {
 function toBool(v, def = false) { return v === true || v === 'true' ? true : v === false || v === 'false' ? false : def; }
 
 function mapOpStatus(card) {
-  const t = card?.tracking?.shop_impressions_loaded?.shopStatus;
-  if (t) {
-    const s = String(t).toLowerCase();
-    if (['open','closed','busy','preorder'].includes(s)) return s;
-  }
-  // Fallback by stt code (observed: 0 = open)
+  // stt is Talabat's own status for this restaurant in this listing: 0 = open, 1 = closed, 2 = busy, 3 = preorder.
+  // It comes first: the tracking field shopStatus says "open" for every card, closed ones included.
   const stt = card?.stt;
   if (stt === 0) return 'open';
   if (stt === 1) return 'closed';
   if (stt === 2) return 'busy';
   if (stt === 3) return 'preorder';
+  // No stt on the card: fall back to the tracking field
+  const t = card?.tracking?.shop_impressions_loaded?.shopStatus;
+  if (t) {
+    const s = String(t).toLowerCase();
+    if (['open','closed','busy','preorder'].includes(s)) return s;
+  }
   return 'unknown';
 }
 
