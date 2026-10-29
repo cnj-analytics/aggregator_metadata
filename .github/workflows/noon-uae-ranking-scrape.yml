@@ -51,4 +51,6 @@ jobs:
           MACHINE_NO: ${{ inputs.machine_no }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           WALL_LIMIT_SEC: '4200'
-        run: node noon/uae/ranking-scrape.js
+        run: |
+          npm install undici
+          node noon/uae/ranking-scrape.js
