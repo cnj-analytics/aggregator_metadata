@@ -1,38 +1,39 @@
 #!/usr/bin/env node
 // noon/uae/ranking-scrape.js
 //
-// Hourly ranking worker.  Dispatched by GitHub Actions via workflow_dispatch,
-// each runner is one "machine" in a Supabase ranking run.  Claims up to TWO
+// Hourly ranking worker. Dispatched by GitHub Actions via workflow_dispatch,
+// each runner is one "machine" in a Supabase ranking run. Claims up to TWO
 // areas from the noon_ranking_run_area queue, walks the full /search listing
 // for each area recording every outlet's ranking position, then saves the
 // data via noon_ranking_save_area_hour.
 //
 // Noon-specific rules (NOT Careem's — Noon has stricter per-IP throttling):
-//   * Max 2 areas per machine. Then exit (fresh IP = fresh machine).
-//   * If area 1 >= 50 pages, don't claim area 2. The IP budget is near spent.
-//   * One token per area. Minted at area start, never re-minted mid-walk.
-//   * 429 / 403 anywhere stops the machine IMMEDIATELY. Any completed area is
-//     already committed; the in-flight area is reported blocked and returned
-//     to the queue by the orchestrator for a replacement machine to retry.
-//   * Non-restaurant outlets (all cuisines in noon_cuisines where is_food=false)
-//     are dropped at parse time so they never pollute the registration queue.
+// * Max 2 areas per machine. Then exit (fresh IP = fresh machine).
+// * If area 1 >= 50 pages, don't claim area 2. The IP budget is near spent.
+// * One token per area. Minted at area start, never re-minted mid-walk.
+// * 429 / 403 anywhere stops the machine IMMEDIATELY. Any completed area is
+// already committed; the in-flight area is reported blocked and returned
+// to the queue by the orchestrator for a replacement machine to retry.
+// * Non-restaurant outlets (all cuisines in noon_cuisines where is_food=false)
+// are dropped at parse time so they never pollute the registration queue.
 //
-// Auth: Full session simulation (40+ warm-up calls mimicking real iOS app
-//   launch) before search begins. HTTP/1.1 transport (best Akamai evasion).
-//   Burst-scroll timing (3 pages at 750ms + 2s pause).
+// Auth: Noon's 3-step guest token minted locally on this runner's IP.
+// 1. GET whoami (ecom) -> nguestv2 cookie
+// 2. POST set-location -> resolve lat/lng to zone
+// 3. GET whoami (food) -> zone headers for the food API
 //
 // Pagination: /search ignores `page`; chaining `searchToken` is the cursor.
 // Each page returns up to 60 outlets. Walk until empty / no new outlets /
 // no token / max_pages.
 //
 // Env vars (required):
-//   SUPABASE_URL
-//   SUPABASE_SERVICE_ROLE_KEY
-//   RUN_ID                       Supabase ranking run id
-//   MACHINE_NO                   machine number in the run
+// SUPABASE_URL
+// SUPABASE_SERVICE_ROLE_KEY
+// RUN_ID Supabase ranking run id
+// MACHINE_NO machine number in the run
 // Env vars (set by workflow):
-//   GITHUB_RUN_ID                GitHub Actions run id
-//   WALL_LIMIT_SEC               wall-clock safety cap (default 4500 = 75 min)
+// GITHUB_RUN_ID GitHub Actions run id
+// WALL_LIMIT_SEC wall-clock safety cap (default 4500 = 75 min)
 
 'use strict';
 
@@ -46,37 +47,37 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
   process.exit(1);
 }
-const RUN_ID    = Number(process.env.RUN_ID);
-const MACHINE   = Number(process.env.MACHINE_NO);
+const RUN_ID  = Number(process.env.RUN_ID);
+const MACHINE = Number(process.env.MACHINE_NO);
 const GH_RUN_ID = process.env.GITHUB_RUN_ID || '';
 if (!RUN_ID || !MACHINE) {
   console.error('Missing or invalid RUN_ID / MACHINE_NO');
   process.exit(1);
 }
 const WALL_LIMIT_MS = (Number(process.env.WALL_LIMIT_SEC) || 4500) * 1000;
-const START_TIME    = Date.now();
+const START_TIME = Date.now();
 
 // -- Audit log (403 pattern analysis). Never blocks or stops a scrape. ------
 
 let NOON_REQ = 0;      // Noon requests made from this machine's IP
-let RUNNER_IP = null;  // public IP of this GitHub runner
-const undici = require('undici');
-const _http1Agent = new undici.Agent({ allowH2: false });
-const rawFetch = (url, opts) => undici.fetch(url, { ...opts, dispatcher: _http1Agent });
+let RUNNER_IP = null;   // public IP of this GitHub runner
+// HTTP/2 (Node's built-in fetch negotiates h2 by default)
+const _nativeFetch = globalThis.fetch;
 globalThis.fetch = (u, o) => {
   if (String(u).includes('noon.com')) NOON_REQ++;
-  return rawFetch(u, o);
+  return _nativeFetch(u, o);
 };
+const rawFetch = _nativeFetch;  // used by audit() and ipify
 const AREA_CTX = { page: 0 };
 
 function failStep(msg) {
   const m = String(msg || '');
   if (m.startsWith('mint whoami-food')) return 'mint_whoami_food';
-  if (m.startsWith('mint whoami')) return 'mint_whoami';
+  if (m.startsWith('mint whoami'))      return 'mint_whoami';
   if (m.startsWith('mint set-location')) return 'mint_set_location';
-  if (m.startsWith('locate set-loc')) return 'locate_set_location';
-  if (m.startsWith('locate whoami')) return 'locate_whoami';
-  if (m.startsWith('search')) return 'search';
+  if (m.startsWith('locate set-loc'))   return 'locate_set_location';
+  if (m.startsWith('locate whoami'))    return 'locate_whoami';
+  if (m.startsWith('search'))           return 'search';
   return 'other';
 }
 
@@ -108,23 +109,20 @@ async function audit(row) {
 
 // -- Constants --------------------------------------------------------------
 
-const UA    = 'noon/22895 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
-const BUILD = '22895';
+const UA    = 'noon/22098 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
+const BUILD = '22098';
 
 const WHOAMI_URL       = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami';
 const SET_LOCATION_URL = 'https://api-app.noon.com/_vs/st/mp-identity-api-geo/serviceable-geo-info/set-location-by-lat-lng';
 const WHOAMI_FOOD_URL  = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami?experience=food&select_nearby=1';
 const SEARCH_URL       = 'https://api-app-fd.noon.com/_svc/mp-food-api-catalog/api/search';
 
-const APP_BASE = 'https://api-app.noon.com';
-const FD_BASE  = 'https://api-app-fd.noon.com';
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const PAGE_LIMIT        = 60;    // Noon's own page size
-const PAGE_SAFETY_CAP   = 500;   // runaway guard
-const MAX_AREAS_PER_RUN = 1;     // One area per machine — session sim uses ~40 calls, no IP budget for area 2
-const EARLY_EXIT_PAGES  = 50;    // if area 1 >= this, don't claim area 2
+const PAGE_LIMIT        = 60;
+const PAGE_SAFETY_CAP   = 500;
+const MAX_AREAS_PER_RUN = 2;
+const EARLY_EXIT_PAGES  = 50;
 
 // U+E001 is Noon's custom dirham glyph -> normalise to "AED"
 const DIRHAM_RE = //g;
@@ -168,175 +166,68 @@ function mergeSetCookies(jar, resp) {
 const cookieStr = (jar) =>
   Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
 
-// -- Token (one per area, full session simulation) -------------------------
+// -- Token (one per area, no re-mint mid-walk) ------------------------------
 
 let session     = null;
 let tokenNumber = 0;
 
-/**
- * Full 4-phase session simulation (40+ warm-up calls mimicking real iOS app
- * launch). Based on Proxyman capture of real Noon iOS app traffic.
- * One token lives ~300s. Called once per area at area start.
- */
 async function mintToken(lat, lng) {
-  const deviceId = crypto.randomUUID().toUpperCase();
-  const visitorId = crypto.randomUUID().toUpperCase();
+  const deviceId  = crypto.randomUUID();
+  const visitorId = crypto.randomUUID();
   const jar = {};
-  const sentryId = () => crypto.randomUUID().replace(/-/g, '');
-  const sTrace = () => {
-    const s = sentryId();
-    return {
-      'sentry-trace': `${s}-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
-      baggage: `sentry-environment=production,sentry-public_key=d61e4de762b3c36e7c14f2d7cf6030c1,sentry-release=com.noon.buyerapp%405.261024%2B${BUILD},sentry-trace_id=${s}`,
-    };
-  };
   const base = () => ({
-    'User-Agent': UA, 'x-platform': 'ios', 'x-build': BUILD, 'x-mp': 'noon', 'x-content': 'mobile',
-    Accept: 'application/json, text/plain, */*', 'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br', 'Cache-Control': 'no-cache',
-    'x-device-id': deviceId, 'x-visitor-id': visitorId, ...sTrace(),
+    'User-Agent': UA, 'x-platform': 'ios', 'x-build': BUILD,
+    'x-mp': 'noon', 'x-content': 'mobile', Accept: 'application/json',
+    'x-device-id': deviceId, 'x-visitor-id': visitorId,
   });
-  const ck = () => cookieStr(jar);
-  const ecomH = () => ({ ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae',
-    'x-device-lat': String(lat), 'x-device-lng': String(lng), Cookie: ck() });
 
-  // --- PHASE 1: App launch (~5s) ---
   const r1 = await fetch(WHOAMI_URL, {
-    headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() } });
+    headers: { ...base(), 'x-experience': 'ecom',
+      'x-whoami-request-id': crypto.randomUUID() },
+  });
   if (r1.status === 403) throw Object.assign(new Error('mint whoami 403'), { forbidden: true });
   if (!r1.ok) throw new Error(`mint whoami HTTP ${r1.status}`);
   mergeSetCookies(jar, r1);
 
-  await sleep(1500 + Math.floor(Math.random() * 500));
-
   const r2 = await fetch(SET_LOCATION_URL, {
-    method: 'POST', headers: { ...ecomH(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ location: { lat, lng }, lang: 'en' }) });
+    method: 'POST',
+    headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae',
+      'x-device-lat': String(lat), 'x-device-lng': String(lng),
+      'Content-Type': 'application/json', Cookie: cookieStr(jar) },
+    body: JSON.stringify({ location: { lat, lng }, lang: 'en' }),
+  });
   if (r2.status === 403) throw Object.assign(new Error('mint set-location 403'), { forbidden: true });
   if (!r2.ok) throw new Error(`mint set-location HTTP ${r2.status}`);
   mergeSetCookies(jar, r2);
 
-  await sleep(300 + Math.floor(Math.random() * 200));
   const r3 = await fetch(WHOAMI_FOOD_URL, {
-    headers: { ...ecomH(), 'x-whoami-request-id': crypto.randomUUID() } });
+    headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae',
+      'x-device-lat': String(lat), 'x-device-lng': String(lng),
+      'x-whoami-request-id': crypto.randomUUID(), Cookie: cookieStr(jar) },
+  });
   if (r3.status === 403) throw Object.assign(new Error('mint whoami-food 403'), { forbidden: true });
   if (!r3.ok) throw new Error(`mint whoami-food HTTP ${r3.status}`);
   const who = await r3.json().catch(() => ({}));
   mergeSetCookies(jar, r3);
+
   if (!jar.nguestv2) throw new Error('mint produced no nguestv2');
 
   const zones = who && who.headers && typeof who.headers === 'object' ? who.headers : {};
   tokenNumber++;
   session = { deviceId, visitorId, jar, zones, mintedAt: Date.now() };
   console.log(`[m${MACHINE}] token #${tokenNumber} | zone=${zones['x-food-zonecode'] || '-'}`);
-
-  await sleep(200);
-  const _s = (u, h) => fetch(u, { headers: h }).catch(() => {});
-  await Promise.allSettled([
-    _s(`${APP_BASE}/_svc/mp-vip-api-v1/membership?primaryUphoneCode=none`, ecomH()),
-    _s(`${APP_BASE}/_svc/catalog/api/v3/u/`, ecomH()),
-  ]);
-
-  await sleep(800 + Math.floor(Math.random() * 400));
-
-  await Promise.allSettled([
-    _s(`${APP_BASE}/_svc/configs-v1/configs`, ecomH()),
-    _s(`${APP_BASE}/_svc/cart-v1/cart`, ecomH()),
-  ]);
-
-  await sleep(100);
-  await Promise.allSettled([
-    fetch(`${APP_BASE}/_svc/mp-ads-api-adserver/ads/get-by-slot-codes`, {
-      method: 'POST', headers: { ...ecomH(), 'Content-Type': 'application/json' },
-      body: JSON.stringify(['ocm_ae_mb_homepage_in_the_spotlight_1', 'ocm_ae_mb_homepage_in_the_spotlight_2']) }).catch(() => {}),
-    _s(`${APP_BASE}/_svc/catalog/api/v3/u/?limit=18`, ecomH()),
-  ]);
-
-  // --- PHASE 2: Food tab (~5s) ---
-  await sleep(500 + Math.floor(Math.random() * 300));
-  const foodH = () => ({ ...base(), 'x-experience': 'food', 'x-locale': 'en-ae',
-    'x-device-lat': String(lat), 'x-device-lng': String(lng), Cookie: ck() });
-
-  await Promise.allSettled([
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/`, foodH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/popups`, foodH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/customer/whoami`, foodH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/page/suggestions`, foodH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/customer/favorite/restaurants`, foodH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/customer/navbar-tabs-config`, foodH()),
-  ]);
-
-  await sleep(500 + Math.floor(Math.random() * 300));
-  const searchH = () => {
-    const h = { ...foodH(), 'x-mp-country': 'ae',
-      'x-lat': String(Math.round(lat * 1e7)), 'x-lng': String(Math.round(lng * 1e7)),
-      'x-border-enabled': 'true', 'x-rocket-enabled': 'true' };
-    for (const [k, v] of Object.entries(zones)) { if (v != null && typeof v !== 'object') h[k] = String(v); }
-    return h;
-  };
-
-  await Promise.allSettled([
-    _s(`${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, searchH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/static`, searchH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=recommended_new_user_carousel_tab&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, searchH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/admon/content-ad/banner-carousel?entity_type=food_banner_module&entity_code=homepage_hero_banner_ads_carousel_ae&limit=20&min_assets=2`, searchH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=homepage_carousel_featured_tab&f%5Btags%5D=listing_ad&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, searchH()),
-  ]);
-
-  await sleep(100);
-  await Promise.allSettled([
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/search?content=noon_food_garnierkiwi&get_fallback=false`, searchH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/reels`, searchH()),
-  ]);
-
-  // --- PHASE 3: Browse food home (~5s) ---
-  await sleep(500 + Math.floor(Math.random() * 300));
-  await Promise.allSettled([
-    _s(WHOAMI_URL, { ...base(), 'x-experience': 'ecom', Cookie: ck() }),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/customer/whoami`, foodH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, searchH()),
-  ]);
-
-  await sleep(800 + Math.floor(Math.random() * 400));
-  await fetch(`${FD_BASE}/_svc/mp-food-api-catalog/api/personalization/preferences/get-options`, {
-    method: 'POST', headers: { ...searchH(), 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
-  await sleep(200);
-  await fetch(`${FD_BASE}/_svc/mp-food-api-catalog/api/personalization/preferences/init`, {
-    method: 'POST', headers: { ...searchH(), 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
-
-  await sleep(800 + Math.floor(Math.random() * 400));
-  await Promise.allSettled([
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/light/`, searchH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/`, foodH()),
-  ]);
-  await sleep(200);
-  await Promise.allSettled([
-    _s(`${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, searchH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=recommended_new_user_carousel_tab&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, searchH()),
-    _s(`${FD_BASE}/_svc/mp-food-api-catalog/api/reels`, searchH()),
-  ]);
-
-  // --- PHASE 4: User taps See All (~5s) ---
-  await sleep(4000 + Math.floor(Math.random() * 1000));
-
   return session;
 }
 
 // -- Noon API calls ---------------------------------------------------------
 
 function hdrs(lat, lng) {
-  const sid = crypto.randomUUID().replace(/-/g, '');
   return {
     'User-Agent': UA, 'x-platform': 'ios', 'x-build': BUILD,
     'x-mp': 'noon', 'x-content': 'mobile', 'x-locale': 'en-ae',
     'x-device-id': session.deviceId, 'x-visitor-id': session.visitorId,
     'x-device-lat': String(lat), 'x-device-lng': String(lng),
-    Accept: 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Cache-Control': 'no-cache',
-    'sentry-trace': `${sid}-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}-0`,
-    baggage: `sentry-environment=production,sentry-public_key=d61e4de762b3c36e7c14f2d7cf6030c1,sentry-release=com.noon.buyerapp%405.261024%2B${BUILD},sentry-trace_id=${sid}`,
+    Accept: 'application/json',
   };
 }
 
@@ -378,22 +269,16 @@ async function fetchPage(loc, searchToken) {
     'x-whoami-request-id': crypto.randomUUID(),
     Cookie: loc.cookie, 'Content-Type': 'application/json',
   };
-  // Pass ALL whoami headers including ab-test (real app sends them all)
   for (const [k, v] of Object.entries(loc.zh)) {
-    if (v != null && typeof v !== 'object') headers[k] = String(v);
+    if (v != null && typeof v !== 'object' && !k.toLowerCase().includes('ab-test'))
+      headers[k] = String(v);
   }
 
   const body = {
     queryEntity: null, q: null, f: {}, contexts: [], withContent: true,
-    excludeOutletCodes: [], limit: PAGE_LIMIT, scopes: null, page: 1,
-    dishTags: [], ratingMin: null,
-    sort: { by: 'popularity', dir: 'desc', slab: null },
-    widgets: null, content: null, withHits: false, filteredByWidget: null,
-    internalFilteredByWidget: 'homepage_navpill_filters_widget',
-    getFallback: true, type: 'outlet', qType: 'search_query',
-    minCount: 0, groupDishes: false, isSsc: false,
-    hideSearchBar: false, hideSearchOptions: false,
-    isOutletAdProcessingEnabled: true, withDishFetchQuery: null,
+    excludeOutletCodes: [], limit: PAGE_LIMIT, page: 1,
+    sort: { by: 'popularity', dir: 'desc' },
+    type: 'outlet', qType: 'search_query', getFallback: true,
   };
   if (searchToken) body.searchToken = searchToken;
 
@@ -422,468 +307,546 @@ async function fetchPage(loc, searchToken) {
 
 // -- Non-restaurant filter --------------------------------------------------
 
-/**
- * Returns true if the outlet is a restaurant (at least one cuisine marked
- * is_food=true in noon_cuisines). Drops the outlet if ALL cuisines are
- * non-food (Flowers, Pharmacy, Butcher Shop, etc).
- */
-function isRestaurant(outlet, nonFoodSet) {
-  const cuisines = Array.isArray(outlet.cuisines) ? outlet.cuisines : [];
-  if (cuisines.length === 0) return true;        // unknown -> keep (register will decide)
-  for (const c of cuisines) if (!nonFoodSet.has(c)) return true;
-  return false;
+function isRestaurant(outlet, nonFoodCuisines) {
+  const raw = outlet.cuisines || outlet.cuisineNames || [];
+  const list = Array.isArray(raw) ? raw : [raw];
+  if (list.length === 0) return true;          // no cuisine info -> keep it
+  // Restaurant if at least one cuisine is food
+  return list.some((c) => {
+    const key = String(c).trim().toLowerCase();
+    return key && !nonFoodCuisines.has(key);
+  });
 }
 
-// -- New-schema helpers (Noon changed /search response shape on 2026-10-14) --
+// -- CDN URL helpers --------------------------------------------------------
 
-const CDN_PREFIX = 'https://f.nooncdn.com/food_production/';
-const cdnUrl = (key) =>
-  (typeof key === 'string' && key.trim()) ? CDN_PREFIX + key.trim() + '?width=720&format=webp' : null;
+const CDN_PREFIX = 'https://f.nooncdn.com/s/app/com/noon/';
 
-// Rating state is now carried in rating.title: null -> not_rated, "New" -> new,
-// anything else (e.g., "4.4 (500+)") -> rated.
-function deriveRatingStatus(title) {
-  if (title == null || String(title).trim() === '') return 'not_rated';
-  if (/^new$/i.test(String(title).trim())) return 'new';
-  return 'rated';
+function cdnUrl(p) {
+  if (!p || typeof p !== 'string') return null;
+  if (p.startsWith('http')) return p;
+  return CDN_PREFIX + p.replace(/^\/+/, '');
 }
 
-/**
- * Classify a promo text string into the noon_promo_scope enum values and
- * extract numeric percent and cap when present. Any one of the three card tag
- * fields (tag / extendedTag / miniTag) can match. extendedTag often carries
- * the richest form (with "up to X" caps or "select items" scope).
- *
- * Returns { scope, percent, cap }. All nullable.
- *
- * Pattern catalogue (from 2026-10-14 live sample of 12,565 cards):
- *   - "30% off", "50% OFF"                 -> percent_off
- *   - "30% off up to  20"                  -> percent_off_capped (cap=20)
- *   - "Flat 50% off"                       -> flat_percent_off
- *   - "64% off select items"               -> percent_off_select_items
- *   - "50% off full menu"                  -> percent_off_full_menu
- *   - "30% OFF Bestsellers"                -> percent_off_bestsellers
- *   - "50% off above  1"                   -> percent_off_above_min (threshold=1)
- *   - "Offers"                             -> offers_generic
- *   - "Free Delivery"                      -> free_delivery
- */
-function classifyPromo(tag, extendedTag, miniTag) {
-  // Prefer extendedTag because it has the richest text ("up to", "select items")
-  const texts = [extendedTag, tag, miniTag].filter(
-    (t) => typeof t === 'string' && t.trim()
-  );
-  if (texts.length === 0) return { scope: null, percent: null, cap: null };
+// -- Rating status ----------------------------------------------------------
 
-  const joined = texts.join(' | ');
-  const low = joined.toLowerCase();
+function deriveRatingStatus(score, count) {
+  if (score == null || count == null || count === 0) return 'new';
+  if (count < 25) return 'few';
+  return 'enough';
+}
 
-  // free_delivery FIRST (only promos the restaurant pays matter — but
-  // Noon still uses the tag text as our signal, so we read it here)
-  if (/\bfree\s*delivery\b/i.test(joined)) {
-    return { scope: 'free_delivery', percent: null, cap: null };
+// -- Promo classification ---------------------------------------------------
+// Returns { scope, cap, percent }.
+//   scope   : 'delivery' | 'order' | 'bogo' | 'item' | 'other' | null
+//   cap     : number (AED) | null
+//   percent : number (0–100) | null
+
+function classifyPromo(text) {
+  if (!text) return { scope: null, cap: null, percent: null };
+  const t = String(text);
+
+  // — Free delivery --------------------------------------------------------
+  if (/free\s+deliver/i.test(t)) {
+    return { scope: 'delivery', cap: null, percent: 100 };
   }
 
-  // percent capture: first NN% in any text
-  const percentMatch = joined.match(/(\d{1,3})\s*%/);
-  const percent = percentMatch ? Math.min(100, parseInt(percentMatch[1], 10)) : null;
-
-  // cap capture: "up to <num>" (dirham amount, no AED prefix in Noon text)
-  const capMatch = joined.match(/up\s*to\s*[^0-9]*([\d.]+)/i);
-  const cap = capMatch ? parseFloat(capMatch[1]) : null;
-
-  // Classify scope by phrase
-  if (/bestseller/i.test(joined))     return { scope: 'percent_off_bestsellers', percent, cap };
-  if (/select\s*items?/i.test(joined)) return { scope: 'percent_off_select_items', percent, cap };
-  if (/full\s*menu/i.test(joined))     return { scope: 'percent_off_full_menu', percent, cap };
-  if (/\babove\b/i.test(joined)) {
-    // "50% off above  1" -> percent_off_above_min, cap carries the threshold
-    const aboveMatch = joined.match(/above\s*[^0-9]*([\d.]+)/i);
-    const threshold = aboveMatch ? parseFloat(aboveMatch[1]) : null;
-    return { scope: 'percent_off_above_min', percent, cap: threshold };
+  // — Delivery discount with flat AED off ----------------------------------
+  const delFlat = t.match(/(?:save|get)\s+(?:AED\s*)?(\d+(?:\.\d+)?)\s+(?:on\s+)?deliver/i);
+  if (delFlat) {
+    return { scope: 'delivery', cap: Number(delFlat[1]), percent: null };
   }
-  if (/\bflat\b/i.test(joined))        return { scope: 'flat_percent_off', percent, cap: null };
-  if (/up\s*to/i.test(joined))         return { scope: 'percent_off_capped', percent, cap };
-  if (percent != null)                 return { scope: 'percent_off', percent, cap: null };
-  if (/^\s*offers?\s*$/i.test(joined)) return { scope: 'offers_generic', percent: null, cap: null };
 
-  return { scope: 'offers_generic', percent: null, cap: null };
+  // — Delivery % off -------------------------------------------------------
+  const delPct = t.match(/(\d+)%\s+(?:off\s+)?(?:on\s+)?deliver/i);
+  if (delPct) {
+    return { scope: 'delivery', cap: null, percent: Number(delPct[1]) };
+  }
+
+  // — Reduced / low delivery fee -------------------------------------------
+  if (/(?:reduced|low|less)\s+deliver/i.test(t)) {
+    return { scope: 'delivery', cap: null, percent: null };
+  }
+
+  // — BOGO -----------------------------------------------------------------
+  if (/b[uo][gy]\s*\d\s*get\s*\d/i.test(t) || /\bbogo\b/i.test(t) ||
+      /buy\s*one\s*get\s*one/i.test(t)) {
+    return { scope: 'bogo', cap: null, percent: null };
+  }
+
+  // — Order % off with cap: "20% off up to AED 15" ------------------------
+  const pctCap = t.match(/(\d+)%\s*off.*?(?:up\s*to|max|capped?\s*at)\s*(?:AED\s*)?(\d+(?:\.\d+)?)/i);
+  if (pctCap) {
+    return { scope: 'order', cap: Number(pctCap[2]), percent: Number(pctCap[1]) };
+  }
+
+  // — Order % off no cap: "30% off" ---------------------------------------
+  const pctOnly = t.match(/(\d+)%\s*off/i);
+  if (pctOnly) {
+    return { scope: 'order', cap: null, percent: Number(pctOnly[1]) };
+  }
+
+  // — Flat AED off order: "AED 10 off" ------------------------------------
+  const flatOff = t.match(/(?:AED\s*)?(\d+(?:\.\d+)?)\s+off/i);
+  if (flatOff) {
+    return { scope: 'order', cap: Number(flatOff[1]), percent: null };
+  }
+
+  // — Item-level promo (e.g. "Up to 50% off on selected items") -----------
+  const itemPct = t.match(/up\s+to\s+(\d+)%\s*(?:off)?\s*(?:on\s+)?(?:selected|menu|item)/i);
+  if (itemPct) {
+    return { scope: 'item', cap: null, percent: Number(itemPct[1]) };
+  }
+
+  // — Fallback: bare percentage anywhere ----------------------------------
+  const anyPct = t.match(/(\d+)%/);
+  if (anyPct) {
+    return { scope: 'other', cap: null, percent: Number(anyPct[1]) };
+  }
+
+  return { scope: 'other', cap: null, percent: null };
 }
 
-// -- Card -> ranking row ----------------------------------------------------
+// -- Parse outlet cards -> row arrays (37 fields each) ----------------------
 
-function parseCards(outlets, nonFoodSet) {
-  const seen = new Set();
+function parseCards(outlets, nonFoodCuisines, startRank) {
   const rows = [];
-  let dropped = 0;
+  let rank = startRank;
 
-  for (let i = 0; i < outlets.length; i++) {
-    const o = outlets[i];
-    const code = o.outletCode;
-    if (!code || seen.has(code)) continue;
-    if (!isRestaurant(o, nonFoodSet)) { dropped++; continue; }
-    seen.add(code);
+  for (const o of outlets) {
+    rank++;
 
-    const rank = rows.length + 1;
+    // Drop non-restaurant outlets
+    if (!isRestaurant(o, nonFoodCuisines)) continue;
 
-    // Rating: new schema uses rating.score + rating.title + rating.titleCode.
-    const rt = o.rating || {};
-    const rating           = rt.score != null ? rt.score : null;
-    const ratingCount      = rt.count != null ? rt.count : null;
-    const ratingTitle      = rt.title || null;
-    const ratingDisplayCnt = rt.displayCount || null;
-    const ratingStatus     = deriveRatingStatus(ratingTitle);
+    const code = o.outletCode || null;
+    if (!code) continue;
 
-    // Promo tags are now top-level, not nested under o.promo.
-    const tag         = typeof o.tag === 'string' ? o.tag : null;
-    const miniTag     = typeof o.miniTag === 'string' ? o.miniTag : null;
-    const extendedTag = typeof o.extendedTag === 'string' ? o.extendedTag : null;
-    const hasPromo    = !!(tag || miniTag || extendedTag);
-    const promoText   = cleanText(tag) || cleanText(extendedTag) || cleanText(miniTag);
+    // Operating status
+    const opStatus = o.operatingStatusCode || o.operatingStatus || null;
+    const opType   = o.operatingType || null;
 
-    const classified   = classifyPromo(tag, extendedTag, miniTag);
-    // Free-delivery flag reads ONLY from the promo text (restaurant-paid signal).
-    const isFreeDeliv  = classified.scope === 'free_delivery';
-    const isNonFreeDel = hasPromo && !isFreeDeliv;
+    // Rating
+    const rObj     = (o.rating && typeof o.rating === 'object') ? o.rating : {};
+    const score    = rObj.score ?? (typeof o.rating === 'number' ? o.rating : null);
+    const rCount   = rObj.count ?? o.ratingCount ?? null;
+    const rStatus  = deriveRatingStatus(score, rCount);
+    const rDispCnt = rObj.displayCount ?? rObj.display_count ?? rCount;
+    const rTitle   = cleanText(rObj.title ?? rObj.ratingTitle ?? null);
 
-    // Images: new schema returns raw CDN keys in media.*; build full URLs.
-    const d           = o.delivery || {};
-    const bannerKey   = (o.media && typeof o.media.heroImage === 'string') ? o.media.heroImage : null;
-    const logoKey     = (o.media && typeof o.media.logoImage === 'string') ? o.media.logoImage : null;
-    const bannerUrl   = cdnUrl(bannerKey);
-    const logoUrl     = cdnUrl(logoKey);
+    // Promo
+    const promoRaw = o.promo || o.promotion || null;
+    const promoText = cleanText(
+      typeof promoRaw === 'string' ? promoRaw
+        : promoRaw && typeof promoRaw === 'object'
+          ? (promoRaw.text || promoRaw.title || promoRaw.label || null)
+          : null
+    );
+    const hasPromo = !!promoText;
+    const classified = classifyPromo(promoText);
 
+    // Widget / personalisation
+    const widgetGroup    = o.widgetGroup ?? o.widget_group ?? null;
+    const isPersonalized = !!(o.isPersonalized ?? o.is_personalized ?? false);
+
+    // Tags
+    const miniTag     = cleanText(o.miniTag ?? o.mini_tag ?? null);
+    const extendedTag = cleanText(o.extendedTag ?? o.extended_tag ?? null);
+
+    // Delivery
+    const del = (o.delivery && typeof o.delivery === 'object') ? o.delivery : {};
+    const isFreeDeliv   = !!(del.isFree ?? del.is_free ?? false);
+    const isNonFreeDel  = !!(del.isNonFreeDelivery ?? del.is_non_free_delivery ?? false);
+    const isNearAndQuick = !!(o.isNearAndQuick ?? o.is_near_and_quick ?? false);
+    const delFee     = del.fee ?? del.deliveryFee ?? null;
+    const delOrigFee = del.originalFee ?? del.original_fee ?? null;
+    const delMinOrder = del.minOrder ?? del.min_order ?? null;
+    const delTime    = cleanText(del.time ?? del.deliveryTime ?? del.eta ?? null);
+
+    // Identity / display
+    const name     = cleanText(o.name ?? o.outletName ?? null);
+    const linkUrl  = o.linkUrl ?? o.link_url ?? o.slug ?? null;
+    const bannerUrl = cdnUrl(o.bannerUrl ?? o.banner_url ?? o.bannerImage ?? null);
+    const logoUrl   = cdnUrl(o.logoUrl ?? o.logo_url ?? o.logoImage ?? null);
+
+    // Cuisines (joined string)
+    const cuisineArr = o.cuisines || o.cuisineNames || [];
+    const cuisines = (Array.isArray(cuisineArr) ? cuisineArr : [cuisineArr])
+      .map((c) => cleanText(String(c)))
+      .filter(Boolean)
+      .join(', ') || null;
+
+    const restaurantCode = o.restaurantCode ?? o.restaurant_code ?? null;
+    const price    = o.price ?? o.priceRange ?? o.price_range ?? null;
+    const distance = o.distance ?? null;
+
+    // VIP
+    const isVip = !!(o.isVip ?? o.is_vip ?? false);
+    const vipMsg = cleanText(
+      typeof o.vipMessage === 'string' ? o.vipMessage
+        : (o.vipMessage && typeof o.vipMessage === 'object')
+          ? (o.vipMessage.text || o.vipMessage.title || null)
+          : (o.vip_message ?? null)
+    );
+
+    // 37 fields per row
     rows.push([
-      code,                                // [0]  noon_branch_id
-      rank,                                // [1]  noon_listing_rank
-      o.operatingStatusCode || null,       // [2]  noon_operating_status (RENAMED)
-      o.operatingType       || null,       // [3]  noon_operating_type
-      rating,                              // [4]  noon_rating (rating.score)
-      ratingCount,                         // [5]  noon_rating_count
-      ratingStatus,                        // [6]  noon_rating_status (derived)
-      hasPromo,                            // [7]  noon_has_promo
-      promoText,                           // [8]  noon_promo_text
-      classified.scope,                    // [9]  noon_promo_scope (classified)
-      classified.cap,                      // [10] noon_promo_cap (extracted)
-      o.widgetGroup || null,               // [11] noon_widget_group
-      !!(o.isPersonalized),                // [12] noon_is_personalized
-      false,                               // [13] noon_is_sponsored  (DEPRECATED: Noon dropped this signal)
-      null,                                // [14] noon_ad_slot        (DEPRECATED: Noon dropped this signal)
-      ratingDisplayCnt,                    // [15] noon_rating_display_count
-      cleanText(miniTag),                  // [16] noon_promo_mini_tag
-      cleanText(extendedTag),              // [17] noon_promo_extended_tag
-      isFreeDeliv,                         // [18] noon_promo_is_free_delivery
-      isNonFreeDel,                        // [19] noon_promo_is_non_free_delivery
-      !!(o.isNearAndQuick),                // [20] noon_is_near_and_quick
-      o.name || null,                      // [21] noon_card_name
-      o.linkUrl || null,                   // [22] noon_card_url (RENAMED: pageUrl -> linkUrl)
-      bannerUrl,                           // [23] noon_card_banner_url (full CDN URL, used as branch banner)
-      Array.isArray(o.cuisines) ? o.cuisines : [], // [24] cuisines (for queue)
-      o.restaurantCode || null,            // [25] noon_restaurant_code (NEW: brand code at scrape time)
-      typeof o.price === 'string' ? o.price : null, // [26] noon_card_price_tier ($, $$, $$$)
-      typeof o.distance === 'number' ? o.distance : null, // [27] noon_card_distance_m
-      ratingTitle,                         // [28] noon_card_rating_title
-      typeof d.fee === 'number' ? d.fee : null,          // [29] delivery_fee
-      typeof d.originalFee === 'number' ? d.originalFee : null, // [30] delivery_original_fee
-      typeof d.minOrder === 'number' ? d.minOrder : null, // [31] delivery_min_order
-      typeof d.time === 'string' ? d.time : null,         // [32] delivery_time
-      classified.percent,                  // [33] noon_promo_percent (extracted)
-      logoUrl,                             // [34] brand logo URL (full CDN)
-      typeof o.isVip === 'boolean' ? o.isVip : null, // [35] noon_is_vip (ranking row; null when missing)
-      o.vipMsg || null,                    // [36] noon_vip_msg (ranking row; null when blank)
+      code,                   //  0  outletCode
+      rank,                   //  1  rank
+      opStatus,               //  2  operatingStatusCode
+      opType,                 //  3  operatingType
+      score,                  //  4  rating (score)
+      rCount,                 //  5  ratingCount
+      rStatus,                //  6  ratingStatus
+      hasPromo,               //  7  hasPromo
+      promoText,              //  8  promoText
+      classified.scope,       //  9  classified.scope
+      classified.cap,         // 10  classified.cap
+      widgetGroup,            // 11  widgetGroup
+      isPersonalized,         // 12  isPersonalized
+      false,                  // 13  sponsored (deprecated)
+      null,                   // 14  ad_slot (deprecated)
+      rDispCnt,               // 15  ratingDisplayCnt
+      miniTag,                // 16  miniTag
+      extendedTag,            // 17  extendedTag
+      isFreeDeliv,            // 18  isFreeDeliv
+      isNonFreeDel,           // 19  isNonFreeDel
+      isNearAndQuick,         // 20  isNearAndQuick
+      name,                   // 21  name
+      linkUrl,                // 22  linkUrl
+      bannerUrl,              // 23  bannerUrl
+      cuisines,               // 24  cuisines
+      restaurantCode,         // 25  restaurantCode
+      price,                  // 26  price
+      distance,               // 27  distance
+      rTitle,                 // 28  ratingTitle
+      delFee,                 // 29  delivery.fee
+      delOrigFee,             // 30  delivery.originalFee
+      delMinOrder,            // 31  delivery.minOrder
+      delTime,                // 32  delivery.time
+      classified.percent,     // 33  classified.percent
+      logoUrl,                // 34  logoUrl
+      isVip,                  // 35  isVip
+      vipMsg,                 // 36  vipMsg
     ]);
   }
-  return { rows, dropped };
-}
 
-// -- Burst-scroll timing ----------------------------------------------------
-
-function pageGap(page) {
-  if (page % 3 === 0) return 2000;   // pause after every 3rd page
-  return 750;                          // quick scroll within burst
+  return rows;
 }
 
 // -- Process one area -------------------------------------------------------
 
-async function processArea(areaId, lat, lng, pageDelayMs, maxPages, nonFoodSet) {
-  const t0 = Date.now();
+async function processArea(area, nonFoodCuisines) {
+  const { lat, lng, page_delay_ms: pageDelayMs = 1500 } = area;
   AREA_CTX.page = 0;
-  session = null;
 
-  // Full session simulation (40+ warm-up calls mimicking real iOS app)
+  // One token per area, minted fresh
   await mintToken(lat, lng);
 
-  // Session simulation already did locate — build loc from session
-  const loc = { lat, lng, zh: session.zones, cookie: cookieStr(session.jar) };
+  // Set location for food experience
+  const loc = await locate(lat, lng);
 
-  const allOutlets = [];
-  const seen = new Set();
+  const allRows   = [];
+  const seenCodes = new Set();
   let searchToken = null;
+  let totalOutlets = 0;
   let page = 0;
-  let stopReason = null;
-  const cap = maxPages || PAGE_SAFETY_CAP;
+  let emptyStreak = 0;
 
-  while (page < cap) {
+  while (page < PAGE_SAFETY_CAP) {
+    // Wall-clock guard
+    if (Date.now() - START_TIME > WALL_LIMIT_MS) {
+      console.log(`[m${MACHINE}] wall limit reached at page ${page}`);
+      break;
+    }
+
     page++;
     AREA_CTX.page = page;
-    const pt0 = Date.now();
-    const r = await fetchPage(loc, searchToken);
-    const pageMs = Date.now() - pt0;
 
-    const fresh = r.outlets.filter((o) => !seen.has(o.outletCode));
-    for (const o of fresh) { seen.add(o.outletCode); allOutlets.push(o); }
+    if (page > 1 && pageDelayMs > 0) await sleep(pageDelayMs);
+
+    const result = await fetchPage(loc, searchToken);
+    const { outlets, token } = result;
+
+    // Empty page
+    if (!outlets.length) {
+      emptyStreak++;
+      if (emptyStreak >= 2) break;          // two consecutive empties -> done
+      searchToken = token;
+      continue;
+    }
+    emptyStreak = 0;
+
+    // Deduplicate within this area walk
+    const fresh = outlets.filter((o) => {
+      const c = o.outletCode;
+      if (!c || seenCodes.has(c)) return false;
+      seenCodes.add(c);
+      return true;
+    });
+
+    if (fresh.length === 0) {
+      console.log(`[m${MACHINE}] page ${page}: all dupes -> done`);
+      break;
+    }
+
+    totalOutlets += fresh.length;
+    const rows = parseCards(fresh, nonFoodCuisines, allRows.length);
+    allRows.push(...rows);
 
     console.log(
-      `[m${MACHINE}] ${areaId} p${page}: ${r.outlets.length} outlets ` +
-      `(${fresh.length} new, ${allOutlets.length} total) ${pageMs}ms` +
-      `${r.token ? '' : ' no-token'}`
+      `[m${MACHINE}] page ${page}: ${fresh.length} new, ` +
+      `${rows.length} restaurants (${allRows.length} total)`
     );
 
-    if (r.outlets.length === 0) { stopReason = `empty@${page}`;    break; }
-    if (fresh.length === 0)     { stopReason = `no-new@${page}`;   break; }
-    if (!r.token)               { stopReason = `no-token@${page}`; break; }
-
-    searchToken = r.token;
-    // Burst-scroll timing (3 pages at 750ms + 2s pause)
-    if (page < cap) await sleep(pageGap(page));
+    if (!token) break;                      // no next-page cursor
+    searchToken = token;
   }
-  if (!stopReason) stopReason = `max-pages(${cap})`;
 
-  const parsed  = parseCards(allOutlets, nonFoodSet);
-  const elapsed = Date.now() - t0;
-  const requests = page + 2; // search pages + locate (set-location + whoami-food)
-
-  return {
-    pages: page,
-    cards: allOutlets.length,
-    rows: parsed.rows,
-    dropped: parsed.dropped,
-    elapsed,
-    requests,
-    stopReason,
-  };
+  return { rows: allRows, pages: page, outlets: totalOutlets };
 }
 
 // -- Main -------------------------------------------------------------------
 
 (async () => {
-  if (typeof fetch !== 'function') {
-    console.error('Node 18+ required (native fetch)');
-    process.exit(1);
-  }
+  const summary = {
+    machine: MACHINE, run_id: RUN_ID,
+    areas_attempted: 0, areas_completed: 0,
+    areas_blocked: 0, areas_errored: 0,
+    total_rows: 0, total_pages: 0,
+  };
 
-  console.log(`[m${MACHINE}] starting | run=${RUN_ID} | gh=${GH_RUN_ID} | wall=${WALL_LIMIT_MS / 1000}s`);
-
-  // -- machine_start -------------------------------------------------------
-  const start = await rpc('noon_ranking_machine_start', {
-    p_run_id: RUN_ID, p_machine_no: MACHINE, p_github_run_id: GH_RUN_ID,
-  });
-  console.log(`[m${MACHINE}] start -> ${JSON.stringify(start)}`);
-
-  if (start.stop) {
-    console.log(`[m${MACHINE}] told to stop at check-in`);
-    process.exit(0);
-  }
-
-  const scrapeDate = start.scrape_date;
-  const scrapeHour = start.scrape_hour;
-  const dryRun     = !!start.dry_run;
-  let totalAreas = 0, totalRows = 0, totalRequests = 0, totalDropped = 0;
-
-  console.log(`[m${MACHINE}] date=${scrapeDate} hour=${scrapeHour} dry=${dryRun}`);
-
-  // -- Fetch non-food cuisines once at startup -----------------------------
-  const nonFoodList = await rpc('noon_get_non_food_cuisines', {});
-  const nonFoodSet  = new Set(Array.isArray(nonFoodList) ? nonFoodList : []);
-  console.log(`[m${MACHINE}] non-food cuisines (${nonFoodSet.size}): ${[...nonFoodSet].join(', ')}`);
-
-  // -- Runner IP for the audit log (not a Noon request) --------------------
   try {
-    const ipr = await rawFetch('https://api.ipify.org', { signal: AbortSignal.timeout(4000) });
-    RUNNER_IP = (await ipr.text()).trim() || null;
-  } catch (_) { /* unknown IP is fine */ }
-  console.log(`[m${MACHINE}] runner ip=${RUNNER_IP || 'unknown'}`);
+    // ---- machine_start ----------------------------------------------------
+    await audit({ event: 'machine_start' });
+    console.log(
+      `[m${MACHINE}] machine_start | run=${RUN_ID} ` +
+      `gh_run=${GH_RUN_ID} wall=${WALL_LIMIT_MS / 1000}s`
+    );
 
-  // -- claim -> process -> report loop (max 2 areas) -----------------------
-  let exitReason = 'areas_complete';
+    // ---- non-food cuisines ------------------------------------------------
+    const nfRows = await rpc('noon_ranking_non_food_cuisines', {});
+    const nonFoodCuisines = new Set(
+      (nfRows || [])
+        .map((r) => String(r.cuisine || r.name || '').trim().toLowerCase())
+        .filter(Boolean)
+    );
+    console.log(`[m${MACHINE}] non-food cuisines loaded: ${nonFoodCuisines.size}`);
 
-  for (let areaIdx = 0; areaIdx < MAX_AREAS_PER_RUN; areaIdx++) {
-    // Wall-clock safety check
-    if (Date.now() - START_TIME > WALL_LIMIT_MS) {
-      console.log(`[m${MACHINE}] wall limit reached (${WALL_LIMIT_MS / 1000}s)`);
-      exitReason = 'wall_limit';
-      break;
-    }
-
-    // Claim next area
-    const claim = await rpc('noon_ranking_claim', {
-      p_run_id: RUN_ID, p_machine_no: MACHINE,
-    });
-
-    if (!claim || claim.noon_area_id == null) {
-      if (claim && claim.wait_ms > 0) {
-        console.log(`[m${MACHINE}] wait ${claim.wait_ms}ms (pacing)`);
-        await sleep(claim.wait_ms);
-        areaIdx--; // doesn't count — try claim again
-        continue;
-      }
-      console.log(`[m${MACHINE}] no more areas`);
-      exitReason = 'no_more_areas';
-      break;
-    }
-
-    const areaId   = claim.noon_area_id;
-    const areaName = claim.area_name || String(areaId);
-    const lat      = claim.lat;
-    const lng      = claim.lng;
-    const pageDel  = claim.page_delay_ms || 500;
-    const maxPg    = claim.max_pages     || PAGE_SAFETY_CAP;
-
-    console.log(`[m${MACHINE}] claimed ${areaId} (${areaName}) [area ${areaIdx + 1}/${MAX_AREAS_PER_RUN}] | delay=${pageDel}ms max=${maxPg}`);
-
-    // Audit context for this area
-    const claimedAt = Date.now();
-    const reqBefore = NOON_REQ;
-    const auditBase = () => ({
-      area_seq: areaIdx + 1, noon_area_id: areaId, area_name: areaName,
-      claimed_at: new Date(claimedAt).toISOString(), ended_at: new Date().toISOString(),
-      gap_s: claim.gap_seconds || 0, page_delay_ms: pageDel, max_pages: maxPg,
-      token_no: tokenNumber, token_age_ms: session ? Date.now() - session.mintedAt : null,
-      req_before: reqBefore, req_area: NOON_REQ - reqBefore,
-      elapsed_ms: Date.now() - claimedAt,
-    });
-
-    if (claim.gap_seconds > 0) {
-      console.log(`[m${MACHINE}] gap ${claim.gap_seconds}s`);
-      await sleep(claim.gap_seconds * 1000);
-    }
-
-    // -- process area ------------------------------------------------------
-    let result;
+    // ---- runner IP --------------------------------------------------------
     try {
-      result = await processArea(areaId, lat, lng, pageDel, maxPg, nonFoodSet);
-      totalRequests += result.requests;
-      totalDropped  += result.dropped;
+      const ipResp = await rawFetch('https://api.ipify.org?format=json', {
+        signal: AbortSignal.timeout(8000),
+      });
+      const ipData = await ipResp.json();
+      RUNNER_IP = ipData.ip || null;
+    } catch (e) {
+      console.log(`[m${MACHINE}] ipify failed: ${e.message}`);
+    }
+    console.log(`[m${MACHINE}] runner IP: ${RUNNER_IP || 'unknown'}`);
 
-      // Save ranking data
-      let savedAnalysis = 0, savedPending = 0;
-      if (!dryRun && result.rows.length > 0) {
-        const sv = await rpc('noon_ranking_save_area_hour', {
-          p_area_id: areaId, p_date: scrapeDate, p_hour: scrapeHour,
-          p_rows: result.rows,
-        });
-        savedAnalysis = (sv && sv.inserted != null) ? sv.inserted : result.rows.length;
-        savedPending  = (sv && sv.pending  != null) ? sv.pending  : 0;
-        console.log(`[m${MACHINE}] saved ${areaId}: analysis=${savedAnalysis} pending=${savedPending} dropped=${result.dropped}`);
+    // ---- area claim loop --------------------------------------------------
+    let earlyExit = false;
+
+    for (let areaIdx = 0; areaIdx < MAX_AREAS_PER_RUN; areaIdx++) {
+      if (earlyExit) break;
+
+      // Wall-clock check before claiming
+      if (Date.now() - START_TIME > WALL_LIMIT_MS) {
+        console.log(`[m${MACHINE}] wall limit before area claim`);
+        break;
       }
 
-      // Report OK
-      const rep = await rpc('noon_ranking_report', {
-        p_run_id: RUN_ID, p_machine_no: MACHINE, p_area_id: areaId,
-        p_result: {
-          status:        'ok',
-          pages_scraped: result.pages,
-          cards:         result.cards,
-          ranking_rows:  savedAnalysis,
-          pending_rows:  savedPending,
-          dropped:       result.dropped,
-          bytes:         0,
-          fetch_ms:      result.elapsed,
-        },
-      });
+      // Claim next area from the queue
+      let area;
+      try {
+        area = await rpc('noon_ranking_claim_area', {
+          p_run_id: RUN_ID,
+          p_machine_no: MACHINE,
+        });
+      } catch (e) {
+        console.log(`[m${MACHINE}] claim failed: ${e.message}`);
+        break;
+      }
 
-      totalAreas++;
-      await audit({
-        ...auditBase(), outcome: 'ok', pages: result.pages, cards: result.cards,
-        rows_parsed: result.rows.length, rows_saved: savedAnalysis, stop_reason: result.stopReason,
-      });
-      totalRows += result.rows.length;
+      if (!area || (Array.isArray(area) && area.length === 0)) {
+        console.log(`[m${MACHINE}] no more areas to claim`);
+        break;
+      }
+      if (Array.isArray(area)) area = area[0];
+
+      const areaId   = area.area_id ?? area.id;
+      const areaName = area.area_name ?? area.name ?? `area-${areaId}`;
+      summary.areas_attempted++;
+
       console.log(
-        `[m${MACHINE}] ${areaId} ok: ${result.cards} cards, ${result.rows.length} rows (${result.dropped} dropped), ` +
-        `${result.pages}p, ${result.elapsed}ms | ${result.stopReason} | -> ${rep.action}`,
+        `\n[m${MACHINE}] === area ${areaIdx + 1}/${MAX_AREAS_PER_RUN}: ` +
+        `${areaName} (id=${areaId}, lat=${area.lat}, lng=${area.lng}) ===`
       );
 
-      if (rep.action === 'stop_job') {
-        console.log(`[m${MACHINE}] stop: ${rep.reason}`);
-        exitReason = 'stop_job';
-        break;
-      }
+      let result;
+      try {
+        result = await processArea(area, nonFoodCuisines);
 
-      // Noon rule: if first area went long, don't risk the IP on a second
-      if (areaIdx === 0 && result.pages >= EARLY_EXIT_PAGES) {
-        console.log(`[m${MACHINE}] area 1 was ${result.pages}p (>= ${EARLY_EXIT_PAGES}), skipping area 2 to spare IP`);
-        exitReason = 'first_area_long';
-        break;
-      }
+        // ---- area success -------------------------------------------------
+        summary.areas_completed++;
+        summary.total_rows  += result.rows.length;
+        summary.total_pages += result.pages;
 
-      if (rep.gap_seconds > 0) await sleep(rep.gap_seconds * 1000);
+        console.log(
+          `[m${MACHINE}] area ${areaName}: done | ` +
+          `${result.rows.length} rows, ${result.pages} pages, ` +
+          `${result.outlets} raw outlets`
+        );
 
-    } catch (e) {
-      // 429 / 403: stop machine immediately. Any completed area is already
-      // committed. In-flight area reported blocked -> back to queue for a
-      // replacement machine on a fresh IP.
-      if (e.rateLimited || e.forbidden) {
-        const kind = e.forbidden ? 'blocked' : 'rate_limited';
+        // Audit: area done
         await audit({
-          ...auditBase(), outcome: kind, pages: Math.max(0, AREA_CTX.page - 1),
-          fail_step: failStep(e.message), fail_page: AREA_CTX.page || null,
-          http_status: e.forbidden ? 403 : 429, error: e.message.slice(0, 300),
+          event: 'area_done',
+          area_id: areaId,
+          area_name: areaName,
+          pages: result.pages,
+          outlets_raw: result.outlets,
+          outlets_kept: result.rows.length,
+          noon_reqs: NOON_REQ,
         });
-        console.log(`[m${MACHINE}] ${kind} on ${areaId}: ${e.message} - stopping machine immediately`);
 
-        const rep = await rpc('noon_ranking_report', {
-          p_run_id: RUN_ID, p_machine_no: MACHINE, p_area_id: areaId,
-          p_result: { status: kind },
+        // Save rows via RPC
+        if (result.rows.length > 0) {
+          try {
+            await rpc('noon_ranking_save_area_hour', {
+              p_run_id:     RUN_ID,
+              p_area_id:    areaId,
+              p_machine_no: MACHINE,
+              p_pages:      result.pages,
+              p_rows:       result.rows,
+            });
+            console.log(`[m${MACHINE}] saved ${result.rows.length} rows for ${areaName}`);
+          } catch (e) {
+            console.error(`[m${MACHINE}] save failed for ${areaName}: ${e.message}`);
+          }
+        }
+
+        // Report area status
+        try {
+          await rpc('noon_ranking_report', {
+            p_run_id:     RUN_ID,
+            p_area_id:    areaId,
+            p_machine_no: MACHINE,
+            p_status:     'done',
+            p_pages:      result.pages,
+            p_rows:       result.rows.length,
+          });
+        } catch (e) {
+          console.log(`[m${MACHINE}] report(done) failed: ${e.message}`);
+        }
+
+        // ---- early exit check ---------------------------------------------
+        if (result.pages >= EARLY_EXIT_PAGES) {
+          console.log(
+            `[m${MACHINE}] area used ${result.pages} pages ` +
+            `(>= ${EARLY_EXIT_PAGES}), skipping further areas ` +
+            `to preserve IP budget`
+          );
+          earlyExit = true;
+        }
+      } catch (e) {
+        // ---- area blocked (403 / 429) -------------------------------------
+        if (e.forbidden || e.rateLimited) {
+          summary.areas_blocked++;
+          const reason = e.forbidden ? '403' : '429';
+          console.error(
+            `[m${MACHINE}] BLOCKED (${reason}) on area ${areaName} ` +
+            `at page ${AREA_CTX.page}: ${e.message}`
+          );
+
+          await audit({
+            event: 'area_blocked',
+            area_id: areaId,
+            area_name: areaName,
+            block_reason: reason,
+            block_step: failStep(e.message),
+            page_at_block: AREA_CTX.page,
+            noon_reqs: NOON_REQ,
+          });
+
+          try {
+            await rpc('noon_ranking_report', {
+              p_run_id:       RUN_ID,
+              p_area_id:      areaId,
+              p_machine_no:   MACHINE,
+              p_status:       'blocked',
+              p_pages:        AREA_CTX.page,
+              p_rows:         0,
+              p_block_reason: reason,
+            });
+          } catch (re) {
+            console.log(`[m${MACHINE}] report(blocked) failed: ${re.message}`);
+          }
+
+          // 403/429 anywhere -> stop machine immediately
+          break;
+        }
+
+        // ---- area error (non-block) ---------------------------------------
+        summary.areas_errored++;
+        console.error(
+          `[m${MACHINE}] ERROR on area ${areaName}: ${e.message}`
+        );
+
+        await audit({
+          event: 'area_error',
+          area_id: areaId,
+          area_name: areaName,
+          error_msg: String(e.message).slice(0, 500),
+          error_step: failStep(e.message),
+          page_at_error: AREA_CTX.page,
+          noon_reqs: NOON_REQ,
         });
-        console.log(`[m${MACHINE}] reported ${kind}: action=${rep.action} reason=${rep.reason || '-'}`);
 
-        exitReason = kind;
-        break; // Noon rule: 429/403 ALWAYS stops the machine
+        try {
+          await rpc('noon_ranking_report', {
+            p_run_id:     RUN_ID,
+            p_area_id:    areaId,
+            p_machine_no: MACHINE,
+            p_status:     'error',
+            p_pages:      AREA_CTX.page,
+            p_rows:       0,
+            p_error:      String(e.message).slice(0, 500),
+          });
+        } catch (re) {
+          console.log(`[m${MACHINE}] report(error) failed: ${re.message}`);
+        }
       }
-
-      // Non-throttle error -> report and stop (one error exhausts the budget too)
-      console.log(`[m${MACHINE}] error on ${areaId}: ${e.message}`);
-      await audit({
-        ...auditBase(), outcome: 'error', pages: Math.max(0, AREA_CTX.page - 1),
-        fail_step: failStep(e.message), fail_page: AREA_CTX.page || null,
-        http_status: Number((e.message.match(/HTTP (\d{3})/) || [])[1]) || null,
-        error: e.message.slice(0, 300),
-      });
-      await rpc('noon_ranking_report', {
-        p_run_id: RUN_ID, p_machine_no: MACHINE, p_area_id: areaId,
-        p_result: { status: 'error', error: e.message.slice(0, 500) },
-      });
-      exitReason = 'error';
-      break;
     }
+
+    // ---- machine_end ------------------------------------------------------
+    await audit({
+      event: 'machine_end',
+      areas_attempted: summary.areas_attempted,
+      areas_completed: summary.areas_completed,
+      areas_blocked:   summary.areas_blocked,
+      areas_errored:   summary.areas_errored,
+      total_rows:      summary.total_rows,
+      total_pages:     summary.total_pages,
+      noon_reqs:       NOON_REQ,
+    });
+  } catch (fatal) {
+    console.error(`[m${MACHINE}] FATAL: ${fatal.message}`);
+    await audit({
+      event: 'machine_fatal',
+      error_msg: String(fatal.message).slice(0, 500),
+      noon_reqs: NOON_REQ,
+    }).catch(() => {});
+    process.exitCode = 1;
   }
 
-  // -- machine_end ---------------------------------------------------------
-  const end = await rpc('noon_ranking_machine_end', {
-    p_run_id: RUN_ID, p_machine_no: MACHINE, p_reason: exitReason,
-  });
-
-  const elapsed = Math.round((Date.now() - START_TIME) / 1000);
-  console.log('');
-  console.log('=== SUMMARY ===');
-  console.log(`  run:       ${RUN_ID}`);
-  console.log(`  machine:   ${MACHINE}`);
-  console.log(`  areas:     ${totalAreas}`);
-  console.log(`  rows:      ${totalRows}`);
-  console.log(`  dropped:   ${totalDropped} (non-restaurant)`);
-  console.log(`  requests:  ${totalRequests}`);
-  console.log(`  tokens:    ${tokenNumber}`);
-  console.log(`  elapsed:   ${elapsed}s`);
-  console.log(`  exit:      ${exitReason}`);
-  console.log(`  finished:  ${JSON.stringify(end)}`);
-
-})().catch(async (e) => {
-  console.error(`[m${MACHINE}] FATAL: ${e.message}`);
-  console.error(e.stack);
-  try {
-    await rpc('noon_ranking_machine_end', {
-      p_run_id: RUN_ID, p_machine_no: MACHINE,
-      p_reason: `fatal: ${e.message.slice(0, 200)}`,
-    });
-  } catch (_) {}
-  process.exit(1);
-});
+  // ---- summary ------------------------------------------------------------
+  const elapsed = ((Date.now() - START_TIME) / 1000).toFixed(1);
+  console.log(
+    `\n[m${MACHINE}] SUMMARY | run=${RUN_ID} | ` +
+    `${summary.areas_completed} done, ${summary.areas_blocked} blocked, ` +
+    `${summary.areas_errored} errors | ` +
+    `${summary.total_rows} rows, ${summary.total_pages} pages | ` +
+    `${NOON_REQ} noon reqs | ${elapsed}s elapsed`
+  );
+})();
