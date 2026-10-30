@@ -61,9 +61,8 @@ const START_TIME    = Date.now();
 
 let NOON_REQ = 0;      // Noon requests made from this machine's IP
 let RUNNER_IP = null;  // public IP of this GitHub runner
-const undici = require('undici');
-const _http1Agent = new undici.Agent({ allowH2: false });
-const rawFetch = (url, opts) => undici.fetch(url, { ...opts, dispatcher: _http1Agent });
+// HTTP/2 (Node's built-in fetch)
+const rawFetch = globalThis.fetch.bind(globalThis);
 globalThis.fetch = (u, o) => {
   if (String(u).includes('noon.com')) NOON_REQ++;
   return rawFetch(u, o);
