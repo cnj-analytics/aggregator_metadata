@@ -1,56 +1,94 @@
-name: Noon UAE – Ranking Scrape (worker)
-run-name: Noon ranking run ${{ inputs.run_id }} m${{ inputs.machine_no }}
+name: Noon UAE – Ranking scrape
 
-# One worker job.  Dispatched by Supabase (noon_ranking_dispatch_machine) from
-# ranking-control, OR manually for debug.
-# Each dispatch is one machine -> separate workflow_run -> fresh runner IP.
+# PERSONAL-side runner. One dispatch = one machine = one GitHub-runner IP.
+#
+# This workflow checks out the ORG repo (cnj-analytics/aggregator-metadata)
+# at runtime via the ORG_REPO_PAT secret, then runs noon/uae/ranking-scrape.js
+# from THAT checkout. The ORG repo is the single source of truth — this
+# workflow intentionally has no scraper code of its own. Any change to the
+# scrape logic is pushed to the org repo and both personal & org dispatches
+# pick it up on the next machine.
+#
+# Dispatched by Supabase function noon_ranking_dispatch_machine; the Supabase
+# function alternates (or splits by machine_no) between the ORG and the
+# PERSONAL repos so both drain the same shared queue in parallel. The
+# worker code must behave identically in both places, which is why both
+# workflows execute the exact same noon/uae/ranking-scrape.js from the org
+# repo checkout.
+#
+# Required repo secrets:
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_ROLE_KEY
+#   ORG_REPO_PAT             -- fine-grained PAT with read-only "Contents"
+#                               access to the org repo. Owner: the ORG
+#                               account. Set in Settings -> Secrets.
+#
+# Required repo variable (Settings -> Variables):
+#   ORG_REPO                 -- "owner/name" of the org repo that holds
+#                               the merged ranking-scrape.js. Example:
+#                               "my-org/aggregator_metadata". Set this
+#                               BEFORE the first dual-dispatch run.
+
+run-name: ranking run ${{ inputs.run_id }} m${{ inputs.machine_no }}
 
 on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: 'noon_ranking_run.run_id'
+        description: 'noon_ranking_run.id'
         required: true
         type: string
       machine_no:
-        description: 'noon_ranking_run_machine.machine_no'
+        description: 'machine_no inside the run'
         required: true
         type: string
       page_delay_ms:
-        description: 'delay between page fetches within one area (ms)'
+        description: 'overrides the per-page sleep (ms)'
         required: false
         type: string
-        default: '2000'
       pin_area_id:
-        description: 'Override: claim this area first (used on retry dispatch; empty = normal claim)'
+        description: 'optional: force this machine to only pick this area'
         required: false
         type: string
-        default: ''
 
 concurrency:
-  group: noon-uae-ranking-scrape-run-${{ inputs.run_id }}-m${{ inputs.machine_no }}
+  group: noon-uae-ranking-${{ inputs.run_id }}-m${{ inputs.machine_no }}
   cancel-in-progress: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
-    name: run ${{ inputs.run_id }} machine ${{ inputs.machine_no }}
-    env:
-      PYTHONUNBUFFERED: '1'
+    timeout-minutes: 70
+    name: scrape run ${{ inputs.run_id }} machine ${{ inputs.machine_no }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # NOTE: We do NOT checkout this (personal) repo at all. The scraper
+      # lives entirely in the org repo. This keeps a single source of truth
+      # and avoids the risk of personal/org drift during an active run.
+      - name: Checkout org repo (via ORG_REPO_PAT)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ORG_REPO }}
+          token: ${{ secrets.ORG_REPO_PAT }}
+          sparse-checkout: noon/uae
+          path: org
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Run ranking worker
+
+      - name: Ranking scrape (from org repo)
+        working-directory: org/noon/uae
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           RUN_ID: ${{ inputs.run_id }}
           MACHINE_NO: ${{ inputs.machine_no }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          WALL_LIMIT_SEC: '4200'
-        run: |
-          npm install undici
-          node noon/uae/ranking-scrape.js
+          WALL_LIMIT_SEC: '4000'
+          RECOVERY_ATTEMPTS: '3'
+          TOKEN_REFRESH_AT_MS: '240000'
+          RECOVERY_BACKOFF_MS: '1500'
+          OVERRIDE_PAGE_DELAY_MS: ${{ inputs.page_delay_ms }}
+          OVERRIDE_PIN_AREA_ID: ${{ inputs.pin_area_id }}
+        run: node ranking-scrape.js
