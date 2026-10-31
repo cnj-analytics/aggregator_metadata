@@ -2,8 +2,8 @@ name: Noon UAE – Ranking scrape
 
 # PERSONAL-side runner. One dispatch = one machine = one GitHub-runner IP.
 #
-# This workflow checks out the ORG repo (cnj-analytics/aggregator-metadata)
-# at runtime via the ORG_REPO_PAT secret, then runs noon/uae/ranking-scrape.js
+# This workflow checks out the ORG repo at runtime via the
+# PERSONAL_READS_ORG_CODE secret, then runs noon/uae/ranking-scrape.js
 # from THAT checkout. The ORG repo is the single source of truth — this
 # workflow intentionally has no scraper code of its own. Any change to the
 # scrape logic is pushed to the org repo and both personal & org dispatches
@@ -16,18 +16,18 @@ name: Noon UAE – Ranking scrape
 # workflows execute the exact same noon/uae/ranking-scrape.js from the org
 # repo checkout.
 #
-# Required repo secrets:
+# Required repo secrets (Settings -> Secrets -> Actions):
 #   SUPABASE_URL
 #   SUPABASE_SERVICE_ROLE_KEY
-#   ORG_REPO_PAT             -- fine-grained PAT with read-only "Contents"
+#   PERSONAL_READS_ORG_CODE  -- fine-grained PAT with read-only "Contents"
 #                               access to the org repo. Owner: the ORG
-#                               account. Set in Settings -> Secrets.
+#                               account.
 #
-# Required repo variable (Settings -> Variables):
+# Required repo variable (Settings -> Variables -> Actions):
 #   ORG_REPO                 -- "owner/name" of the org repo that holds
-#                               the merged ranking-scrape.js. Example:
-#                               "my-org/aggregator_metadata". Set this
-#                               BEFORE the first dual-dispatch run.
+#                               the merged ranking-scrape.js, e.g.
+#                               "cnj-alytics/aggregator-metadata-org".
+#                               Set this BEFORE the first dual-dispatch run.
 
 run-name: ranking run ${{ inputs.run_id }} m${{ inputs.machine_no }}
 
@@ -64,11 +64,11 @@ jobs:
       # NOTE: We do NOT checkout this (personal) repo at all. The scraper
       # lives entirely in the org repo. This keeps a single source of truth
       # and avoids the risk of personal/org drift during an active run.
-      - name: Checkout org repo (via ORG_REPO_PAT)
+      - name: Checkout org repo (via PERSONAL_READS_ORG_CODE)
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.ORG_REPO }}
-          token: ${{ secrets.ORG_REPO_PAT }}
+          token: ${{ secrets.PERSONAL_READS_ORG_CODE }}
           sparse-checkout: noon/uae
           path: org
 
